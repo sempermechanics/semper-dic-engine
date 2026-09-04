@@ -153,3 +153,79 @@ TEST_CASE(SimdKernels, FusedErrorEqualsStandaloneZnssd) {
             Semper::simd::znssd_sum(vals.data(), ref.data(), n, mean, inv_std);
     CHECK_REL(fused, standalone, 1e-5);
 }
+
+// =====================================================================
+// CANONICAL EXACTNESS
+//
+// The tests above prove the SIMD kernels are *accurate* against a
+// double-precision oracle. These prove something stricter and, for the
+// GPU work, more important: that they are BIT-IDENTICAL to the canonical
+// reference in <semper/kernels/canonical_math.h>.
+//
+// That reference is the definition the OpenCL kernels will reproduce, so
+// if the CPU vector path drifts from it by even one ulp there is no
+// single answer for the GPU to match. Hence exact ==, never CHECK_NEAR.
+//
+// These are what catch the two ways the contract silently breaks:
+//   - a vector width other than 4 lanes (changes the summation order), and
+//   - reintroducing v_fma (one rounding instead of two).
+// =====================================================================
+
+#include <semper/kernels/canonical_math.h>
+
+namespace {
+    // Deliberately includes 729 (a 27 px subset, tail of exactly 1) and
+    // sizes covering every tail residue 0..3.
+    const int kCanonSizes[] = {1, 2, 3, 4, 5, 7, 8, 15, 16, 31, 121, 625, 729, 961};
+} // namespace
+
+TEST_CASE(SimdKernels, SumSqDiff_BitIdenticalToCanonical) {
+    for (int n : kCanonSizes) {
+        auto vals = random_vec((size_t) n, (unsigned) (21000 + n));
+        const float mean = 127.3f;
+        CHECK(Semper::simd::sum_sq_diff(vals.data(), (size_t) n, mean)
+              == semper_canon_sum_sq_diff(vals.data(), n, mean));
+    }
+}
+
+TEST_CASE(SimdKernels, Znssd_BitIdenticalToCanonical) {
+    for (int n : kCanonSizes) {
+        auto vals = random_vec((size_t) n, (unsigned) (22000 + n));
+        auto ref = random_vec((size_t) n, (unsigned) (23000 + n), -3.0f, 3.0f);
+        const float mean = 118.7f, inv_std = 0.031f;
+        CHECK(Semper::simd::znssd_sum(vals.data(), ref.data(), (size_t) n, mean, inv_std)
+              == semper_canon_znssd_sum(vals.data(), ref.data(), n, mean, inv_std));
+    }
+}
+
+TEST_CASE(SimdKernels, ErrorAndGradient_BitIdenticalToCanonical) {
+    for (int n : kCanonSizes) {
+        auto vals = random_vec((size_t) n, (unsigned) (24000 + n));
+        auto ref = random_vec((size_t) n, (unsigned) (25000 + n), -3.0f, 3.0f);
+        auto sdi = random_vec((size_t) n * 6, (unsigned) (26000 + n), -1.0f, 1.0f);
+        const float mean = 118.7f, inv_std = 0.031f;
+
+        float dp_simd[6], dp_canon[6];
+        const float e_simd = Semper::simd::znssd_error_and_gradient(
+                vals.data(), ref.data(), sdi.data(), (size_t) n, mean, inv_std, dp_simd);
+        const float e_canon = semper_canon_znssd_error_and_gradient(
+                vals.data(), ref.data(), sdi.data(), n, mean, inv_std, dp_canon);
+
+        CHECK(e_simd == e_canon);
+        for (int k = 0; k < 6; ++k) CHECK(dp_simd[k] == dp_canon[k]);
+    }
+}
+
+// The lane count is the summation order. If a future build lets OpenCV
+// pick a 256-bit register, every reduction above silently changes
+// association and the GPU parity tests start failing for reasons that
+// look like kernel bugs. Assert the pin directly so the failure names
+// its actual cause.
+TEST_CASE(SimdKernels, VectorWidthIsPinnedTo4Lanes) {
+#if CV_SIMD
+    CHECK(cv::VTraits<cv::v_float32>::vlanes() == 4);
+#else
+    // Scalar fallback still honours the 4-accumulator form; nothing to pin.
+    CHECK(true);
+#endif
+}

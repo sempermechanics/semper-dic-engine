@@ -1,5 +1,6 @@
 #include <semper/solver.hpp>
 #include <semper/simd.hpp>
+#include <semper/kernels/canonical_math.h>
 #include <semper/tuning.hpp>
 #include "util/log.hpp"
 #include <algorithm>
@@ -96,13 +97,14 @@ namespace Semper {
         size_t n = subset.x_offsets.size();
 
         // 🚀 Form the initial shape matrix properly using the 6-DOF inputs!
-        Eigen::Matrix3f W = Eigen::Matrix3f::Identity();
-        W(0, 0) = 1.0f + init_ux;
-        W(0, 1) = init_uy;
-        W(0, 2) = init_u;
-        W(1, 0) = init_vx;
-        W(1, 1) = 1.0f + init_vy;
-        W(1, 2) = init_v;
+        // Row-major plain float, not Eigen: every arithmetic step below is
+        // part of the CPU/GPU bit-exactness contract, and Eigen packs its
+        // fixed-size products differently at different -march levels (that
+        // alone made this solver return different values on AVX2 than on
+        // SSE2 from bit-identical inputs). See canonical_math.h.
+        float W[9] = {1.0f + init_ux, init_uy,          init_u,
+                      init_vx,        1.0f + init_vy,   init_v,
+                      0.0f,           0.0f,             1.0f};
         // ── LM ADDITION ─────────────────────────────────────────────────────────
         // Precompute the matrix to use for the Newton step ONCE, before the loop.
         //
@@ -120,27 +122,35 @@ namespace Semper {
         // for all iterations of this call. Cost: one 6×6 inversion per
         // calculate_deformation call, not per iteration.
         // ────────────────────────────────────────────────────────────────────────
-        Eigen::Matrix<float, 6, 6> H_solve;
+        float H_solve[36];
+        // subset.H / H_inv are Eigen and therefore COLUMN-major; the
+        // canonical helpers are row-major. Transpose on the way in.
+        float H_inv_rm[36];
+        for (int r = 0; r < 6; ++r)
+            for (int c = 0; c < 6; ++c) H_inv_rm[r * 6 + c] = subset.H_inv(r, c);
 
         if (lm_enabled && lm_alpha > 0.0f) {
             // Copy the raw (undamped) Hessian stored at precompute time.
-            Eigen::Matrix<float, 6, 6> H_damped = subset.H;
+            float H_damped[36];
+            for (int r = 0; r < 6; ++r)
+                for (int c = 0; c < 6; ++c) H_damped[r * 6 + c] = subset.H(r, c);
 
             // Apply DICe-style selective damping: translation DOFs only.
-            H_damped(0, 0) += lm_alpha;
-            H_damped(1, 1) += lm_alpha;
+            H_damped[0 * 6 + 0] += lm_alpha;
+            H_damped[1 * 6 + 1] += lm_alpha;
 
-            const float det = H_damped.determinant();
-            if (std::abs(det) < 1e-6f) {
+            float H_damped_inv[36], det;
+            const int ok = semper_inv6x6(H_damped, H_damped_inv, &det);
+            if (!ok || std::abs(det) < 1e-6f) {
                 // Damped matrix is still singular — fall back to the
                 // pre-inverted H_inv so the point at least attempts a step.
-                H_solve = subset.H_inv;
+                for (int i = 0; i < 36; ++i) H_solve[i] = H_inv_rm[i];
             } else {
-                H_solve = H_damped.inverse();
+                for (int i = 0; i < 36; ++i) H_solve[i] = H_damped_inv[i];
             }
         } else {
             // LM disabled: identical to original behaviour.
-            H_solve = subset.H_inv;
+            for (int i = 0; i < 36; ++i) H_solve[i] = H_inv_rm[i];
         }
         // ── END LM ADDITION ─────────────────────────────────────────────────────
         std::vector<float> &def_vals = this->icgn_buffer;
@@ -174,8 +184,8 @@ namespace Semper {
             while (i < n) {
                 float x = subset.x_offsets_f[i];
                 float y = subset.y_offsets_f[i];
-                float final_x = subset.cx + W(0, 0) * x + W(0, 1) * y + W(0, 2);
-                float final_y = subset.cy + W(1, 0) * x + W(1, 1) * y + W(1, 2);
+                float final_x = subset.cx + W[0] * x + W[1] * y + W[2];
+                float final_y = subset.cy + W[3] * x + W[4] * y + W[5];
 
                 // 🚀 DICe PARITY: Explicit 4-Pixel Guard (WITH ROUNDING)
                 int px = ((int)(final_x + 0.5f) == (int)(final_x)) ? (int)(final_x) : (int)(final_x) + 1;
@@ -196,8 +206,8 @@ namespace Semper {
                         size_t idx = i + static_cast<size_t>(k);
                         float xk = subset.x_offsets_f[idx];
                         float yk = subset.y_offsets_f[idx];
-                        float fxk = subset.cx + W(0, 0) * xk + W(0, 1) * yk + W(0, 2);
-                        float fyk = subset.cy + W(1, 0) * xk + W(1, 1) * yk + W(1, 2);
+                        float fxk = subset.cx + W[0] * xk + W[1] * yk + W[2];
+                        float fyk = subset.cy + W[3] * xk + W[4] * yk + W[5];
                         int pxk = ((int)(fxk + 0.5f) == (int)(fxk)) ? (int)(fxk) : (int)(fxk) + 1;
                         int pyk = ((int)(fyk + 0.5f) == (int)(fyk)) ? (int)(fyk) : (int)(fyk) + 1;
                         if (pxk < 4 || pxk >= def_img.width - 4 || pyk < 4 || pyk >= def_img.height - 4) {
@@ -257,7 +267,7 @@ namespace Semper {
             // a NaN injection that destroys the Newton-Raphson matrix.
             // DICe PARITY: 90% survival threshold.
             if (valid_pixels < static_cast<int>(n * 0.90f)) {
-                AnalysisResult res = {W(0, 2), W(1, 2), W(0, 0) - 1.0f, W(0, 1), W(1, 0), W(1, 1) - 1.0f, 1, 2.0f, iter};
+                AnalysisResult res = {W[2], W[5], W[0] - 1.0f, W[1], W[3], W[4] - 1.0f, 1, 2.0f, iter};
                 res.invalid_ref_pixels = invalid_ref_count;
                 return res;
             }
@@ -265,7 +275,7 @@ namespace Semper {
             float def_mean = def_sum / static_cast<float>(valid_pixels);
             // ==============================================
             float def_sum_sq = 0.0f;
-            Eigen::Matrix<float, 6, 1> dp_sum = Eigen::Matrix<float, 6, 1>::Zero();
+            float dp_sum[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
             float error_sum_sq = 0.0f;
 
             // 🚀 FAST-PATH: All pixels are safely inside the image boundaries.
@@ -287,9 +297,10 @@ namespace Semper {
                         def_vals.data(), subset.norm_ref_intensities.data(),
                         subset.sdi_planes.data(), n, def_mean, inv_std, dp_out);
                 for (int k = 0; k < 6; ++k)
-                    dp_sum(k) += dp_out[k];
+                    dp_sum[k] += dp_out[k];
             } else {
-                Eigen::Matrix<float, 6, 6> H_dynamic = Eigen::Matrix<float, 6, 6>::Zero();
+                float H_dynamic[36];
+                for (int i = 0; i < 36; ++i) H_dynamic[i] = 0.0f;
                 for (size_t i = 0; i < n; ++i) {
                     if (def_vals[i] >= 0.0f) {
                         float diff = def_vals[i] - def_mean;
@@ -306,41 +317,56 @@ namespace Semper {
                         float norm_def = (def_vals[i] - def_mean) * inv_std;
                         float diff = subset.norm_ref_intensities[i] - norm_def;
                         error_sum_sq += diff * diff;
-                        dp_sum += subset.steepest_descent_images[i] * diff;
-                        H_dynamic.noalias() += subset.steepest_descent_images[i] * subset.steepest_descent_images[i].transpose();
+                        float sd[6];
+                        for (int k = 0; k < 6; ++k) sd[k] = subset.steepest_descent_images[i](k);
+                        for (int k = 0; k < 6; ++k) dp_sum[k] += sd[k] * diff;
+                        semper_mat6_add_outer(H_dynamic, sd);
                     }
                 }
 
+                // semper_mat6_add_outer fills only the upper triangle; mirror it
+                // before any code below reads a lower-triangle entry.
+                semper_mat6_symmetrize(H_dynamic);
+
                 // DICe LAYER 3: 2x2 Sub-block Hessian Condition Number Guard
-                float det_2x2 = H_dynamic(0,0)*H_dynamic(1,1) - H_dynamic(1,0)*H_dynamic(0,1);
-                float norm_2x2 = H_dynamic(0,0)*H_dynamic(0,0) + H_dynamic(0,1)*H_dynamic(0,1) + H_dynamic(1,0)*H_dynamic(1,0) + H_dynamic(1,1)*H_dynamic(1,1);
+                float det_2x2 = H_dynamic[0*6+0]*H_dynamic[1*6+1] - H_dynamic[1*6+0]*H_dynamic[0*6+1];
+                float norm_2x2 = H_dynamic[0*6+0]*H_dynamic[0*6+0] + H_dynamic[0*6+1]*H_dynamic[0*6+1] + H_dynamic[1*6+0]*H_dynamic[1*6+0] + H_dynamic[1*6+1]*H_dynamic[1*6+1];
                 float cond_2x2 = (std::abs(det_2x2) > 1e-12f) ? (norm_2x2 / std::abs(det_2x2)) : 1.0e13f;
 
                 if (cond_2x2 > 1.0e12f) {
-                    return {W(0, 2), W(1, 2), W(0, 0) - 1.0f, W(0, 1), W(1, 0), W(1, 1) - 1.0f, 1, 2.0f, iter};
+                    return {W[2], W[5], W[0] - 1.0f, W[1], W[3], W[4] - 1.0f, 1, 2.0f, iter};
                 }
 
                 if (lm_enabled && lm_alpha > 0.0f) {
-                    H_dynamic(0, 0) += lm_alpha;
-                    H_dynamic(1, 1) += lm_alpha;
+                    H_dynamic[0 * 6 + 0] += lm_alpha;
+                    H_dynamic[1 * 6 + 1] += lm_alpha;
                 }
-                H_solve = H_dynamic.inverse();
+                float dyn_det;
+                semper_inv6x6(H_dynamic, H_solve, &dyn_det);
             }
 
             final_score = error_sum_sq / valid_pixels;
 
-            Eigen::Matrix<float, 6, 1> delta_p = -H_solve     * dp_sum;
-            Eigen::Matrix3f dW = Eigen::Matrix3f::Identity();
-            dW(0, 0) += delta_p(2);
-            dW(0, 1) += delta_p(3);
-            dW(0, 2) += delta_p(0);
-            dW(1, 0) += delta_p(4);
-            dW(1, 1) += delta_p(5);
-            dW(1, 2) += delta_p(1);
+            float step[6];
+            semper_mat6_vec6(H_solve, dp_sum, step);
+            float delta_p[6];
+            for (int k = 0; k < 6; ++k) delta_p[k] = -step[k];
 
-            W = W * dW.inverse();
+            float dW[9] = {1.0f + delta_p[2], delta_p[3],        delta_p[0],
+                           delta_p[4],        1.0f + delta_p[5], delta_p[1],
+                           0.0f,              0.0f,              1.0f};
 
-            if (delta_p.norm() < 0.001f) {
+            float dW_inv[9], dW_det;
+            if (semper_inv3x3f(dW, dW_inv, &dW_det)) {
+                float W_next[9];
+                semper_mat3_mul(W, dW_inv, W_next);
+                for (int k = 0; k < 9; ++k) W[k] = W_next[k];
+            }
+            // A singular dW means the Newton step collapsed the warp; leaving
+            // W untouched lets the iteration budget or the guards below end
+            // the solve, rather than propagating inf/NaN through the field.
+
+            if (semper_norm6(delta_p) < 0.001f) {
                 // 🚀 DICe PARITY: Post-Match Sigma (Texture) Check
                 // Compute sum of squared gradients over surviving active pixels
                 float sum_gx_sq = 0.0f, sum_gy_sq = 0.0f;
@@ -358,7 +384,7 @@ namespace Semper {
 
                 // 🚀 DICe 100% Deactivation Check
                 if (valid_survivors == 0) {
-                    AnalysisResult res = {W(0, 2), W(1, 2), W(0, 0) - 1.0f, W(0, 1), W(1, 0), W(1, 1) - 1.0f, 1, 2.0f, iter + 1};
+                    AnalysisResult res = {W[2], W[5], W[0] - 1.0f, W[1], W[3], W[4] - 1.0f, 1, 2.0f, iter + 1};
                     res.invalid_ref_pixels = invalid_ref_count;
                     return res;
                 }
@@ -368,18 +394,18 @@ namespace Semper {
 
                 if (sum_grad <= 0.0f) {
                     // Reject: Surviving pixels lack 2D physical texture (sigma returns -1.0 in DICe)
-                    AnalysisResult res = {W(0, 2), W(1, 2), W(0, 0) - 1.0f, W(0, 1), W(1, 0), W(1, 1) - 1.0f, 1, 2.0f, iter + 1};
+                    AnalysisResult res = {W[2], W[5], W[0] - 1.0f, W[1], W[3], W[4] - 1.0f, 1, 2.0f, iter + 1};
                     res.invalid_ref_pixels = invalid_ref_count;
                     return res;
                 }
 
-                AnalysisResult res = {W(0, 2), W(1, 2), W(0, 0) - 1.0f, W(0, 1), W(1, 0), W(1, 1) - 1.0f, 0, final_score, iter + 1};
+                AnalysisResult res = {W[2], W[5], W[0] - 1.0f, W[1], W[3], W[4] - 1.0f, 0, final_score, iter + 1};
                 res.invalid_ref_pixels = invalid_ref_count;
                 return res;
             }
         }
 
-        AnalysisResult res = {W(0, 2), W(1, 2), W(0, 0) - 1.0f, W(0, 1), W(1, 0), W(1, 1) - 1.0f, 1, final_score, max_iter};
+        AnalysisResult res = {W[2], W[5], W[0] - 1.0f, W[1], W[3], W[4] - 1.0f, 1, final_score, max_iter};
         res.invalid_ref_pixels = invalid_ref_count;
         return res;
     }

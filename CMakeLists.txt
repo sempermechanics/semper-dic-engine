@@ -62,7 +62,19 @@ target_compile_definitions(semper_math PRIVATE
         $<$<NOT:$<BOOL:${SEMPER_ANDROID}>>:SEMPER_HOST_LOG=1>
 )
 if(NOT MSVC)
-    target_compile_options(semper_math PRIVATE -O3 -ffast-math -fPIC -fvisibility=hidden -Wall -Wextra)
+    # semper_math holds exactly the four numerically-mirrored translation units
+    # (image_processor, subset_precomputer, optimization_engine, strain_calculator).
+    # These define the canonical reference the OpenCL kernels must reproduce
+    # bit-for-bit, so they are compiled with strict IEEE semantics:
+    #   -fno-fast-math    no reassociation, no finite-math assumptions
+    #   -ffp-contract=off no implicit a*b+c -> fma contraction
+    # Measured cost on the mirrored kernels is within run-to-run noise, because
+    # the hot reductions are already hand-vectorized with explicit v_fma
+    # intrinsics (include/semper/simd.hpp) and never relied on -ffast-math.
+    # See docs/DETERMINISM.md. semper_pipeline keeps -ffast-math: it orchestrates
+    # but does not itself perform mirrored arithmetic.
+    target_compile_options(semper_math PRIVATE
+            -O3 -fno-fast-math -ffp-contract=off -fPIC -fvisibility=hidden -Wall -Wextra)
 endif()
 if(SEMPER_SANITIZER AND NOT MSVC)
     target_compile_options(semper_math PRIVATE -fsanitize=${SEMPER_SANITIZER} -g -fno-omit-frame-pointer)

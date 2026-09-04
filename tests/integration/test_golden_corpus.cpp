@@ -151,15 +151,27 @@ namespace {
         return points;
     }
 
-    // Converged-point value tolerance. Pixel-scale (u/v) vs strain-scale
-    // (ux/uy/vx/vy) differ by orders of magnitude, so each gets its own bound
-    // rather than one shared epsilon being too loose for one and too tight
-    // for the other. Sized to absorb -ffast-math runner-to-runner noise
-    // (observed up to ~5.5e-3 px / ~3e-4 strain on GitHub vs a local Ubuntu
-    // container, on a few high-strain 6x6 subsets) while still catching a
-    // real field shift.
-    constexpr float TOL_DISPLACEMENT_PX = 1e-2f;
-    constexpr float TOL_STRAIN = 1e-3f;
+    // Converged-point value tolerance.
+    //
+    // These used to be 1e-2 px / 1e-3 strain, sized to absorb -ffast-math
+    // runner-to-runner noise. That noise is gone: the engine is now compiled
+    // under strict IEEE FP with a pinned reduction order, and produces
+    // bit-identical results across -march levels (see docs/DETERMINISM.md).
+    //
+    // They are tightened by four orders of magnitude rather than to exactly
+    // zero for one specific reason. The corpus synthesizes its images in
+    // tests/framework/synthetic.h by summing several hundred std::exp terms
+    // per pixel, so the INPUT depends on the host libm; a different glibc
+    // can move the last ulp of exp and shift every downstream value slightly.
+    // Pinning to zero here would make the fixture toolchain-specific and
+    // fail on any CI image but the one that captured it.
+    //
+    // The true bit-exactness gate is therefore not this tolerance but the
+    // `determinism` CI job, which builds the same source at two -march
+    // levels and byte-compares the captured corpora. This bound is tight
+    // enough that any real change in engine arithmetic still trips it.
+    constexpr float TOL_DISPLACEMENT_PX = 1e-6f;
+    constexpr float TOL_STRAIN = 1e-7f;
 
     void compare_against_golden(bool use_6x6, const char *label, const std::string &suffix) {
         const auto path = golden_file_path() + suffix;

@@ -22,7 +22,15 @@ set(NATIVE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/..)
 option(SEMPER_WERROR "Fail the build on compiler warnings in first-party code" OFF)
 
 if (NOT MSVC)
-    add_compile_options(-O2 -ffast-math -Wall -Wextra)
+    # Strict IEEE FP across the whole test tree, matching semper_math in the
+    # root CMakeLists.txt. This is not only about the engine sources compiled
+    # here: tests/framework/synthetic.h builds the ground-truth images by
+    # summing several hundred std::exp terms per pixel, and under -ffast-math
+    # GCC vectorizes that loop onto libmvec — whose AVX2 exp does not agree
+    # bit-for-bit with its SSE2 one. The generated IMAGES then differ between
+    # -march levels, and every downstream golden comparison differs with them.
+    # A determinism gate whose own inputs are non-deterministic proves nothing.
+    add_compile_options(-O2 -fno-fast-math -ffp-contract=off -Wall -Wextra)
     if (SEMPER_WERROR)
         # GCC's -Waggressive-loop-optimizations is a known false positive on
         # SIMD residual tails (reports absurd iteration counts). Keep it as a
@@ -57,6 +65,8 @@ if (SEMPER_COVERAGE AND NOT MSVC)
 endif ()
 
 set(DIC_UNIT_TESTS
+        unit/test_canonical_reduce.cpp
+        unit/test_canonical_inverse.cpp
         unit/test_simd_kernels.cpp
         unit/test_image.cpp
         unit/test_subset_precomputer.cpp
@@ -86,6 +96,7 @@ set(DIC_ENGINE_SOURCES
         ${NATIVE_ROOT}/src/strain/strain_calculator.cpp
         ${NATIVE_ROOT}/src/pipeline/cancel.cpp
 )
+
 
 # Full-field solver + seeding (OpenCV). Linked only when OpenCV is present so
 # hosts without it still build the math suite; CI sets DIC_REQUIRE_OPENCV=ON.

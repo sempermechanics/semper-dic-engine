@@ -71,6 +71,59 @@ jobs:
         run: ccache --show-stats
 
   # ===================================================================
+  # Determinism — the bit-exactness gate for the OpenCL work
+  #
+  # Builds identical source at two -march levels and byte-compares the
+  # captured golden corpora. SSE2 gives 4 float lanes, x86-64-v3 gives
+  # AVX2's 8 plus FMA; before the canonical-math work these produced
+  # different results, which is why the golden tolerances had been
+  # widened for "runner FP noise". They must now be identical byte for
+  # byte, because the OpenCL kernels have to reproduce one defined
+  # answer and cannot chase a target that moves with the host ISA.
+  # ===================================================================
+  determinism:
+    name: Cross-ABI determinism
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install OpenCV
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends libopencv-dev
+
+      - name: Build and capture at each -march level
+        run: |
+          set -euo pipefail
+          for arch in x86-64 x86-64-v3; do
+            cmake -S tests -B "build/$arch" \
+              -DCMAKE_BUILD_TYPE=Release -DDIC_REQUIRE_OPENCV=ON \
+              -DCMAKE_CXX_FLAGS="-march=$arch"
+            cmake --build "build/$arch" -j"$(nproc)"
+            SEMPER_GOLDEN_CAPTURE=1 SEMPER_GOLDEN_FILE="corpus_$arch.bin" \
+              "./build/$arch/dic_tests" GoldenCorpus
+          done
+
+      - name: Compare captures byte for byte
+        run: |
+          set -euo pipefail
+          status=0
+          for v in bicubic keys6x6; do
+            if cmp "corpus_x86-64.bin.$v" "corpus_x86-64-v3.bin.$v"; then
+              echo "  $v: bit-identical across SSE2 / AVX2"
+            else
+              echo "::error::$v differs between -march=x86-64 and -march=x86-64-v3."
+              echo "The canonical reduction order or FP flags have been broken."
+              echo "See docs/DETERMINISM.md."
+              status=1
+            fi
+          done
+          exit $status
+
+  # ===================================================================
   # Sanitizers — ASan+UBSan and TSan on every change
   # ===================================================================
   sanitizers:
