@@ -105,12 +105,21 @@ jobs:
             cmake --build "build/$arch" -j"$(nproc)"
             SEMPER_GOLDEN_CAPTURE=1 SEMPER_GOLDEN_FILE="corpus_$arch.bin" \
               "./build/$arch/dic_tests" GoldenCorpus
+            SEMPER_FF_GOLDEN_CAPTURE=1 SEMPER_FF_GOLDEN_FILE="ff_$arch.bin" \
+              "./build/$arch/dic_tests" FullFieldGolden.CaptureOrCompare
           done
 
       - name: Compare captures byte for byte
         run: |
           set -euo pipefail
           status=0
+          if cmp "ff_x86-64.bin" "ff_x86-64-v3.bin"; then
+            echo "  full-field: bit-identical across SSE2 / AVX2"
+          else
+            echo "::error::full-field golden differs between -march levels."
+            echo "See docs/DETERMINISM.md."
+            status=1
+          fi
           for v in bicubic keys6x6; do
             if cmp "corpus_x86-64.bin.$v" "corpus_x86-64-v3.bin.$v"; then
               echo "  $v: bit-identical across SSE2 / AVX2"

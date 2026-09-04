@@ -33,6 +33,19 @@ Symptom of all this: the golden-corpus tolerances had been widened twice
 (`ce28937`, `6872cd7`) to absorb what the commit messages called "runner
 FP noise". That noise was not the runner.
 
+4. **Path B was not reproducible even on one machine.** The flood fill
+   drained a shared `std::priority_queue` from several worker threads, and
+   each point's initial guess is extrapolated from whichever parent won the
+   `compare_exchange` for that cell. Measured on the host suite before the
+   rewrite: **0 of 15 runs reproduced**, with 10-230 of ~3100 output floats
+   differing between two consecutive solves of the same binary on identical
+   input.
+
+   Nothing caught this, because the only bit-identity tests in the repo were
+   subset-level (`Engine.RepeatSolve_BitIdentical`,
+   `Robustness.ConcurrentSolves_BitIdenticalToSingleThread`) and the golden
+   corpus never entered `run_full_field` at all.
+
 ## The contract
 
 ### Compile flags
@@ -110,13 +123,38 @@ between `-march` levels, and every downstream comparison differed with
 them. The whole `tests/` tree is therefore strict too. A determinism gate
 whose own inputs are non-deterministic proves nothing.
 
+### Path B is level-synchronous
+
+`full_field_path_b.cpp` no longer uses a priority queue. It advances in
+rounds: each round takes the whole current frontier, resolves every
+child's parent **before** any solving happens, and only then solves that
+round's children in parallel.
+
+The tie-break is explicit — best parent correlation score, ties to the
+lowest parent flat index — and the frontier is kept sorted by flat index
+so that rule is well defined. Because every guess is fixed before the
+parallel section opens, thread interleaving can no longer change the
+answer. `compute_order` is assigned after the round in winner order for
+the same reason.
+
+This is also the shape the GPU needs: one kernel launch per round.
+
+Measured effect of the rewrite: determinism went from 0/15 to 15/15
+reproducible, with **identical coverage** — the same 392 and 380 points,
+and the same Path A / Path B split (413/70 and 420/58), as the racing
+queue produced. DICe field agreement is unchanged at rms 0.0006 px
+against a 0.005 tolerance, 230/230 points compared, 100% convergence
+across every load step of the ladder.
+
 ## What is guaranteed, and what is not
 
 **Guaranteed:** for one toolchain and one libm, the engine produces
 bit-identical output regardless of the target ISA — SSE2, AVX2, NEON.
 This is enforced by the `determinism` CI job, which builds the same
-source at `-march=x86-64` and `-march=x86-64-v3` and byte-compares the
-captured golden corpora.
+source at `-march=x86-64` and `-march=x86-64-v3` and byte-compares both
+the subset corpus and the full-field golden. Run-to-run reproducibility
+within a single build is separately gated by
+`FullFieldGolden.RepeatSolve_IsDeterministic`.
 
 **Not guaranteed:** identical output across different *libm*
 implementations. That dependency is confined to the test image
@@ -137,5 +175,8 @@ Something in the list above was broken. In rough order of likelihood:
    exactly this.
 3. An Eigen fixed-size expression was reintroduced into a mirrored TU.
 4. A `v_fma` was reintroduced into `simd.hpp`.
+5. Path B regained an order-dependent step — a guess read from a
+   neighbour mid-round, or a tie-break that depends on completion order
+   rather than on flat index.
 
 Do **not** widen a tolerance to make it pass.

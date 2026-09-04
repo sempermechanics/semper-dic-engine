@@ -120,6 +120,7 @@ set(DIC_PIPELINE_SOURCES
 # always-on DIC_UNIT_TESTS / DIC_INTEGRATION_TESTS lists.
 set(DIC_PIPELINE_TESTS
         integration/test_full_field_contracts.cpp
+        integration/test_full_field_golden.cpp
         unit/test_image_codec.cpp
         integration/test_reference_cache.cpp
 )
