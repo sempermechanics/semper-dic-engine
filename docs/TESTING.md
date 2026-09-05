@@ -237,6 +237,27 @@ the reference by one ulp there is no single answer for the GPU to match.
 | `ErrorAndGradient_BitIdenticalToCanonical` | Fused kernel ≡ canonical, error and all 6 gradients |
 | `VectorWidthIsPinnedTo4Lanes` | `CV__SIMD_FORCE_WIDTH` took effect. The lane count **is** the summation order, so an 8-lane register silently changes every reduction's association |
 
+## Suite: `ClRuntime` — `unit/test_cl_runtime.cpp`
+
+The OpenCL backend's probe and build plumbing. Compiled only under
+`-DSEMPER_OPENCL=ON`; otherwise the file reduces to one test asserting the
+backend really is absent, so the suite count does not shift silently with the
+flag.
+
+Every test must pass on a machine with **no** OpenCL, because that is the CI
+default and the common developer case — the backend's contract is that it
+degrades to the CPU, not that it is present.
+
+| Test | Proves |
+|---|---|
+| `ProbeIsSafeAndIdempotent` | Probing never throws whatever is installed, and the result is cached rather than re-probed |
+| `UnavailableAlwaysExplainsItself` | `unavailable_reason` is never empty when the backend is unused. A GPU that goes unused silently is indistinguishable from one that works — this is the assertion that makes that visible |
+| `CapabilitiesImplyAvailability` | `fp64` / `exact_fp32` are never claimed while the backend is unusable |
+| `BuildOptionsContainNoAccuracyDestroyingFlag` | No `-cl-fast-relaxed-math`, `-cl-mad-enable`, `-cl-unsafe-math` or `-cl-no-signed-zeros`, and `-cl-fp32-correctly-rounded-divide-sqrt` **is** present. These are contract, not tuning — exactly the flags someone adds while chasing a benchmark |
+| `EmbeddedKernelIsSelfContained` | `scripts/embed_cl_kernels.py` expanded the first-party include: the `_g` address-space variant exists (proving `canonical_reductions.inc` expanded twice), `FP_CONTRACT OFF` survived, and no unresolved `#include <semper/...>` remains |
+| `EnvDisableForcesCpuPath` | `SEMPER_OPENCL_DISABLE=1` forces the CPU path, for bisecting a suspected device-side difference |
+| `DeviceReproducesCanonicalReductionExactly` | **Device-gated.** A real OpenCL device returns bit-identical results to `semper_canon_sum_sq_diff` at n = 0…729, tail included. Skips with a printed reason rather than passing vacuously when no device is present |
+
 ## Suite: `CanonicalReduce` — `unit/test_canonical_reduce.cpp`
 
 Pins the reduction **order**, not merely the value, in

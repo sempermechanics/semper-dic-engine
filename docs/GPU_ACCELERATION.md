@@ -46,7 +46,7 @@ run the bit-exact ICGN path and is refused for that stage.
 | # | Scope | Status |
 |---|---|---|
 | **0** | Make the CPU reference reproducible. Strict FP, canonical reduction order, canonical linear algebra replacing Eigen in the mirrored paths, deterministic Path B. **No GPU code.** | **Complete** |
-| **1** | OpenCL runtime + build plumbing: `SEMPER_OPENCL`, dlopen loader, device capability gate, kernel embedding. **No kernels.** | In progress |
+| **1** | OpenCL runtime + build plumbing: `SEMPER_OPENCL`, dlopen loader, device capability gate, kernel embedding. **No compute kernels.** | **Complete** |
 | **2** | Strain VSG on GPU. One work-item per grid point, fp64. Currently the only fully serial numerical stage. | Pending |
 | **3** | Hessian pre-pass on GPU. One work-item per grid point. | Pending |
 | **4** | Path A ICGN on GPU. **One work-item per subset**, so the reduction keeps the canonical order rather than becoming a cross-lane tree. | Pending |
@@ -69,6 +69,31 @@ Three independent causes of cross-ISA divergence were found and fixed:
 width, and Eigen's per-ISA packing of fixed-size products. Path B was
 additionally non-deterministic run-to-run because its worker threads raced
 a shared priority queue. See [DETERMINISM.md](DETERMINISM.md).
+
+### Phase 1 results (measured)
+
+The backend compiles and probes; no DIC work runs on the device yet. What
+was verified:
+
+| Check | Result |
+|---|---|
+| `SEMPER_OPENCL=OFF` (default) | 102 tests pass; `nm -D` finds **zero** OpenCL symbols |
+| `SEMPER_OPENCL=ON`, no ICD installed | 109 tests pass; probe reports *"loader present but reports zero platforms"* and every stage falls back to CPU |
+| `SEMPER_OPENCL=ON`, POCL 5.0 CPU device | 109 tests pass; kernel builds on the device; `fp64=1 exact_fp32=1` |
+| **Device reproduces the canonical reduction** | **Exactly**, at n = 0, 1, 3, 4, 5, 8 and 729 — including the scalar tail (729 = 4·182 + 1) |
+| Throughput, backend ON vs OFF back-to-back | 2900 vs 2910 median — 0.3%, within noise |
+| Cross-ABI determinism | Subset corpus and full-field golden both still byte-identical |
+
+The reduction result is the one that matters for everything after this. The
+POCL device vectorizes internally on `skylake-avx512` and still reproduces
+the host's pinned 4-lane summation order bit-for-bit, which is the premise
+Phases 2-5 are built on.
+
+> The throughput numbers above are lower than Phase 0's 3205/3273 because the
+> host was busier, not because anything regressed — the *unchanged*
+> `SEMPER_OPENCL=OFF` build measured 2910 in the same session. This is
+> precisely why §4a says to compare ON against OFF back-to-back rather than
+> against a number recorded on another day.
 
 ### Per-phase gate
 
@@ -223,6 +248,7 @@ chat log.
 | Date | GPU | Driver / ICD | CL ver | fp64 | exact fp32 | Throughput before → after | Parity | Notes |
 |---|---|---|---|---|---|---|---|---|
 | 2026-09 | *(none — CPU only)* | loader present, no ICD | — | — | — | 3205 / 3273 (median/max) | n/a | Development container, 4-core Xeon. Phase 0 reference |
+| 2026-09 | POCL CPU device | pocl-opencl-icd 5.0 | 3.0 (CL C 1.2) | yes | yes | 2900 ON / 2910 OFF (median, back-to-back) | pass | `cpu-skylake-avx512`. Canonical reduction exact vs host at every size |
 |  |  |  |  |  |  |  |  |  |
 
 ---

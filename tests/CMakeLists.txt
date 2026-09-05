@@ -65,6 +65,7 @@ if (SEMPER_COVERAGE AND NOT MSVC)
 endif ()
 
 set(DIC_UNIT_TESTS
+        unit/test_cl_runtime.cpp
         unit/test_canonical_reduce.cpp
         unit/test_canonical_inverse.cpp
         unit/test_simd_kernels.cpp
@@ -151,6 +152,17 @@ target_compile_definitions(dic_tests PRIVATE
         NATIVE_TESTS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
         SEMPER_HOST_LOG=1
 )
+
+# OpenCL backend, mirroring the root package so the host tests exercise the
+# same code the library ships. Off by default; test_cl_runtime.cpp is written
+# to pass either way.
+option(SEMPER_OPENCL "Build the OpenCL backend" OFF)
+if (SEMPER_OPENCL)
+    set(SEMPER_ROOT_FOR_GPU ${NATIVE_ROOT})
+    list(APPEND CMAKE_MODULE_PATH "${NATIVE_ROOT}/cmake")
+    include(SemperOpenCL)
+    semper_add_opencl(dic_tests)
+endif ()
 
 option(DIC_REQUIRE_OPENCV "Fail configure if OpenCV is missing (CI sets this)" OFF)
 

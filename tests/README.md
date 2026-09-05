@@ -101,6 +101,37 @@ for i in $(seq 1 15); do
 done | sort -n | awk '{a[NR]=$1} END{printf "median=%d max=%d\n", a[int((NR+1)/2)], a[NR]}'
 ```
 
+## OpenCL backend
+
+Off by default. Build it in with `-DSEMPER_OPENCL=ON`; the backend is then
+runtime-probed, so the binary still runs correctly on a machine with no GPU
+and no ICD.
+
+```bash
+cmake -S tests -B build/gpu -DCMAKE_BUILD_TYPE=Release \
+  -DDIC_REQUIRE_OPENCV=ON -DSEMPER_OPENCL=ON
+cmake --build build/gpu -j"$(nproc)"
+./build/gpu/dic_tests ClRuntime      # prints what was detected, and why not
+```
+
+`ClRuntime` passes with or without a device; the device-dependent test
+reports itself as skipped rather than passing vacuously. To exercise the
+with-device path locally without a GPU, install a conformant CPU device:
+
+```bash
+sudo apt-get install -y pocl-opencl-icd    # POCL 5.0
+./build/gpu/dic_tests ClRuntime
+```
+
+POCL is IEEE-conformant, which is the point: it catches FP-contract and
+reduction-order mistakes that a lenient vendor driver would paper over.
+
+```bash
+SEMPER_OPENCL_DISABLE=1 ./build/gpu/dic_tests   # force the CPU path
+```
+
+Full roadmap and device bring-up: [docs/GPU_ACCELERATION.md](../docs/GPU_ACCELERATION.md).
+
 ## Python bindings
 
 `bindings/python/tests` is **not** run by `ci.yml` — only by the

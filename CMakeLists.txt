@@ -146,6 +146,17 @@ if(SEMPER_SANITIZER AND NOT MSVC)
     target_link_options(semper_pipeline PUBLIC -fsanitize=${SEMPER_SANITIZER})
 endif()
 
+# ---------------------------------------------------------------------------
+# OpenCL backend (opt-in; see cmake/SemperOptions.cmake and
+# docs/GPU_ACCELERATION.md). Attached to semper_pipeline because dispatch
+# lives alongside the full-field orchestration, not in the portable math.
+# ---------------------------------------------------------------------------
+if(SEMPER_OPENCL)
+    set(SEMPER_ROOT_FOR_GPU ${SEMPER_ROOT})
+    include(SemperOpenCL)
+    semper_add_opencl(semper_pipeline)
+endif()
+
 add_library(semper INTERFACE)
 target_link_libraries(semper INTERFACE semper_pipeline)
 target_include_directories(semper INTERFACE ${SEMPER_PUBLIC_INCLUDE})

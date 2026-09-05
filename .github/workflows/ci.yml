@@ -71,6 +71,58 @@ jobs:
         run: ccache --show-stats
 
   # ===================================================================
+  # OpenCL backend — compiles, and degrades correctly in both directions
+  #
+  # Runs the suite twice on purpose. First with no ICD installed, which is
+  # the state most machines are in and the one where a silent failure would
+  # hide: the backend must report unavailable with a reason and every stage
+  # must fall back to the CPU. Then with POCL, a conformant CPU OpenCL
+  # device, which actually compiles the embedded kernels and checks the
+  # device reproduces the host's canonical reduction bit-for-bit.
+  #
+  # POCL is IEEE-conformant and will catch FP-contract and reduction-order
+  # mistakes that a lenient vendor driver would happily paper over.
+  # ===================================================================
+  opencl:
+    name: OpenCL backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install OpenCV
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends libopencv-dev
+
+      - name: Configure and build with SEMPER_OPENCL=ON
+        run: |
+          cmake -S tests -B build/gpu -DCMAKE_BUILD_TYPE=Release \
+            -DDIC_REQUIRE_OPENCV=ON -DSEMPER_OPENCL=ON
+          cmake --build build/gpu -j"$(nproc)"
+
+      - name: Run with no OpenCL device (must fall back cleanly)
+        run: ./build/gpu/dic_tests
+
+      - name: Install POCL (conformant CPU OpenCL device)
+        run: sudo apt-get install -y -qq --no-install-recommends pocl-opencl-icd
+
+      - name: Run against a real OpenCL device
+        run: ./build/gpu/dic_tests
+
+      - name: Confirm the default build has no OpenCL in it
+        run: |
+          cmake -S tests -B build/off -DCMAKE_BUILD_TYPE=Release -DDIC_REQUIRE_OPENCV=ON
+          cmake --build build/off -j"$(nproc)"
+          if nm -D build/off/dic_tests | grep -i opencl; then
+            echo "::error::SEMPER_OPENCL=OFF build contains OpenCL symbols"
+            exit 1
+          fi
+          echo "  no OpenCL symbols in the default build"
+
+  # ===================================================================
   # Determinism — the bit-exactness gate for the OpenCL work
   #
   # Builds identical source at two -march levels and byte-compares the
