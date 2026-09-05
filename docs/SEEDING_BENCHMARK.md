@@ -143,6 +143,73 @@ speckle. Replacing the descriptor with phase correlation plus an IC-GN anchor
 lattice is 5–13× better on vertices, 5–17× better on guess gradients, and
 cheaper in wall time, CPU time and memory at the same time.
 
+### 4.5 Rotation and large motion — where the anchor lattice loses
+
+`SeedBench.LargeMotionSweep`, 320 px ROI centred in 640 px so the deformed
+subsets stay inside the image. This is the regime the descriptor front-end was
+actually built for, so it is the regime where the lattice is expected to lose.
+
+**Translation — no crossover, the lattice wins at every magnitude tested:**
+
+| shift | AKAZE mesh cov | anchor mesh cov | AKAZE wall / CPU ms | anchor wall / CPU ms |
+|---|---|---|---|---|
+| 25 px | 0.993 | 1.000 | 148.3 / 519.6 | **92.1 / 310.6** |
+| 50 px | 0.927 | 1.000 | 87.4 / 278.2 | **96.1 / 321.4** |
+| 100 px | 0.706 | 1.000 | 81.8 / 268.8 | **91.9 / 302.5** |
+
+Phase correlation locks cleanly at 100 px (31% of the ROI width) and the lattice
+keeps all 289 anchors. AKAZE's mesh coverage decays with shift magnitude. The
+earlier concern that phase correlation would alias past ROI/2 does not
+materialise anywhere in this range.
+
+**Rotation — the lattice degrades from about 5 deg:**
+
+| rotation | phase lock | anchors kept | anchor mesh cov | anchor wall / CPU ms | AKAZE wall / CPU ms |
+|---|---|---|---|---|---|
+| 2 deg | yes | 268 | 0.996 | 156.0 / 552.3 | 140.1 / 494.3 |
+| 5 deg | yes | 54 | **0.450** | 207.3 / 768.5 | 139.7 / 493.3 |
+| 15 deg | **no** | 30 | **0.152** | **344.7 / 1306.7** | 178.9 / 595.8 |
+
+At 15 deg the lattice costs **2.2x the CPU** and 1.9x the wall time of the
+shipping seeder, and its seeding alone costs 214 ms against 5.6 ms.
+
+Two things do **not** degrade, and they matter:
+
+- **Final accuracy is unaffected.** Converged fraction is 87.89% and field RMS
+  is identical for all seven candidates in every one of these scenarios. Path B
+  reliability-guided propagation covers whatever the mesh does not. The lattice
+  costs time under rotation, not correctness.
+- **The surviving anchors stay accurate.** Vertex error is 0.0090 px at 15 deg
+  against AKAZE's 0.1984. Coverage collapses; precision does not.
+
+**Mechanism, and a hypothesis that was tested and rejected.** The obvious
+suspect was the `INIT_NO_SIMPLEX` switch: with a phase lock the anchors run pure
+ICGN, whose capture radius is small. Re-running with `INIT_NO_SEARCH` (ICGN plus
+Simplex rescue) recovers part of the 5 deg case — 126 anchors and 0.826 coverage
+instead of 54 and 0.450 — but costs 1426 ms of seeding CPU against 364, pushes
+total CPU to 1849 ms against 768, helps nothing at 15 deg, and is worse
+everywhere else. `INIT_NO_SIMPLEX` is the correct setting; it is not the cause.
+
+The real cause is structural: `phase_correlate_roi` supplies a **translation**.
+Under rotation about the ROI centre the true displacement grows with radius
+(2*r*sin(theta/2)), so one global translation is wrong for the outer anchors no
+matter which per-anchor solver mode is used. At 5 deg the outer anchors are
+already ~14 px out, at the edge of what ICGN pulls in from a zero-gradient
+guess.
+
+The principled fix, if this regime matters, is to estimate rotation globally as
+well — log-polar (Fourier-Mellin) phase correlation recovers rotation and scale
+before the translation correlation, and lives entirely in `imgproc`, so it would
+not reinstate `features2d`. That is unimplemented and unmeasured.
+
+**Practical relevance.** The engine ships in an Android app, so the reference
+and deformed frames may be captured handheld. Frame-to-frame camera rotation
+above 5 deg is plausible there in a way it is not on a fixed laboratory rig.
+This is the one scenario in which keeping a descriptor fallback — at the cost of
+the 2.755 MB and the `features2d`/`flann`/`calib3d` modules — has a real
+argument behind it.
+
+
 ## 5. Cost accounting
 
 Wall clock alone is not sufficient: the anchor lattice is OpenMP-parallel while
@@ -289,7 +356,7 @@ measurement:
 | 3 | total wall time ≤ baseline | **pass** — every scenario. 192.0 vs 198.7 ms (DICe), 201.9 vs 283.9 (Sample 5), 372.7 vs 389.1 (Sample 14) |
 | 4 | total CPU time ≤ baseline, single and multi-threaded | **pass** — 678.3 vs 706.7 ms at 4 threads, 622.9 vs 691.3 ms pinned to one core |
 | 5 | peak RSS ≤ baseline | **pass** — 65.9 vs 67.9 MB, the lowest of all seven candidates |
-| 6 | coverage and convergence no worse | **pass** — mesh coverage 1.000 vs 0.446 (DICe) and 0.762 (Sample 14); convergence identical everywhere; never routes below the baseline's quality |
+| 6 | coverage and convergence no worse | **pass for translation and strain, fails above ~5 deg rotation** — mesh coverage 1.000 vs 0.446 (DICe) and 0.762 (Sample 14), and 1.000 at translations to 100 px; but 0.450 at 5 deg and 0.152 at 15 deg, against AKAZE's 0.961. Convergence and field RMS are identical in every case — the cost is CPU, not correctness (§4.5) |
 | 7 | binary size not larger | **pass** — aarch64 29.1% smaller (−2.755 MB per ABI); x86_64 35.9% (−4.864 MB). Quote the aarch64 figure |
 
 Two criteria are not met literally. Criterion 1 fails on Sample 5 by 7% at a

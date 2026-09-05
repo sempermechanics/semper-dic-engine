@@ -211,6 +211,38 @@ int repeat_count() {
     return 1;
 }
 
+
+// Rotation by theta about the deformation centre, in the engine's shape
+// function: A = R - I, so ux = vy = cos(theta) - 1, uy = -sin(theta),
+// vx = +sin(theta). Image y runs downward.
+dictest::AffineDeformation rotation(double deg) {
+    const double t = deg * CV_PI / 180.0;
+    return affine(0.0f, 0.0f,
+                  (float)(std::cos(t) - 1.0), (float)(-std::sin(t)),
+                  (float)( std::sin(t)),      (float)(std::cos(t) - 1.0));
+}
+
+// Large-motion sweep uses a smaller, centred ROI: a 100 px translation or a
+// 15 deg rotation moves the outer subsets a long way, and they must stay inside
+// the image or every candidate fails for reasons that have nothing to do with
+// seeding. 320 ROI in a 640 image leaves 160 px of margin.
+constexpr int BIG_RECT = 320;
+constexpr int BIG_ORIGIN = 160;
+
+FullFieldParams big_motion_params() {
+    FullFieldParams p;
+    p.rect_x = BIG_ORIGIN;
+    p.rect_y = BIG_ORIGIN;
+    p.rect_w = BIG_RECT;
+    p.rect_h = BIG_RECT;
+    p.step = STEP;
+    p.subset_size = SUBSET;
+    p.strain_window = std::max(STRAIN_WIN, 5 * STEP + 1);
+    if (p.strain_window % 2 == 0) p.strain_window += 1;
+    p.use_6x6_interpolator = false;
+    return p;
+}
+
 FullFieldParams bench_params() {
     FullFieldParams p;
     p.rect_x = RECT_ORIGIN;
@@ -236,6 +268,9 @@ struct Row {
     double mesh_frac = 0.0;        // fraction of grid points inside the mesh
     double mesh_med_du = -1.0;
     double mesh_med_dux = -1.0, mesh_p95_dux = -1.0;
+    bool phase_locked = false;         // anchor lattice: did phaseCorrelate trust its peak
+    int anchors_accepted = 0;
+    int anchors_attempted = 0;
     double seed_cpu_ms = 0.0;          // user+sys across the seeding call
     double seed_precompute_ms = 0.0;   // anchor lattice only
     double seed_icgn_ms = 0.0;         // anchor lattice only
@@ -282,6 +317,9 @@ void measure_seed(Row &row, const TruthFn &truth, SeedMethod method,
     row.seed_cpu_ms = percentile(seed_cpus, 0.50);
     row.seed_precompute_ms = seeds.time_precompute_ms;
     row.seed_icgn_ms = seeds.time_icgn_ms;
+    row.phase_locked = seeds.phase_locked;
+    row.anchors_accepted = seeds.anchors_accepted;
+    row.anchors_attempted = seeds.anchors_attempted;
 
     row.vertices = (int)seeds.ref_pts.size();
     row.coverage = seeds.coverage;
@@ -404,16 +442,19 @@ void measure_full_field(Row &row, const TruthFn &truth, SeedMethod method,
 
 void print_table(const std::vector<Row> &rows) {
     std::printf("\n");
-    std::printf("%-20s %-15s %6s %6s %3s %8s %8s %11s %11s %7s %11s %10s %10s %6s %8s %8s %7s %11s\n",
-                "scenario", "method", "vtx", "cov", "q", "seed_ms", "seedCPU",
+    std::printf("%-20s %-15s %6s %6s %3s %5s %8s %8s %11s %11s %7s %11s %10s %10s %6s %8s %8s %7s %11s\n",
+                "scenario", "method", "vtx", "cov", "q", "lock", "seed_ms", "seedCPU",
                 "vtx_med_du", "mesh_med_dP", "meshfr", "mesh_med_du",
                 "ff_wall_ms", "ff_cpu_ms", "par", "rssRet", "conv_%",
                 "mean_it", "ff_rms_u");
     std::printf("%s\n", std::string(200, '-').c_str());
     for (const Row &r : rows) {
-        std::printf("%-20s %-15s %6d %6.3f %3d %8.2f %8.2f %11.4f %11.3e %7.3f %11.4f %10.1f %10.1f %6.2f %8.1f %8.2f %7.2f %11.5f\n",
+        char lock[8];
+        if (r.anchors_attempted > 0) std::snprintf(lock, sizeof(lock), "%s", r.phase_locked ? "yes" : "NO");
+        else std::snprintf(lock, sizeof(lock), "-");
+        std::printf("%-20s %-15s %6d %6.3f %3d %5s %8.2f %8.2f %11.4f %11.3e %7.3f %11.4f %10.1f %10.1f %6.2f %8.1f %8.2f %7.2f %11.5f\n",
                     r.scenario.c_str(), r.method.c_str(), r.vertices, (double)r.coverage,
-                    r.quality, r.seed_ms, r.seed_cpu_ms, r.vtx_med_du, r.mesh_med_dux,
+                    r.quality, lock, r.seed_ms, r.seed_cpu_ms, r.vtx_med_du, r.mesh_med_dux,
                     r.mesh_frac, r.mesh_med_du, r.ff_total_ms, r.ff_cpu_ms, r.ff_par,
                     r.rss_retained_mb, r.ff_conv_pct, r.ff_mean_iters, r.ff_rms_u);
     }
@@ -427,18 +468,19 @@ void write_csv(const std::vector<Row> &rows, const char *path) {
         std::printf("    (could not open %s for writing)\n", path);
         return;
     }
-    std::fprintf(f, "scenario,method,vertices,coverage,quality,seed_ms,seed_cpu_ms,"
+    std::fprintf(f, "scenario,method,vertices,coverage,quality,phase_locked,anchors_accepted,anchors_attempted,seed_ms,seed_cpu_ms,"
                     "seed_precompute_ms,seed_icgn_ms,"
                     "vtx_med_du,vtx_p95_du,mesh_frac,mesh_med_du,"
                     "mesh_med_dP,mesh_p95_dP,ff_total_ms,ff_cpu_ms,ff_par,"
                     "rss_retained_mb,ff_seed_ms,"
                     "ff_conv_pct,ff_mean_iters,ff_simplex_calls,ff_rms_u,ff_rc\n");
     for (const Row &r : rows) {
-        std::fprintf(f, "%s,%s,%d,%.6f,%d,%.4f,%.4f,%.4f,%.4f,"
+        std::fprintf(f, "%s,%s,%d,%.6f,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,"
                         "%.6f,%.6f,%.6f,%.6f,%.6e,%.6e,"
                         "%.3f,%.3f,%.4f,%.2f,%.3f,%.4f,%.4f,%d,%.8f,%d\n",
                      r.scenario.c_str(), r.method.c_str(), r.vertices,
-                     (double)r.coverage, r.quality, r.seed_ms, r.seed_cpu_ms,
+                     (double)r.coverage, r.quality, r.phase_locked ? 1 : 0,
+                     r.anchors_accepted, r.anchors_attempted, r.seed_ms, r.seed_cpu_ms,
                      r.seed_precompute_ms, r.seed_icgn_ms, r.vtx_med_du,
                      r.vtx_p95_du, r.mesh_frac, r.mesh_med_du, r.mesh_med_dux,
                      r.mesh_p95_dux, r.ff_total_ms, r.ff_cpu_ms, r.ff_par,
@@ -738,6 +780,50 @@ TEST_CASE(SeedBench, Challenge14Sinusoid) {
     }
     print_table(rows);
     if (const char *csv = std::getenv("SEMPER_SEEDBENCH_CSV_C14")) write_csv(rows, csv);
+}
+
+// ---------------------------------------------------------------------------
+// Rotation and large-motion sweep.
+//
+// This is the regime the descriptor front-end was actually built for: DICe uses
+// its AKAZE Feature_Matching_Initializer for stereo and for re-acquiring lost
+// subsets, not for small-displacement 2D DIC. AKAZE is scale- and
+// rotation-invariant; phase correlation is not, and the anchor lattice's
+// fallback when the correlation peak is untrustworthy is only a +/-15 px
+// per-anchor search. So this sweep is expected to be where the lattice loses,
+// and it exists to find out where the crossover actually is.
+//
+// The `lock` column is the diagnostic: `NO` means phaseCorrelate's peak was
+// below kPhaseCorrMinResponse and every anchor fell back to its own coarse
+// search.
+// ---------------------------------------------------------------------------
+TEST_CASE(SeedBench, LargeMotionSweep) {
+    if (std::getenv("SEMPER_RUN_SEEDBENCH") == nullptr) {
+        std::printf("    skipped (set SEMPER_RUN_SEEDBENCH=1)\n");
+        return;
+    }
+
+    std::vector<Scenario> sweep;
+    sweep.push_back({"R_rot_2deg",    rotation(2.0),  0.0f});
+    sweep.push_back({"R_rot_5deg",    rotation(5.0),  0.0f});
+    sweep.push_back({"R_rot_15deg",   rotation(15.0), 0.0f});
+    sweep.push_back({"T_trans_25px",  affine(25.0f, -15.0f),  0.0f});
+    sweep.push_back({"T_trans_50px",  affine(50.0f, -30.0f),  0.0f});
+    sweep.push_back({"T_trans_100px", affine(100.0f, -60.0f), 0.0f});
+
+    const FullFieldParams params = big_motion_params();
+    std::vector<Row> rows;
+    for (const Scenario &sc : sweep) {
+        dictest::SpeckleField field(/*seed=*/11, W, H, BLOBS);
+        const Image ref = dictest::make_reference_image(field, W, H);
+        const Image def = dictest::make_deformed_image(field, W, H, sc.def);
+        const cv::Mat ref_gray = gray8(ref, sc.noise_sigma, 101);
+        const cv::Mat def_gray = gray8(def, sc.noise_sigma, 202);
+        run_candidates(sc.name, affine_truth(sc.def), ref_gray, def_gray, params, rows);
+    }
+
+    print_table(rows);
+    if (const char *csv = std::getenv("SEMPER_SEEDBENCH_CSV_BIG")) write_csv(rows, csv);
 }
 
 #endif // DIC_HAVE_OPENCV
