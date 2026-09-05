@@ -19,6 +19,7 @@
 #include "framework/synthetic.h"
 #include <semper/image.hpp>
 
+#include <cstdio>
 #include <vector>
 
 using Semper::Image;
@@ -116,4 +117,52 @@ TEST_CASE(Image, BoundaryDemotionLadderIsContinuousInRange) {
         CHECK(v6 >= 0.0f && v6 <= 255.0f);
         CHECK(v4 >= 0.0f && v4 <= 255.0f);
     }
+}
+
+// The batch-of-four interpolators are the one place in the engine where a
+// sequence of floating-point operations is written out twice: once in
+// semper_canon_sample_bicubic / _keys6 in the canonical header, and once
+// per lane in interpolate_bicubic_x4 / interpolate_keys_fourth_x4, which
+// exist so the compiler can pipeline four independent points.
+//
+// solve_icgn takes the batched path whenever four consecutive subset pixels
+// are all inside the guard and the scalar path otherwise, so the two must
+// agree to the LAST BIT or a subset's result would depend on where its
+// out-of-guard pixels happened to fall. Nothing pinned that until the ICGN
+// kernel needed the scalar sampler to be the definition of the arithmetic.
+//
+// Exact ==, deliberately: CHECK_NEAR here would pass while the property
+// the batching relies on was already broken.
+TEST_CASE(Image, BatchOfFourMatchesScalarExactly) {
+    dictest::SpeckleField field(1234, 96, 96, 900);
+    Image img = dictest::make_reference_image(field, 96, 96);
+
+    // Interior only -- that is these functions' documented precondition, and
+    // the guard in solve_icgn is tighter still.
+    unsigned rng = 20240917u;
+    auto next = [&rng]() {
+        rng = rng * 1664525u + 1013904223u;
+        return static_cast<float>((rng >> 8) & 0xFFFFu) / 65536.0f;
+    };
+
+    int bicubic_bad = 0, keys_bad = 0, groups = 0;
+    for (int g = 0; g < 512; ++g) {
+        float xs[4], ys[4];
+        for (int k = 0; k < 4; ++k) {
+            xs[k] = 8.0f + next() * 78.0f;
+            ys[k] = 8.0f + next() * 78.0f;
+        }
+        float b4[4], k4[4];
+        img.interpolate_bicubic_x4(xs, ys, b4);
+        img.interpolate_keys_fourth_x4(xs, ys, k4);
+        for (int k = 0; k < 4; ++k) {
+            if (b4[k] != img.interpolate_bicubic(xs[k], ys[k])) ++bicubic_bad;
+            if (k4[k] != img.interpolate_keys_fourth(xs[k], ys[k])) ++keys_bad;
+        }
+        ++groups;
+    }
+    std::printf("  Image: %d groups x 4 lanes, %d bicubic / %d keys mismatches\n",
+                groups, bicubic_bad, keys_bad);
+    CHECK(bicubic_bad == 0);
+    CHECK(keys_bad == 0);
 }

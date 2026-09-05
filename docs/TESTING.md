@@ -524,6 +524,7 @@ Interpolation ladder + gradients + blur, validated via mathematical identities
 | `GradientOfLinearRampIsExactSlope` | 5-point central difference is exact for degree ≤ 4 |
 | `BlurPreservesConstantImage` | Normalized kernel ⇒ constant in = constant out |
 | `BilinearOutOfBoundsReturnsZero` | The `0.0f` dead-pixel sentinel contract that ICGN's `val > 0` guard relies on |
+| `BatchOfFourMatchesScalarExactly` | The batched interpolators are the one arithmetic sequence written twice (canonical sampler vs. the per-lane copy in `interpolate_*_x4`); `solve_icgn` takes whichever path the guard allows, so a difference would make a subset's result depend on where its out-of-guard pixels fell. Exact `==` over 2 048 lanes |
 | `BoundaryDemotionLadderIsContinuousInRange` | 6×6→bilinear and 4×4→bilinear demotion never extrapolates outside [0,255] |
 
 ## Suite: `SubsetPrecomputer` — `unit/test_subset_precomputer.cpp`

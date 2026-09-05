@@ -97,7 +97,8 @@ kernels correct on baseline x86-64, where hardware FMA is not guaranteed.
 `include/semper/kernels/canonical_math.h` is written in the common subset
 of C99 and OpenCL C and is compiled **as the same text** into both the
 host library and the `.cl` kernels. It holds the reductions, the Keys 6x6
-and bicubic weights, and the small dense linear algebra (3x3 and 6x6
+and bicubic weights, the three image samplers behind
+`Image::interpolate_*`, and the small dense linear algebra (3x3 and 6x6
 inverses, the 6x6 matvec, the 6-norm).
 
 Those replace `Eigen`'s equivalents *on the host as well*, not only on
@@ -105,9 +106,20 @@ the device. Eigen's blocked, pivoting LU cannot be called from a kernel;
 rather than have the GPU chase Eigen, both sides use one definition.
 
 Because OpenCL C 1.2 has no generic address space, the three reduction
-bodies live in `canonical_reductions.inc` and are included once per
-address space (unsuffixed for private, `_g` for `__global`) rather than
-being copy-pasted.
+bodies live in `canonical_reductions.inc` and the samplers in
+`canonical_interp.inc`, each included once per address space (unsuffixed
+for private, `_g` for `__global`) rather than being copy-pasted.
+
+The samplers moved out of `image_processor.cpp` when the ICGN kernel
+needed them. An interpolator is the most parity-critical routine here:
+every ICGN iteration of every point goes through it, and a one-ulp
+disagreement does not stay one ulp — it changes the Newton step, which
+changes the next warp, which changes which pixels are sampled at all.
+The one sequence still written twice is the batch-of-four row sum in
+`interpolate_bicubic_x4` / `interpolate_keys_fourth_x4`, which exists so
+the compiler can pipeline four independent points;
+`Image.BatchOfFourMatchesScalarExactly` pins it to the scalar sampler
+with `==`.
 
 The header **fails the build** with `#error` if `__FAST_MATH__` is
 defined. Forgetting to put an including TU on the strict-FP list is a

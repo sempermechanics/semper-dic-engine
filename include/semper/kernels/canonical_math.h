@@ -189,6 +189,24 @@ SEMPER_INLINE void semper_keys4_weights(float s, float w[4]) {
     w[3] =  0.5f * s3 - 0.5f * s2;
 }
 
+/* The samplers are single-sourced the same way the reductions are, and
+ * for the same reason: the ICGN kernel needs __global variants, and a
+ * hand-maintained device copy of an interpolator would drift. */
+
+#define SEMPER_AS
+#define SEMPER_FN(name) name
+#include "canonical_interp.inc"
+#undef SEMPER_AS
+#undef SEMPER_FN
+
+#if SEMPER_IS_OPENCL
+#define SEMPER_AS __global
+#define SEMPER_FN(name) name##_g
+#include "canonical_interp.inc"
+#undef SEMPER_AS
+#undef SEMPER_FN
+#endif
+
 /* ---------------------------------------------------------------------
  * MATRIX INVERSES
  *
