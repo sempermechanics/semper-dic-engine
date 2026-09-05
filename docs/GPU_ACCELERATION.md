@@ -48,7 +48,7 @@ run the bit-exact ICGN path and is refused for that stage.
 | **0** | Make the CPU reference reproducible. Strict FP, canonical reduction order, canonical linear algebra replacing Eigen in the mirrored paths, deterministic Path B. **No GPU code.** | **Complete** |
 | **1** | OpenCL runtime + build plumbing: `SEMPER_OPENCL`, dlopen loader, device capability gate, kernel embedding. **No compute kernels.** | **Complete** |
 | **2** | Strain VSG on GPU. One work-item per grid point, fp64. Currently the only fully serial numerical stage. | **Complete** |
-| **3** | Hessian pre-pass on GPU. One work-item per grid point. | Pending |
+| **3** | Hessian pre-pass on GPU. One work-item per grid point. | In progress — CPU reference canonical, kernel pending |
 | **4** | Path A ICGN on GPU. **One work-item per subset**, so the reduction keeps the canonical order rather than becoming a cross-lane tree. | Pending |
 | **5** | Path B wavefront on GPU. Reuses the Phase 4 kernel; one launch per round. Only possible because Phase 0 made Path B round-based. | Pending |
 | **6** | Image prep (gradients, optional blur). AKAZE stays on CPU — randomized RANSAC, poor return. | Pending |

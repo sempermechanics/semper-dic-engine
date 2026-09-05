@@ -1,5 +1,6 @@
 #include <semper/subset.hpp>
 #include <semper/assert.hpp>
+#include <semper/kernels/canonical_math.h>
 #include "util/log.hpp"
 #include <cmath>
 
@@ -100,8 +101,16 @@ namespace Semper {
             data.norm_ref_intensities[i] = (data.ref_intensities[i] - data.mean_intensity) / data.std_dev;
         }
 
-        // 🚀 Convert to Matrix<float>
-        Eigen::Matrix<float, 6, 6> H = Eigen::Matrix<float, 6, 6>::Zero();
+        // Row-major plain float, not Eigen. This Hessian is what the GPU
+        // pre-pass has to reproduce bit for bit, and Eigen packs a fixed-size
+        // outer product differently at different -march levels -- the same
+        // hazard optimization_engine.cpp:100 documents for the warp matrix.
+        // semper_mat6_add_outer accumulates the upper triangle only and
+        // mirrors afterwards, which is bit-identical to the full
+        // sd*sd.transpose() it replaces: s[r]*s[c] and s[c]*s[r] are the same
+        // product of the same two floats, added over the same scan.
+        float H[36];
+        for (int i = 0; i < 36; ++i) H[i] = 0.0f;
         idx = 0;
 
         // 🚀 SIMD SoA mirror must track n (see Types.h / SimdKernels.h)
@@ -114,41 +123,63 @@ namespace Semper {
                 float gx = data.gx_vec[idx] / data.std_dev;
                 float gy = data.gy_vec[idx] / data.std_dev;
 
-                Eigen::Matrix<float, 6, 1> sd;
-                sd << gx, gy, gx * (float)x, gx * (float)y, gy * (float)x, gy * (float)y;
+                const float sd[6] = {gx, gy,
+                                     gx * (float)x, gx * (float)y,
+                                     gy * (float)x, gy * (float)y};
 
-                data.steepest_descent_images[idx] = sd;
+                // steepest_descent_images stays Eigen: it is 6x1, so storage
+                // order is not a question, and it is part of the published
+                // SubsetData layout.
+                Eigen::Matrix<float, 6, 1> &sd_e = data.steepest_descent_images[idx];
+                for (int k = 0; k < 6; ++k) sd_e(k) = sd[k];
 
                 // 🚀 SoA mirror for the portable SIMD hot loop
-                data.sdi_planes[idx]         = sd(0);
-                data.sdi_planes[n + idx]     = sd(1);
-                data.sdi_planes[2 * n + idx] = sd(2);
-                data.sdi_planes[3 * n + idx] = sd(3);
-                data.sdi_planes[4 * n + idx] = sd(4);
-                data.sdi_planes[5 * n + idx] = sd(5);
+                data.sdi_planes[idx]         = sd[0];
+                data.sdi_planes[n + idx]     = sd[1];
+                data.sdi_planes[2 * n + idx] = sd[2];
+                data.sdi_planes[3 * n + idx] = sd[3];
+                data.sdi_planes[4 * n + idx] = sd[4];
+                data.sdi_planes[5 * n + idx] = sd[5];
 
                 // 🚀 DICe PARITY: Intensity-only check
                 if (data.ref_intensities[idx] >= -5.0f) {
-                    H.noalias() += sd * sd.transpose();
+                    semper_mat6_add_outer(H, sd);
                 }
                 idx++;
             }
         }
 
-        float det = H.determinant();
-        float det_2x2 = H(0,0)*H(1,1) - H(1,0)*H(0,1);
-        float norm_2x2 = H(0,0)*H(0,0) + H(0,1)*H(0,1) + H(1,0)*H(1,0) + H(1,1)*H(1,1);
+        semper_mat6_symmetrize(H);
+
+        // Gauss-Jordan with partial pivoting, not Eigen's PartialPivLU. It
+        // returns 0 only on an exactly-zero pivot, where det is 0 and the
+        // threshold below would reject the point anyway -- but it is checked
+        // FIRST, because H_inv_rm is left untouched on failure.
+        float H_inv_rm[36], det = 0.0f;
+        const int invertible = semper_inv6x6(H, H_inv_rm, &det);
+
+        float det_2x2 = H[0*6+0]*H[1*6+1] - H[1*6+0]*H[0*6+1];
+        float norm_2x2 = H[0*6+0]*H[0*6+0] + H[0*6+1]*H[0*6+1]
+                       + H[1*6+0]*H[1*6+0] + H[1*6+1]*H[1*6+1];
         float cond_2x2 = (std::abs(det_2x2) > 1e-12f) ? (norm_2x2 / std::abs(det_2x2)) : 1.0e13f;
 
-        if (std::abs(det) < 1e-6f || cond_2x2 > 1.0e12f) {
+        if (!invertible || std::abs(det) < 1e-6f || cond_2x2 > 1.0e12f) {
             data.H_inv = Eigen::Matrix<float, 6, 6>::Zero();
             data.is_initialized = false;
             return;
         } else {
-            data.H_inv = H.inverse();
+            // Element-wise, NOT a memcpy: SubsetData::H_inv is Eigen and so
+            // column-major, which optimization_engine.cpp:126 transposes
+            // straight back on read. The inverse of a symmetric matrix is
+            // symmetric in exact arithmetic but NOT bit for bit after
+            // Gauss-Jordan, so getting this transpose wrong would be silent.
+            for (int r = 0; r < 6; ++r)
+                for (int c = 0; c < 6; ++c) data.H_inv(r, c) = H_inv_rm[r * 6 + c];
         }
         // ── LM ADDITION ─────────────────────────────────────────────────────────
-        data.H = H;   // preserve raw Hessian for LM damping in solve_icgn
+        // Same row-major -> column-major transpose as H_inv above.
+        for (int r = 0; r < 6; ++r)
+            for (int c = 0; c < 6; ++c) data.H(r, c) = H[r * 6 + c];
         // ────────────────────────────────────────────────────────────────────────
         data.is_initialized = true;
     }
@@ -216,7 +247,9 @@ namespace Semper {
         // 🚀 REMOVED: result.sssig
 
         // ── Pass 3: Hessian accumulation (upper triangle only → 21 muls instead of 36) ──
-        Eigen::Matrix<float, 6, 6> H = Eigen::Matrix<float, 6, 6>::Zero();
+        // Row-major plain float for the same reason as precompute_subset.
+        float H[36];
+        for (int i = 0; i < 36; ++i) H[i] = 0.0f;
 
         for (int oy = -half; oy <= half; ++oy) {
             const float* int_row = &ref_img.intensities[(cy + oy) * ref_img.width + cx - half];
@@ -234,40 +267,39 @@ namespace Semper {
                 const float gy = gy_row[ox + half] * inv_std;
                 const float fx = static_cast<float>(ox);
 
-                const float s0 = gx,      s1 = gy;
-                const float s2 = gx * fx, s3 = gx * fy;
-                const float s4 = gy * fx, s5 = gy * fy;
+                const float sd[6] = {gx, gy, gx * fx, gx * fy, gy * fx, gy * fy};
 
-                // 21-op upper-triangle accumulation
-                H(0,0)+=s0*s0; H(0,1)+=s0*s1; H(0,2)+=s0*s2; H(0,3)+=s0*s3; H(0,4)+=s0*s4; H(0,5)+=s0*s5;
-                H(1,1)+=s1*s1; H(1,2)+=s1*s2; H(1,3)+=s1*s3; H(1,4)+=s1*s4; H(1,5)+=s1*s5;
-                H(2,2)+=s2*s2; H(2,3)+=s2*s3; H(2,4)+=s2*s4; H(2,5)+=s2*s5;
-                H(3,3)+=s3*s3; H(3,4)+=s3*s4; H(3,5)+=s3*s5;
-                H(4,4)+=s4*s4; H(4,5)+=s4*s5;
-                H(5,5)+=s5*s5;
+                // 21-op upper-triangle accumulation, in the identical order
+                // the six explicit rows here used to be written out in.
+                semper_mat6_add_outer(H, sd);
             }
         }
 
         // Symmetrize lower triangle
-        for (int r = 1; r < 6; ++r)
-            for (int c = 0; c < r; ++c)
-                H(r, c) = H(c, r);
+        semper_mat6_symmetrize(H);
 
-        const float det = H.determinant();
-        float det_2x2 = H(0,0)*H(1,1) - H(1,0)*H(0,1);
-        float norm_2x2 = H(0,0)*H(0,0) + H(0,1)*H(0,1) + H(1,0)*H(1,0) + H(1,1)*H(1,1);
+        float H_inv_rm[36], det = 0.0f;
+        const int invertible = semper_inv6x6(H, H_inv_rm, &det);
+
+        float det_2x2 = H[0*6+0]*H[1*6+1] - H[1*6+0]*H[0*6+1];
+        float norm_2x2 = H[0*6+0]*H[0*6+0] + H[0*6+1]*H[0*6+1]
+                       + H[1*6+0]*H[1*6+0] + H[1*6+1]*H[1*6+1];
         float cond_2x2 = (std::abs(det_2x2) > 1e-12f) ? (norm_2x2 / std::abs(det_2x2)) : 1.0e13f;
 
         // ── LM ADDITION ─────────────────────────────────────────────────────────
-        result.H = H;   // preserve raw Hessian before it is inverted
+        // preserve raw Hessian before it is inverted; element-wise because
+        // CachedHessianData::H is Eigen and therefore column-major
+        for (int r = 0; r < 6; ++r)
+            for (int c = 0; c < 6; ++c) result.H(r, c) = H[r * 6 + c];
         // ────────────────────────────────────────────────────────────────────────
 
-        if (std::abs(det) < 1e-6f || cond_2x2 > 1.0e12f) {
+        if (!invertible || std::abs(det) < 1e-6f || cond_2x2 > 1.0e12f) {
             result.H_inv = Eigen::Matrix<float, 6, 6>::Zero();
             result.valid = false;
             return result;
         } else {
-            result.H_inv = H.inverse();
+            for (int r = 0; r < 6; ++r)
+                for (int c = 0; c < 6; ++c) result.H_inv(r, c) = H_inv_rm[r * 6 + c];
         }
 
         result.valid = true;

@@ -164,6 +164,16 @@ fixtures are pinned to the toolchain that captured them. This is why
 exactly: tight enough to catch any real change in engine arithmetic,
 loose enough to survive a glibc bump. The exact gate is the CI job.
 
+### Recaptures of the committed fixtures
+
+A golden fixture is recaptured only when a deliberate change to engine
+arithmetic moves it, never to make a red test green. Each one is recorded
+here with what moved and by how much.
+
+| When | Fixture | Why |
+|---|---|---|
+| GPU Phase 3a | `golden_corpus.bin.{bicubic,keys6x6}` | The static Hessian moved off Eigen's `PartialPivLU` inverse onto `semper_inv6x6` (Gauss-Jordan, partial pivoting), so the Phase 3 pre-pass kernel has a reference it can reproduce. Both are correct inverses of the same matrix and differ only in the last few digits, which shifts the ICGN iterate path: 394 of 580 points (4x4) and 399 of 580 (6x6) moved by roughly 1e-5, with **0 status mismatches** — no point changed whether it converged. Recaptured on Linux GCC Release, the platform the fixture is pinned to; the accompanying accumulation change was separately shown to be bit-identical, and `full_field_golden.bin` was verified **unchanged** and was not recaptured. |
+
 ## If the determinism job fails
 
 Something in the list above was broken. In rough order of likelihood:
