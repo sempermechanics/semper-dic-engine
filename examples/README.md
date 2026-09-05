@@ -15,6 +15,9 @@ Redistributed under [samples/LICENSE.DICe](samples/LICENSE.DICe) (Sandia / NTESS
 Uses the same **subset solver** path as
 `tests/dice/test_translation_real_image.cpp`:
 
+Needs **OpenCV 4.8+** (see the note in [../README.md](../README.md#host-tests));
+this path builds the vendored copy, so the submodule checkout below covers it.
+
 ```bash
 # from engine repo root
 git submodule update --init --recursive
@@ -48,6 +51,26 @@ python examples/python/run_synthetic.py
 #    subset-level golden is the C++ demo / dic_tests)
 python examples/python/run_translation.py
 ```
+
+## Choosing `step`, `subset` and `strain_window`
+
+`strain_window` is a diameter **in pixels**, not a number of grid points, and
+it must be at least **`2 * step`**.
+
+Strain is fitted by least squares over a circular window of radius
+`strain_window / 2` around each grid point. The nearest neighbouring point is
+`step` pixels away, so below `2 * step` no neighbour falls inside the window:
+every window collapses to its own centre, fails the "at least 3 points" test,
+and **the whole field is discarded** — the run returns zero points.
+
+| `strain_window / step` | Points in window | Result |
+|---|---|---|
+| `< 2` | 1 (centre only) | Whole field dropped |
+| `2` | 5 (plus shape) | Minimum workable |
+| `>= 3` | 9 or more | Recommended |
+
+The demos below use `3 * step`. `subset` is independent of this — it is the
+correlation window for the displacement solve, not the strain fit.
 
 ## Output layout (Frozen)
 

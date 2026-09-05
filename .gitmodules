@@ -4,3 +4,8 @@
 [submodule "third_party/opencv"]
 	path = third_party/opencv
 	url = https://github.com/opencv/opencv.git
+	# scripts/sparse-opencv.sh writes doc/ and data/ CMakeLists.txt stubs into
+	# this worktree as a documented setup step, so the submodule reads dirty
+	# forever afterwards and every `git status` shows noise. .gitignore already
+	# treats those stubs as regeneratable; this stops them being reported.
+	ignore = dirty

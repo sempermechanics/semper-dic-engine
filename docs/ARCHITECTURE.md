@@ -256,8 +256,8 @@ Where it is polled, and why there:
 | Site | Shape |
 |---|---|
 | Hessian pre-pass, Path A mesh execution | `if (cancel_requested()) continue;` — OpenMP forbids breaking out of a parallel `for`, so a cancel skips the remaining iterations |
-| Path B queue workers | `return` at the top of the work loop, plus the flag in the condition-variable predicate |
-| Path B's CV wait | bounded (`wait_for`, 20 ms) — a worker parked on an empty queue has no one to notify it of a cancel, so it re-checks on a timer |
+| Path B round loop | `return` at the top of each round, before the frontier is expanded |
+| Path B round body | `if (cancel_requested()) continue;` inside the OpenMP `for`, same shape as Path A — there is no queue to park on since the wavefront rewrite, so no timed re-check is needed |
 | After Path A, after Path B | `return kCancelled` — a cancelled field is partial, so strain and packing are never run on it |
 
 `run_full_field` returns `kCancelled` (**-99**), which is deliberately the same
@@ -295,6 +295,7 @@ starts — a pending edit can never reach the engine uncommitted.
 | Path | Role |
 |---|---|
 | `include/semper/` | Public headers (`types`, `image`, `subset`, `solver`, `strain`, `simd`, `pipeline`, `io`, `seeding`, `semper_c.h`) |
+| `include/semper/kernels/` | `canonical_math.h` + `canonical_reductions.inc` — the reduction order, interpolation weights and small dense linear algebra, written in the C99 / OpenCL C common subset so one text compiles into both the host library and the device kernels |
 | `src/math/` | Image / SubsetPrecomputer / OptimizationEngine |
 | `src/strain/` | StrainCalculator |
 | `src/io/` | Platform-agnostic OpenCV decode |
@@ -345,8 +346,8 @@ those trees from the worktree (~100+ MB). CMake only needs `modules/`,
   the C++/JNI build (the optional `bindings/python` path uses pybind11
   separately).
 - OpenCV compiles with its **own** default flags: `add_subdirectory` runs before
-  the engine's aggressive `-O3 -ffast-math` flags are set, so those apply
-  to the DIC code only, not to OpenCV.
+  the engine's optimization flags are set, so those apply to the DIC code
+  only, not to OpenCV.
 
 The host test build ([TESTING.md](TESTING.md)) consumes OpenCV's universal-intrinsics
 header from the submodule source; the two generated headers it needs are
@@ -362,10 +363,23 @@ configure.
 - SIMD portability comes from `include/semper/simd.hpp`; there is **no**
   architecture-conditional code left in the engine (`#if __aarch64__` was
   removed — do not reintroduce it; extend the kernels instead).
-- Production flags: `-O3 -ffast-math -fopenmp` on host; Android also uses
-  `-flto` on the pipeline/JNI targets. Note `-ffast-math` disables NaN
-  semantics; the code uses explicit sentinels (`-1.0f`, `-1000.0f`) instead of
-  `std::isnan`. Preserve this convention. Host shared-lib builds intentionally
-  omit `-flto` (MinGW LTO + DLL is unstable).
+- Production flags differ **by target**, and the split is load-bearing:
+  - `semper_math` (the four numerically-mirrored TUs — `image_processor`,
+    `subset_precomputer`, `optimization_engine`, `strain_calculator`):
+    `-O3 -fno-fast-math -ffp-contract=off`. These define the canonical
+    reference the OpenCL kernels must reproduce bit-for-bit, so
+    reassociation and implicit FMA contraction are disallowed.
+    `include/semper/kernels/canonical_math.h` `#error`s if `__FAST_MATH__`
+    is set, making a missing flag a build failure rather than a silent loss
+    of the guarantee. See [DETERMINISM.md](DETERMINISM.md).
+  - `semper_pipeline`: `-O3 -ffast-math -fopenmp`. It orchestrates but
+    performs no mirrored arithmetic.
+  - Android additionally uses `-flto` on the pipeline/JNI targets; host
+    shared-lib builds intentionally omit it (MinGW LTO + DLL is unstable).
+- The code uses explicit sentinels (`-1.0f`, `-1000.0f`) rather than
+  `std::isnan`, originally because `-ffast-math` disables NaN semantics.
+  `semper_math` no longer sets that flag, but the convention is retained:
+  `semper_pipeline` still does, and the sentinels are part of the Frozen
+  output contract. Preserve it.
 - 16 KB page alignment: `-Wl,-z,max-page-size=16384` on the Android shared lib for
   Android 15+ devices.

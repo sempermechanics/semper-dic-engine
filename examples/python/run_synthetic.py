@@ -47,7 +47,12 @@ def main() -> int:
     print(f"semper {semper.__version__} — synthetic +{dx} px X shift")
     eng = semper.Engine()
     eng.set_reference(ref)
-    res = eng.run(deformed, rect=(40, 40, 176, 176), step=20, subset=31, strain_window=5)
+    # strain_window is in PIXELS and must be at least 2*step, or the VSG
+    # window contains only its own centre point, fails the valid_pts >= 3
+    # test, and every point is dropped by the strain filter. 3*step gives
+    # a better-conditioned plane fit. See docs/MATHEMATICS.md.
+    res = eng.run(deformed, rect=(40, 40, 176, 176), step=20, subset=31,
+                  strain_window=60)
 
     if res.count <= 0:
         print("FAIL: no points", file=sys.stderr)

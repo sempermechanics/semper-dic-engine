@@ -58,7 +58,9 @@ def main() -> int:
         rect=(64, 64, 384, 384),
         step=32,
         subset=27,
-        strain_window=5,
+        # In pixels, and at least 2*step or every VSG window degenerates to
+        # its own centre and the whole field is dropped. 3*step here.
+        strain_window=96,
         progress=lambda pct: print(f"\r  progress: {pct:3d}%", end="", flush=True),
     )
     print()

@@ -37,7 +37,14 @@ def test_recovers_rigid_translation():
 
     eng = semper.Engine()
     eng.set_reference(ref)
-    res = eng.run(deformed, rect=(40, 40, 176, 176), step=20, subset=31, strain_window=5)
+    # strain_window is a diameter in PIXELS and must be >= 2*step, else every
+    # VSG window holds only its own centre point, fails the valid_pts >= 3 test,
+    # and the strain filter drops the whole field -- making res.count 0. This
+    # test asserted count > 0 with strain_window=5 at step=20 (ratio 0.25), so
+    # it could only ever have failed; nothing caught it because the binding
+    # tests run solely under the manually-dispatched wheels workflow.
+    res = eng.run(deformed, rect=(40, 40, 176, 176), step=20, subset=31,
+                  strain_window=60)
 
     assert res.count > 0
     assert res.points.shape[1] == 8
@@ -50,7 +57,7 @@ def test_recovers_rigid_translation():
 def test_missing_reference_errors():
     eng = semper.Engine()
     with pytest.raises(semper.DicError) as excinfo:
-        eng.run(_speckle(), rect=(0, 0, 128, 128), step=20, subset=31, strain_window=5)
+        eng.run(_speckle(), rect=(0, 0, 128, 128), step=20, subset=31, strain_window=60)
     # Tighten: the code must be the documented INIT sentinel, not just "some error".
     assert excinfo.value.code == semper.ERR_INIT
 
@@ -61,7 +68,7 @@ def test_degenerate_roi_raises_with_roi_code():
     eng.set_reference(ref)
     # rect_w < step ⇒ empty grid ⇒ ROI error.
     with pytest.raises(semper.DicError) as excinfo:
-        eng.run(ref, rect=(0, 0, 10, 10), step=20, subset=31, strain_window=5)
+        eng.run(ref, rect=(0, 0, 10, 10), step=20, subset=31, strain_window=60)
     assert excinfo.value.code == semper.ERR_ROI
 
 
@@ -70,7 +77,7 @@ def test_degenerate_roi_no_raise_returns_negative_result():
     eng = semper.Engine()
     eng.set_reference(ref)
     res = eng.run(
-        ref, rect=(0, 0, 10, 10), step=20, subset=31, strain_window=5,
+        ref, rect=(0, 0, 10, 10), step=20, subset=31, strain_window=60,
         raise_on_error=False,
     )
     # code < 0 branch in __init__.py: count carries the code, points is empty,
@@ -95,7 +102,7 @@ def test_set_reference_float_array_is_cast_not_rejected():
     ref_f64 = _speckle().astype(np.float64)
     eng.set_reference(ref_f64)  # must NOT raise
     res = eng.run(
-        ref_f64, rect=(0, 0, 128, 128), step=20, subset=31, strain_window=5,
+        ref_f64, rect=(0, 0, 128, 128), step=20, subset=31, strain_window=60,
         raise_on_error=False,
     )
     assert res.metrics.shape == (17,)

@@ -69,9 +69,14 @@ pip install ./bindings/python
 pytest bindings/python/tests
 ```
 
-> Host math/DICe tests compile with `-ffast-math` deliberately — the same
-> floating-point model as the production library, so numerical regressions
-> surface here first.
+> The whole test tree compiles with `-fno-fast-math -ffp-contract=off`, the
+> same floating-point model as `semper_math` in the shipped library, so
+> numerical regressions surface here first. This applies to the harness too,
+> not just the engine sources: `framework/synthetic.h` sums hundreds of
+> `std::exp` terms per pixel, and under `-ffast-math` GCC vectorizes that
+> onto libmvec — whose AVX2 `exp` disagrees with its SSE2 one, so the
+> generated **images** differed between `-march` levels. A determinism gate
+> whose own inputs are non-deterministic proves nothing.
 
 ---
 
@@ -96,35 +101,56 @@ translation ≤ 0.02 px, displacement gradients ≤ 2×10⁻³.
 
 ## Numerical reproducibility contract
 
-What "the same result" means across builds, and when a difference is a bug.
+What "the same result" means, and when a difference is a bug.
 
-**Same APK, same device, same inputs → bit-identical results.**
-Guarded by `Engine.RepeatSolve_BitIdentical`. Any run-to-run variation on
-identical inputs is a defect (threading race, uninitialized memory).
+> This section changed substantially. The engine used to compile with
+> `-ffast-math` and reduce over hardware-width SIMD lanes, which made results
+> legitimately build-specific; the tolerances below were sized for that. Both
+> are now pinned. See [DETERMINISM.md](DETERMINISM.md) for the full contract.
 
-**Different builds / ABIs / dependency versions → small drift is expected.**
-The engine compiles with `-ffast-math` and uses FMA-based SIMD reductions, so
-any change to the compiler, NDK, OpenCV build (e.g. Carotene on ARM vs the
-generic path), Eigen version, or kernel summation order legally perturbs
-floating-point rounding. Because ICGN is iterative, last-bit differences per
-iteration shift the convergence path. Empirically (verified across the
-prebuilt-SDK → from-source OpenCV migration, ARM NEON → portable SIMD):
+**Same build, same inputs → bit-identical.** Two tiers guard this:
 
-| Quantity | Expected cross-build agreement |
+| Scope | Test |
 |---|---|
-| Displacements (U, V) | ≤ ~1×10⁻⁴ px (typically identical to 5 decimals) |
-| Strains (Exx, Eyy, Exy) | ≤ ~1 µε (0.001 mε) |
-| Solver stats (solved/dead counts, convergence %) | identical |
-| Report max/min **locations** | may hop between near-tied grid points |
+| One subset solve, repeated | `Engine.RepeatSolve_BitIdentical` |
+| Concurrent solves vs single-threaded | `Robustness.ConcurrentSolves_BitIdenticalToSingleThread` |
+| A whole `run_full_field` solve, repeated | `FullFieldGolden.RepeatSolve_IsDeterministic` |
 
-Anything beyond this — values off in the first or second significant digit,
-extrema in unrelated regions, changed dead-point counts on the same input —
-is a real regression: bisect with the `Engine` suite per-ABI.
+The third is the one that matters most and is newest. Path B used to drain a
+shared priority queue from racing threads, so each point's guess came from
+whichever parent won a `compare_exchange`: measured at **0 of 15 runs
+reproducing**, with 10-230 of ~3100 output floats differing between two
+consecutive solves of the same binary. Nothing caught it, because the other
+two tests are subset-level and the golden corpus never enters
+`run_full_field`. It is now a level-synchronous wavefront and reproduces
+15/15.
 
-Trade-off note: `-ffast-math` makes results build-specific by design. If
-bit-reproducibility across builds ever becomes a requirement, compile `core/`
-and `preprocessing/` with `-fno-fast-math` and re-benchmark; the explicit SIMD
-kernels already do the heavy lifting, so the expected cost is small.
+**Different target ISA, same toolchain → also bit-identical.** This is the
+part that used to be "small drift is expected". SSE2, AVX2 and NEON now
+produce byte-identical output, enforced by the `determinism` CI job, which
+builds the same source at `-march=x86-64` and `-march=x86-64-v3` and
+byte-compares both golden fixtures. Reproduce it locally with the commands in
+[tests/README.md](../tests/README.md#determinism).
+
+**Different toolchain or libm → small drift possible, in the fixtures only.**
+The remaining dependency is not in the engine: `tests/framework/synthetic.h`
+builds its ground-truth images from several hundred `std::exp` terms per
+pixel, so a different libm can move the last ulp of the *input*. This is why
+`test_golden_corpus.cpp` compares at 1e-6 px / 1e-7 strain rather than
+exactly — tight enough to catch any real change in engine arithmetic, loose
+enough to survive a glibc bump. The exact gate is the CI job, not the
+tolerance.
+
+| Quantity | Expected agreement across ISAs (same toolchain) |
+|---|---|
+| Displacements (U, V) | **exact** |
+| Strains (Exx, Eyy, Exy) | **exact** |
+| Solver stats (solved/dead counts, convergence %) | **exact** |
+| Report max/min locations | **exact** |
+
+Any difference at all across ISAs is now a regression, not noise. Do not
+widen a tolerance to absorb one — work the checklist in
+[DETERMINISM.md](DETERMINISM.md).
 
 ---
 
@@ -197,6 +223,80 @@ scalar fallback.
 | `Znssd_PerfectMatchIsZero` | Perfectly correlated signals score ≈ 0 (the convergence anchor) |
 | `ErrorAndGradient_MatchesScalarOracle` | Fused kernel: error AND all 6 SoA gradient projections match |
 | `FusedErrorEqualsStandaloneZnssd` | Contract: fused error term ≡ standalone `znssd_sum` (callers assume it) |
+
+The tests above prove the kernels are *accurate*. These prove something
+stricter, and for the OpenCL work more important — that they are
+**bit-identical** to the canonical reference the device kernels will
+reproduce. Exact `==`, never a tolerance: if the CPU vector path drifts from
+the reference by one ulp there is no single answer for the GPU to match.
+
+| Test | Proves |
+|---|---|
+| `SumSqDiff_BitIdenticalToCanonical` | Vector path ≡ `semper_canon_sum_sq_diff`, every size |
+| `Znssd_BitIdenticalToCanonical` | Vector path ≡ `semper_canon_znssd_sum` |
+| `ErrorAndGradient_BitIdenticalToCanonical` | Fused kernel ≡ canonical, error and all 6 gradients |
+| `VectorWidthIsPinnedTo4Lanes` | `CV__SIMD_FORCE_WIDTH` took effect. The lane count **is** the summation order, so an 8-lane register silently changes every reduction's association |
+
+## Suite: `CanonicalReduce` — `unit/test_canonical_reduce.cpp`
+
+Pins the reduction **order**, not merely the value, in
+`include/semper/kernels/canonical_math.h`. Every long summation accumulates
+into four stride-4 accumulators combined as `((a0+a1)+(a2+a3))`, with the
+tail added to the combined result in index order. A reduction that produces
+the mathematically-correct sum by a different association fails here, because
+the GPU would then have no fixed target.
+
+| Test | Proves |
+|---|---|
+| `SumSqDiff_MatchesSpecExactly` | Matches an independently-written restatement of the documented order, across every tail residue and n = 729 (a 27 px subset) |
+| `ZnssdSum_MatchesSpecExactly` | Same, for the ZNSSD residual |
+| `FusedGradient_ResidualMatchesZnssdSum` | Fused kernel's residual ≡ the standalone one, and each of the six gradient planes independently follows the same association |
+| `BlockedBeatsNaiveOnAverageAgainstDoubleOracle` | Pinning the order costs no accuracy. Stated across 300 trials, not per-sample: pairwise summation wins on error *growth*, but on any single input a naive accumulator can land closer by luck of rounding |
+| `EmptyInputReturnsZero` | n = 0 (a fully masked subset) returns exactly zero rather than NaN |
+
+## Suite: `CanonicalInverse` — `unit/test_canonical_inverse.cpp`
+
+`semper_inv3x3` (fp64, strain normal equations) and `semper_inv6x6` (fp32,
+ICGN Hessian) replace Eigen's `inverse()` on **both** sides of the CPU/GPU
+boundary — Eigen's blocked pivoting LU cannot be called from a kernel, and
+having the device chase it is not a contract anyone can hold. Verified
+structurally (`A·A⁻¹ = I`, known analytic inverses) rather than by diffing
+against Eigen, because matching Eigen is explicitly not the goal.
+
+| Test | Proves |
+|---|---|
+| `Inv3x3_KnownAnalyticInverse` | Exactly-representable diagonal case is exact |
+| `Inv3x3_RoundTripsToIdentity` | 200 well-conditioned matrices, residual ≤ 1e-12 |
+| `Inv3x3_SingularIsRejected` | Structurally rank-deficient input returns failure, not garbage |
+| `Inv6x6_IdentityIsItsOwnInverse` | Trivial case exact, determinant 1 |
+| `Inv6x6_RoundTripsToIdentityOnSpdHessians` | 50 SPD matrices shaped like real ICGN Hessians (built as JᵀJ) |
+| `Inv6x6_RequiresRowPivoting` | An anti-diagonal matrix — every leading pivot is zero without row swaps |
+| `Inv6x6_SingularIsRejected` | Duplicate row detected |
+| `Inv6x6_PivotTieBreakIsLowestRow` | Equal-magnitude pivots resolve deterministically. An unspecified tie-break is a bit-exactness hole, and ties happen routinely on structured matrices |
+
+## Suite: `FullFieldGolden` — `integration/test_full_field_golden.cpp`
+
+The end-to-end regression and determinism gate. `GoldenCorpus` pins the
+*subset* solver by calling `precompute_subset` / `calculate_deformation`
+directly; it never enters `run_full_field`, which left the entire
+orchestration layer — AKAZE seeding, the Delaunay mesh guess field, Path A,
+Path B propagation, and strain — with no golden reference at all. Those are
+exactly the stages moving to the GPU.
+
+| Test | Proves | Failure would mean |
+|---|---|---|
+| `CaptureOrCompare` | Packed 8-float output and the counting metrics match `fixtures/full_field_golden.bin` for a translation and an affine scenario | Orchestration changed: seeding, mesh, path split, or strain |
+| `RepeatSolve_IsDeterministic` | Two solves in one process agree **exactly** | An order-dependent step is back in the pipeline — a guess read mid-round, or a tie-break resolved by completion order rather than flat index |
+
+Values compare at 1e-6 px / 1e-7 strain and grid coordinates exactly; the
+counting metrics compare exactly, and timing slots are excluded because they
+differ every run by construction.
+
+> Its `STRAIN_WIN` is 48 against `step` 12, not the 15 the contract test
+> uses. `strain_window` is a diameter in pixels and must be at least
+> `2 * step`, or the VSG window contains only its own centre point, fails
+> `valid_pts >= 3`, and the strain filter drops the **entire** field
+> (484 attempted → 0 output).
 
 ## Suite: `Image` — `unit/test_image.cpp`
 

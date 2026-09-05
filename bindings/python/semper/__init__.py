@@ -9,7 +9,7 @@ Example
 >>> eng = semper.Engine()
 >>> eng.set_reference(ref_u8)                     # 2-D uint8 array or encoded bytes
 >>> res = eng.run(def_u8, rect=(0, 0, 512, 512),
-...               step=10, subset=21, strain_window=5)
+...               step=10, subset=21, strain_window=30)
 >>> res.points.shape          # (N, 8): x, y, u, v, exx, eyy, exy, corr
 (2401, 8)
 """
