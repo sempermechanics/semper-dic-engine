@@ -97,9 +97,14 @@ AnchorSeedResult solve_anchor_lattice(
     stride = std::max(tuning::kAnchorStrideMin, stride);
     stride = std::min(stride, std::max(1, std::min(gridW, gridH) / 3));
 
+    // The lattice must include the last row and column. Stopping at stride
+    // multiples leaves the convex hull short of the ROI edge, which costs
+    // coverage exactly where the mesh has no triangle to interpolate from.
     std::vector<int> lat_x, lat_y;
     for (int gx = 0; gx < gridW; gx += stride) lat_x.push_back(gx);
+    if (lat_x.back() != gridW - 1) lat_x.push_back(gridW - 1);
     for (int gy = 0; gy < gridH; gy += stride) lat_y.push_back(gy);
+    if (lat_y.back() != gridH - 1) lat_y.push_back(gridH - 1);
     const int LW = (int)lat_x.size(), LH = (int)lat_y.size();
     if (LW < 2 || LH < 2) return out;
 
@@ -118,9 +123,15 @@ AnchorSeedResult solve_anchor_lattice(
     auto t_anchor_start = std::chrono::high_resolution_clock::now();
 
     const int n_anchor = LW * LH;
-    const auto init_mode = have_global_guess ? INIT_NO_SEARCH : INIT_AUTO_SEARCH;
+    // With a phase-correlation lock the guess is already sub-pixel, so pure
+    // ICGN converges and the 6-DOF Simplex rescue is pure cost -- on noisy
+    // images nearly every anchor triggers it and most still fail. Without a
+    // lock each anchor has to find its own offset, so the coarse search stays.
+    const auto init_mode = have_global_guess ? INIT_NO_SIMPLEX : INIT_AUTO_SEARCH;
 
-#pragma omp parallel
+    double precompute_ms = 0.0, icgn_ms = 0.0;
+
+#pragma omp parallel reduction(+ : precompute_ms, icgn_ms)
     {
         OptimizationEngine engine;
         Semper::SubsetData subset;
@@ -144,19 +155,25 @@ AnchorSeedResult solve_anchor_lattice(
                 if (roi_mask.at<uchar>(realY, realX) < 128) continue;
             }
 
-            // Full precompute: the lattice is small and, unlike the grid solve,
-            // has no pooled Hessian to reuse. Measuring it this way is the
-            // pessimistic reading of the lattice's cost.
+            // Full precompute: standalone, the lattice has no pooled Hessian to
+            // reuse. On the shipping path anchors sit on grid nodes and would
+            // use precompute_subset_fast against hessian_pool, so this is the
+            // pessimistic reading -- hence the separate timer.
+            auto t_pre = std::chrono::high_resolution_clock::now();
             SubsetPrecomputer::precompute_subset(subset, ref_img, realX, realY, subset_size);
+            auto t_solve = std::chrono::high_resolution_clock::now();
+            precompute_ms += std::chrono::duration<double, std::milli>(t_solve - t_pre).count();
             if (!subset.is_initialized) continue;
 
             AnalysisResult res = engine.calculate_deformation(
                     subset, def_img, guess_u, guess_v, 0.0f, 0.0f, 0.0f, 0.0f, init_mode);
+            icgn_ms += std::chrono::duration<double, std::milli>(
+                    std::chrono::high_resolution_clock::now() - t_solve).count();
 
             const float ghost_fraction =
                     (float)res.invalid_ref_pixels / (float)(subset_size * subset_size);
             if (ghost_fraction > tuning::kGhostRejectFraction) continue;
-            if (res.status != 0 || res.correlation_score > tuning::kCorrAccept) continue;
+            if (res.status != 0 || res.correlation_score > tuning::kAnchorAcceptScore) continue;
 
             Anchor &a = anchors[(size_t)idx];
             a.rx = (float)realX;
@@ -227,6 +244,8 @@ AnchorSeedResult solve_anchor_lattice(
 
     out.anchor_ms = std::chrono::duration<double, std::milli>(
             std::chrono::high_resolution_clock::now() - t_anchor_start).count();
+    out.precompute_ms = precompute_ms;
+    out.icgn_ms = icgn_ms;
     return out;
 }
 

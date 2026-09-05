@@ -97,16 +97,16 @@ target_include_directories(semper_pipeline SYSTEM PUBLIC
             ${SEMPER_OPENCV_INCLUDE_DIRS}
             ${EIGEN_SRC_DIR}
 )
-target_link_libraries(semper_pipeline
-        PUBLIC
-            semper_math
-            opencv_core
-            opencv_imgproc
-            opencv_imgcodecs
-            opencv_features2d
-            opencv_calib3d
-            opencv_flann
-)
+# core/imgproc/imgcodecs are always required. features2d, flann and calib3d are
+# needed only by the descriptor seeding front-end, so they are linked when the
+# configured SEMPER_OPENCV_BUILD_LIST actually builds them.
+set(_semper_opencv_libs semper_math opencv_core opencv_imgproc opencv_imgcodecs)
+foreach(_optional_cv opencv_features2d opencv_calib3d opencv_flann)
+    if(TARGET ${_optional_cv})
+        list(APPEND _semper_opencv_libs ${_optional_cv})
+    endif()
+endforeach()
+target_link_libraries(semper_pipeline PUBLIC ${_semper_opencv_libs})
 target_compile_definitions(semper_pipeline PRIVATE
         $<$<BOOL:${SEMPER_ANDROID}>:SEMPER_ANDROID_LOG=1>
         $<$<NOT:$<BOOL:${SEMPER_ANDROID}>>:SEMPER_HOST_LOG=1>

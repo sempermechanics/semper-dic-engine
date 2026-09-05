@@ -36,6 +36,13 @@ inline constexpr int kAnchorTarget = 256;
 /** Anchor-lattice seeding: minimum lattice stride in grid nodes. */
 inline constexpr int kAnchorStrideMin = 1;
 
+/** Anchor-lattice seeding: ZNSSD gate for keeping an anchor as a mesh vertex.
+ *  Deliberately looser than kCorrAccept: a seed only has to be approximately
+ *  right, and the universal median test below rejects the blunders. Gating
+ *  seeds at the final acceptance threshold discards usable vertices on noisy
+ *  images and collapses mesh coverage. */
+inline constexpr float kAnchorAcceptScore = 0.40f;
+
 /** Anchor-lattice seeding: universal-median-test rejection radius (px). */
 inline constexpr float kAnchorMedianTol = 1.0f;
 

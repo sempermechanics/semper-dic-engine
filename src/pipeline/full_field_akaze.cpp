@@ -61,6 +61,8 @@ static MeshSeedResult detect_anchor_seeds(
     out.anchors_accepted = anchors.accepted;
     out.phase_locked = locked;
     out.time_akaze_ms = anchors.anchor_ms;
+    out.time_precompute_ms = anchors.precompute_ms;
+    out.time_icgn_ms = anchors.icgn_ms;
 
     const float accepted_fraction = anchors.attempted > 0
             ? (float)anchors.accepted / (float)anchors.attempted : 0.0f;

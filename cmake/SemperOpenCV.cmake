@@ -11,7 +11,13 @@ foreach(_stub doc data)
     endif()
 endforeach()
 
-set(BUILD_LIST "core,imgproc,imgcodecs,features2d,calib3d,flann" CACHE STRING "" FORCE)
+# Overridable so the binary-size cost of the descriptor seeding front-end can be
+# measured: features2d and flann serve only AKAZE + BFMatcher, and calib3d is
+# pulled in by a single cv::findHomography call in src/seeding/akaze_seed.cpp.
+# Default reproduces the previous hard-coded list exactly.
+set(SEMPER_OPENCV_BUILD_LIST "core,imgproc,imgcodecs,features2d,calib3d,flann"
+    CACHE STRING "OpenCV modules compiled from source")
+set(BUILD_LIST "${SEMPER_OPENCV_BUILD_LIST}" CACHE STRING "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
 # Python extensions (and most host toolchains) use the dynamic CRT (/MD). OpenCV's

@@ -83,6 +83,12 @@ struct AnchorSeedResult {
     bool phase_locked = false;
     double phase_ms = 0.0;
     double anchor_ms = 0.0;
+    // Split so the marginal in-pipeline cost is visible. Standalone, an anchor
+    // pays a full precompute_subset; on the shipping path anchors sit on grid
+    // nodes and reuse the Hessian pool, so precompute_ms is work the solve
+    // already does and icgn_ms replaces the Path A solve for those nodes.
+    double precompute_ms = 0.0;
+    double icgn_ms = 0.0;
 };
 
 /**
