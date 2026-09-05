@@ -8,14 +8,15 @@
 // the aggregate median-error check while still silently flipping which
 // points converge or introducing a small systematic bias; this catches that.
 //
-// -ffast-math is enabled for host tests (see tests/CMakeLists.txt), so
-// bit-exact reproducibility is not something this build guarantees even
-// for an IDENTICAL binary rerun — hence a tolerance-based diff, not a
-// byte-for-byte one. Fixtures are captured from Ubuntu GCC Release.
-// GitHub-hosted runners can still differ by a few thousandths of a
-// pixel from a local container under -ffast-math, mostly on a handful
-// of poorly conditioned 6x6 subsets. The tolerances below cover that
-// noise while still failing on a status flip or a systematic field shift.
+// The whole test tree compiles -fno-fast-math -ffp-contract=off (see
+// tests/CMakeLists.txt), so an identical binary rerun IS bit-exact, and so
+// is the same source built at a different -march level. The diff below is
+// still tolerance-based rather than byte-for-byte for one narrower reason:
+// the corpus synthesizes its own input images from several hundred std::exp
+// terms per pixel, so a different libm can move the last ulp of the INPUT.
+// See the tolerance comment at TOL_DISPLACEMENT_PX below, and
+// docs/DETERMINISM.md. The byte-exact gate is the `determinism` CI job.
+//
 // Sanitizer and coverage builds skip this suite: instrumentation and
 // Debug -O0 change floating-point results (and which subsets initialize)
 // enough to trip the relative check. The other suites still cover those

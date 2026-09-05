@@ -48,9 +48,10 @@ namespace {
     // Inter-code agreement bounds (px), set from the MEASURED spread rather than
     // guessed. Our engine reproduces DICe's field on this pair to
     // rms 0.0006 px / max 0.0033 px, converging at 230/230 of its points — so
-    // these bounds keep ~8x headroom (and far exceed the <=1e-4 px cross-build
-    // fast-math drift documented in docs/engine/TESTING.md) while still being
-    // tight enough to actually catch a regression.
+    // these bounds keep ~8x headroom while still being tight enough to catch a
+    // regression. Cross-build drift no longer eats into that headroom at all:
+    // the engine is bit-identical across -march levels (docs/DETERMINISM.md),
+    // so the whole margin absorbs genuine inter-code disagreement.
     constexpr double RMS_TOL = 0.005;
     constexpr double MAX_TOL = 0.02;
     constexpr double MIN_COMPARED_FRACTION = 0.95;

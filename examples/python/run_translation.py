@@ -72,13 +72,20 @@ def main() -> int:
     )
 
     if res.count <= 0:
+        # A zero-point field is a hard failure, never an acceptable outcome.
+        # It is the exact symptom of a strain_window smaller than 2*step: every
+        # VSG window degenerates to its own centre, fails the valid_pts >= 3
+        # test, and the post-filter drops the whole field. This example exists
+        # partly to catch that, so it must not exit 0 here.
         print(
-            "  full-field quality filter kept 0 points on this pair "
-            "(common for sub-pixel DICe fixtures).\n"
-            "  Verified subset contract: build examples/cpp/run_translation "
-            "or run `dic_tests DiceTranslationReal`."
+            "FAIL: no points — the full-field quality filter kept 0 of "
+            f"{res.metrics[1]:.0f} solved subsets.\n"
+            "  Check strain_window >= 2*step (see examples/README.md).\n"
+            "  To verify the subset contract alone: build "
+            "examples/cpp/run_translation or run `dic_tests DiceTranslationReal`.",
+            file=sys.stderr,
         )
-        return 0
+        return 1
 
     med_u = float(np.median(res.points[:, 2]))
     med_v = float(np.median(res.points[:, 3]))

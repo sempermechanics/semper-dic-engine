@@ -101,12 +101,9 @@ translation ≤ 0.02 px, displacement gradients ≤ 2×10⁻³.
 
 ## Numerical reproducibility contract
 
-What "the same result" means, and when a difference is a bug.
-
-> This section changed substantially. The engine used to compile with
-> `-ffast-math` and reduce over hardware-width SIMD lanes, which made results
-> legitimately build-specific; the tolerances below were sized for that. Both
-> are now pinned. See [DETERMINISM.md](DETERMINISM.md) for the full contract.
+What "the same result" means, and when a difference is a bug. The full
+contract, and the reasoning behind each rule, is in
+[DETERMINISM.md](DETERMINISM.md); this section covers which tests enforce it.
 
 **Same build, same inputs → bit-identical.** Two tiers guard this:
 
@@ -133,12 +130,13 @@ byte-compares both golden fixtures. Reproduce it locally with the commands in
 [tests/README.md](../tests/README.md#determinism).
 
 **Different toolchain or libm → small drift possible, in the fixtures only.**
-The remaining dependency is not in the engine: `tests/framework/synthetic.h`
-builds its ground-truth images from several hundred `std::exp` terms per
-pixel, so a different libm can move the last ulp of the *input*. This is why
+The remaining dependency is not in the engine but in the test inputs:
+`tests/framework/synthetic.h` builds its ground-truth images from several
+hundred `std::exp` terms per pixel, so a different libm can move the last ulp
+of the *input*. That, and not any looseness in the engine, is why
 `test_golden_corpus.cpp` compares at 1e-6 px / 1e-7 strain rather than
-exactly — tight enough to catch any real change in engine arithmetic, loose
-enough to survive a glibc bump. The exact gate is the CI job, not the
+exactly — see [DETERMINISM.md](DETERMINISM.md#what-is-guaranteed-and-what-is-not)
+for the reasoning. The exact gate is the `determinism` CI job, not this
 tolerance.
 
 | Quantity | Expected agreement across ISAs (same toolchain) |
@@ -177,6 +175,21 @@ end-to-end (ICGN, Simplex, auto-search, guards).
 | `RepeatSolve_BitIdentical` | The same solve twice is bit-identical | Threading race, uninitialized buffer, or run-to-run nondeterminism |
 | `SuccessfulSolve_CorrelationNonNegative` | Successful solves report ZNSSD ≥ 0 | Sentinel contract broken — the JNI layer marks failed/skipped points with `CORR_INVALID = -1`, so a real score must never be negative |
 
+## Suite: `Robustness` — `integration/test_robustness.cpp`
+
+`Engine` proves the solver is *accurate* on clean input. This suite proves it
+is *safe* on bad input and *correct* under the production threading pattern:
+many workers solving against one shared, read-only `SubsetData` and deformed
+`Image`. Build with `-DDIC_SANITIZER=thread` to turn the last case into a
+data-race detector.
+
+| Test | Proves | Failure would mean |
+|---|---|---|
+| `NoisyDeformedImage_TranslationStillRecovered` | +/-3 grey levels of seeded noise on the deformed image only (reference clean, as in a real experiment) still allows sub-pixel recovery | The solver is tuned to noiseless synthetic input and would degrade on real camera data |
+| `TexturelessSubset_RejectedAtPrecompute` | A flat, zero-gradient subset has a singular Hessian and is refused at precompute (`is_initialized == false`) | The solver would be handed a garbage system and could "converge" to confident nonsense |
+| `LowContrast_TranslationStillRecovered` | Speckle contrast compressed to 6% of nominal still solves, because ZNSSD divides by the subset std-dev | The zero-normalized criterion is not actually normalizing; badly lit specimens would fail |
+| `ConcurrentSolves_BitIdenticalToSingleThread` | 8 threads x 25 solves each are **bit-identical** (`==`) to the single-threaded answer | Hidden mutable state or a lazy cache in `Image`/`SubsetData`; results would depend on thread count |
+
 ## Suite: `DiceTranslationSynthetic` — `dice/test_translation_synthetic.cpp`
 
 Cross-validation against **DICe** (Digital Image Correlation Engine,
@@ -208,6 +221,62 @@ image codec).
 | Test | Proves | Failure would mean |
 |---|---|---|
 | `CustomApp_0p4px_RealSpeckle` | All 4 subsets recover the 0.4 px X-shift on DICe's real images, within DICe's 0.1 px tolerance | Our engine disagrees with DICe on their own experimental data — a real-texture/robustness gap the synthetic tests don't expose |
+
+## Suite: `DiceFieldAgreement` — `dice/test_field_agreement.cpp`
+
+Our displacement field against DICe's own solved field for its
+`dic_challenge_12` case (open-hole tension on CFRP). We solve at DICe's exact
+subset coordinates and diff. Because the gold is external and fixed, this both
+anchors us to the reference implementation and detects drift in ours.
+
+The metric is **agreement, not correctness**: `oht_cfrp` is a real experiment
+with no analytic truth, so the bounds are inter-code agreement bounds taken
+from the measured spread (rms 0.0006 px, max 0.0033 px, 230/230 points
+converged) with roughly 8x headroom. Matched to DICe where possible: subset
+27, Keys-fourth interpolation, its coordinates. OpenCV-gated.
+
+| Test | Proves | Failure would mean |
+|---|---|---|
+| `OhtCfrp_AgreesWithDiceSolution` | Agreement with DICe on one image pair: rms <= 0.005 px, max <= 0.02 px, >= 95% of its points compared | Our engine has drifted from the reference implementation on real experimental data |
+| `OhtCfrp_LoadStepLadder` | Agreement holds across load steps 03 / 06 / 11 (3.16 to 12.03 px), solved from zero prior with `INIT_AUTO_SEARCH`, rms <= 0.05 px on >= 90% of points | The coarse search cannot find multi-pixel shifts unaided, or accuracy decays as deformation grows |
+
+---
+
+## Suite: `DiceStrainGradients` — `dice/test_strain_gradients.cpp`
+
+Raw per-subset ICGN displacement gradients on real speckle against a
+prescribed strain. `def_exx.tif` is DICe's `ref.tif` resampled by a known 1%
+uniaxial strain, so in reference coordinates `du/dx = 0.01` exactly. Each
+subset is seeded with its expected translation, as RGDIC propagation would;
+the gradient itself starts at zero, so the strain really is measured.
+
+Asserts the **field mean**, not per subset: a 27 px subset spans only ~0.27 px
+of displacement at 1% strain, so a single raw gradient is inherently noisy
+(~0.006-0.016 scatter). That is exactly why production DIC uses a virtual
+strain gauge instead — see `DiceStrainVsg`. OpenCV-gated.
+
+| Test | Proves | Failure would mean |
+|---|---|---|
+| `RealSpeckle_UniaxialStrain_1pct` | Field-mean `ux` within 1.5e-3 of the applied 0.01; `uy`/`vx`/`vy` means ~0; per-subset rms scatter < 6e-3; >= 60 of 81 grid points solved | A systematic bias in the measured gradients, or a solve blow-up inflating the scatter |
+
+---
+
+## Suite: `DiceStrainVsg` — `dice/test_strain_vsg.cpp`
+
+The same 1% uniaxial fixture, but fed through `StrainCalculator`'s virtual
+strain gauge — the post-processor a real analysis actually uses — rather than
+read as raw gradients. The `Strain` unit suite proves VSG is exact on
+synthetic linear fields; this proves it holds up with real correlation noise
+feeding it, and that smoothing is markedly tighter than the raw scatter
+`DiceStrainGradients` measures.
+
+Uses a 120 px VSG window on a 20 px grid — ~6 grid steps, comfortably above
+the `>= 2 * step` floor documented in
+[../examples/README.md](../examples/README.md). OpenCV-gated.
+
+| Test | Proves | Failure would mean |
+|---|---|---|
+| `UniaxialStrain_ThroughStrainCalculator` | VSG-smoothed mean `exx` within 1.0e-3 of the applied 0.01, rms < 2.0e-3, over a field where more than half the grid solved | The VSG plane fit does not average correlation noise as intended, or the window/step handling is wrong on a real field |
 
 ## Suite: `SimdKernels` — `unit/test_simd_kernels.cpp`
 
@@ -294,6 +363,39 @@ against Eigen, because matching Eigen is explicitly not the goal.
 | `Inv6x6_RequiresRowPivoting` | An anti-diagonal matrix — every leading pivot is zero without row swaps |
 | `Inv6x6_SingularIsRejected` | Duplicate row detected |
 | `Inv6x6_PivotTieBreakIsLowestRow` | Equal-magnitude pivots resolve deterministically. An unspecified tie-break is a bit-exactness hole, and ties happen routinely on structured matrices |
+
+## Suite: `GoldenCorpus` — `integration/test_golden_corpus.cpp`
+
+Relative equivalence for the subset solver. `Engine` checks *absolute*
+correctness against analytic truth; this checks whether a change moved any
+point's convergence status, or shifted a converged point's u/v/gradients,
+relative to a captured "before" run. A change can pass an aggregate
+median-error check while silently flipping which points converge or
+introducing a small systematic bias.
+
+324 subsets per scenario on a 512x512 speckle field, captured for both
+interpolators. Compared at **1e-6 px / 1e-7 strain** rather than exactly — the
+residual libm dependence is in the fixture generator, not the engine; see the
+reproducibility contract above. The byte-exact gate is the `determinism` CI
+job, which runs this at two `-march` levels and `cmp`s the captures.
+
+```bash
+SEMPER_GOLDEN_CAPTURE=1 ./dic_tests GoldenCorpus   # capture, before a change
+./dic_tests GoldenCorpus                           # compare, after
+```
+
+`SEMPER_GOLDEN_FILE` overrides the location (default
+`tests/fixtures/golden_corpus.bin`, kept next to the source tree so it
+survives out-of-source builds); each case appends its own suffix. Skipped
+under sanitizer and coverage builds, where instrumentation and Debug `-O0`
+change which subsets initialize.
+
+| Test | Proves | Failure would mean |
+|---|---|---|
+| `CaptureOrCompare_4x4Bicubic` | The 4x4 bicubic path reproduces the captured corpus: zero status mismatches, zero value mismatches | A convergence-status flip or a field shift in the bicubic interpolator |
+| `CaptureOrCompare_6x6Keys` | The same for the 6x6 Keys interpolator | The same, in the higher-order path that `DiceFieldAgreement` also exercises |
+
+---
 
 ## Suite: `FullFieldGolden` — `integration/test_full_field_golden.cpp`
 
@@ -447,6 +549,26 @@ on. It runs in the `c-sdk-smoke` CI job and returns non-zero on any breach:
   `libsemper_c.so` against the six documented exports, so an accidental export or
   a dropped `SEMPER_C_API` annotation fails the build.
 
+## Suite: `Perf` — `perf/test_throughput.cpp`
+
+Solver throughput, printed for tracking. **Not a benchmark gate**: CI runners
+are noisy and this same binary is built under ASan/UBSan/TSan where everything
+is several times slower, so a `solves/s` assertion would be flaky and
+meaningless. The only assertion is a generous wall-clock ceiling that catches
+a hang or a catastrophic regression.
+
+The printed rate is what [GPU_ACCELERATION.md](GPU_ACCELERATION.md) §4a reads
+for the per-phase throughput gate. That gate is **relative** — measured on one
+machine before and after a change — never compared against a number recorded
+on another machine. Run it on a quiet machine for anything you intend to act
+on.
+
+| Test | Proves | Failure would mean |
+|---|---|---|
+| `SubsetSolveThroughput` | 225 subsets precompute and solve, at least one converges, and the whole grid finishes well inside 120 s | A hang, a pathological slowdown, or a regression that stops every subset converging |
+
+---
+
 ## Coverage (report-only)
 
 The `coverage` CI job configures `-DSEMPER_COVERAGE=ON`, runs `dic_tests`, and
@@ -475,25 +597,34 @@ tests/
   test_main.cpp           micro-framework runner entry point
   framework/              the test harness — synthetic.h, test_framework.h
   shim/                   host stand-ins for OpenCV configs
+  fixtures/               captured golden corpora (see GoldenCorpus above)
   c/smoke.c               C ABI smoke (built with SEMPER_BUILD_C_SDK)
   c/contract.c            C ABI Frozen-contract binary (semper_c_contract)
   c/abi_symbols.txt       golden list of exported semper_* symbols
   unit/                   one component vs. an oracle / mathematical identity
-                            test_simd_kernels, test_image,
+                            test_cl_runtime (OpenCL-gated), test_canonical_reduce,
+                            test_canonical_inverse, test_simd_kernels, test_image,
                             test_subset_precomputer, test_strain_calculator,
                             test_cancel_token, test_image_codec (OpenCV-gated)
   integration/            the assembled engine end-to-end + robustness
                             test_optimization_engine, test_robustness,
+                            test_golden_corpus, test_full_field_golden,
                             test_full_field_contracts, test_reference_cache
-                            (the last two OpenCV-gated)
-  dice/                   DICe golden comparisons
-  perf/                   throughput gates
+                            (the last three OpenCV-gated)
+  dice/                   DICe golden comparisons — all OpenCV-gated
+                            test_translation_synthetic, test_translation_real_image,
+                            test_strain_gradients, test_strain_vsg,
+                            test_field_agreement
+  perf/                   throughput, printed not gated — test_throughput
 ```
 
 `tests/CMakeLists.txt` lists sources under `DIC_UNIT_TESTS` /
 `DIC_INTEGRATION_TESTS` / `DIC_DICE_TESTS` / `DIC_PERF_TESTS`, plus
 `DIC_PIPELINE_TESTS` for the OpenCV-gated suites (`test_full_field_contracts`,
-`test_image_codec`, `test_reference_cache`) — attached only when OpenCV is present.
+`test_full_field_golden`, `test_image_codec`, `test_reference_cache`) —
+attached via `target_sources` only when OpenCV is present. `test_cl_runtime`
+is in the always-on unit list but compiles to nothing unless `SEMPER_OPENCL=ON`;
+see [GPU_ACCELERATION.md](GPU_ACCELERATION.md).
 
 ## Adding a new test
 

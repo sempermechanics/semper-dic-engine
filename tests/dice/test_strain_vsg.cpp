@@ -1,9 +1,10 @@
 // The VSG strain pipeline on real speckle, against a prescribed strain.
 //
-// Where test_strain.cpp reads raw per-subset ICGN gradients, this feeds the
-// displacement field through StrainCalculator's virtual strain gauge — the
-// post-processor a real analysis actually uses — and checks the smoothed exx
-// against the known applied 1% strain (def_exx.tif, truth exx = 0.01).
+// Where test_strain_gradients.cpp reads raw per-subset ICGN gradients, this
+// feeds the displacement field through StrainCalculator's virtual strain
+// gauge — the post-processor a real analysis actually uses — and checks the
+// smoothed exx against the known applied 1% strain (def_exx.tif, truth
+// exx = 0.01).
 //
 // The Strain unit suite proves VSG is exact on synthetic linear fields; this
 // proves it holds up with real correlation noise feeding it. Smoothing over a
