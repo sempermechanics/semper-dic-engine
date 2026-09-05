@@ -160,17 +160,22 @@ TEST_CASE(ClPipelineParity, FullFieldOutputIsIdenticalWithAndWithoutGpu) {
     }
 
     // metrics[1] is the valid point count, [3]/[4] the Path A / Path B split,
-    // [11] the pre-pass time in ms. The times are printed, never asserted --
-    // they are what says the GPU branch actually fired, but they are far too
-    // noisy to gate on.
+    // [5..7] the simplex-rescue tally, [8] the mean ICGN iteration count,
+    // [9] total wall time and [11] the pre-pass time in ms. The times are
+    // printed, never asserted -- they are what says the GPU branch actually
+    // fired, but they are far too noisy to gate on.
     std::printf("     valid: cpu %.0f, gpu %.0f | A/B split: cpu %.0f/%.0f, gpu %.0f/%.0f"
-                " | pre-pass: cpu %.2f ms, gpu %.2f ms cold / %.2f ms warm"
-                " | %d float mismatches\n",
+                " | rescues: cpu %.0f, gpu %.0f | mean iters: cpu %.6f, gpu %.6f\n"
+                "     pre-pass: cpu %.2f ms, gpu %.2f ms cold / %.2f ms warm"
+                " | total: cpu %.1f ms, gpu %.1f ms warm | %d float mismatches\n",
                 (double) cpu.metrics[1], (double) gpu.metrics[1],
                 (double) cpu.metrics[3], (double) cpu.metrics[4],
                 (double) gpu.metrics[3], (double) gpu.metrics[4],
+                (double) cpu.metrics[5], (double) gpu.metrics[5],
+                (double) cpu.metrics[8], (double) gpu.metrics[8],
                 (double) cpu.metrics[11], (double) gpu_cold.metrics[11],
-                (double) gpu.metrics[11], bad);
+                (double) gpu.metrics[11],
+                (double) cpu.metrics[9], (double) gpu.metrics[9], bad);
 
     // A solve that found nothing would compare equal and prove nothing.
     CHECK(cpu.metrics[1] > 0.0f);
@@ -179,6 +184,17 @@ TEST_CASE(ClPipelineParity, FullFieldOutputIsIdenticalWithAndWithoutGpu) {
     // surviving point still matches -- docs/DETERMINISM.md:142-147.
     CHECK(gpu.metrics[3] == cpu.metrics[3]);
     CHECK(gpu.metrics[4] == cpu.metrics[4]);
+    // Phase 4 makes these say something they did not before. The ICGN kernel
+    // never runs Nelder-Mead, so Path A accepts a device answer only when the
+    // CPU would not have gone on to a rescue; if that rule were wrong, the
+    // rescue tally and the mean iteration count would move even where the
+    // surviving points happened to agree. Both are derived from counters the
+    // device path still has to feed by hand (full_field_path_a.cpp), which is
+    // exactly why they are worth asserting rather than printing.
+    CHECK(gpu.metrics[5] == cpu.metrics[5]);
+    CHECK(gpu.metrics[6] == cpu.metrics[6]);
+    CHECK(gpu.metrics[7] == cpu.metrics[7]);
+    CHECK(gpu.metrics[8] == cpu.metrics[8]);
     CHECK(bad == 0);
 
     // Cold and warm device solves must agree with each other too -- a

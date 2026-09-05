@@ -327,11 +327,11 @@ degrades to the CPU, not that it is present.
 | `EnvDisableForcesCpuPath` | `SEMPER_OPENCL_DISABLE=1` forces the CPU path, for bisecting a suspected device-side difference |
 | `DeviceReproducesCanonicalReductionExactly` | **Device-gated.** A real OpenCL device returns bit-identical results to `semper_canon_sum_sq_diff` at n = 0…729, tail included. Skips with a printed reason rather than passing vacuously when no device is present |
 
-## Suite: `ClParity` — `unit/test_cl_strain.cpp`, `unit/test_cl_hessian.cpp`
+## Suite: `ClParity` — `unit/test_cl_strain.cpp`, `unit/test_cl_hessian.cpp`, `unit/test_cl_icgn.cpp`
 
-One suite, one rule, two kernels: Phase 2's strain fit and Phase 3's static
-Hessian pre-pass. Both files register into `ClParity`, so `dic_tests ClParity`
-runs the whole GPU parity gate.
+One suite, one rule, three kernels: Phase 2's strain fit, Phase 3's static
+Hessian pre-pass and Phase 4's ICGN solve. All three files register into
+`ClParity`, so `dic_tests ClParity` runs the whole GPU parity gate.
 
 ### Phase 2 — strain VSG (`unit/test_cl_strain.cpp`)
 
@@ -387,6 +387,43 @@ them, recomputing that condition from the image rather than inferring it.
 | `HessianLeavesUnwantedPoolSlotsAlone` | **Device-gated.** Pool slots the caller did not request come back byte-for-byte as they went in | The pre-pass skips points the solver has already solved; overwriting them would discard real results |
 | `HessianIsRunToRunReproducible` | **Device-gated.** Repeat dispatches of one input return identical bytes | A result depending on work-group scheduling would pass the parity tests only intermittently |
 
+### Phase 4 — Path A ICGN (`unit/test_cl_icgn.cpp`)
+
+The same gate for `solve_icgn_batch_gpu` against `OptimizationEngine`, and the
+largest of the three kernels: it fuses the ICGN iteration with the part of
+`precompute_subset_fast` that feeds it, so one work-item carries a whole
+subset from reference planes to converged warp. fp32 end to end, gated on
+**`exact_fp32`**.
+
+**One work-item per subset is the design constraint, not an implementation
+detail.** A cross-lane tree reduction would change the summation order and
+void bit-exactness immediately, so the parity these cases check is what pins
+the kernel shape.
+
+Iteration counts are compared alongside the values, and that is the point of
+the suite rather than a bonus assertion: reaching an equal answer in a
+different number of iterations would mean the convergence test diverged, and
+the agreement would be luck.
+
+The stage this exercises **ships disabled** — `kGpuIcgnPathAEnabled = false`
+in `src/pipeline/full_field_path_a.cpp`, because the throughput gate failed
+(see the Phase 4 block in [GPU_ACCELERATION.md](GPU_ACCELERATION.md)). These
+cases drive the dispatch directly, so they keep running and keep the kernel
+honest for Phase 5, which reuses it.
+
+| Test | Proves | Failure would mean |
+|---|---|---|
+| `IcgnDispatchDeclinesCleanlyWhenStageUnavailable` | With no device, or one without correctly-rounded fp32, dispatch returns false and leaves the caller's results **untouched** | A half-filled result array would be read as solved points the CPU never computed |
+| `IcgnDispatchRejectsBadArguments` | Null pointers, a zero point count and degenerate subset sizes are refused, not launched | A crash on a caller error instead of a return value |
+| `IcgnDispatchHonoursEnvDisable` | `SEMPER_OPENCL_DISABLE=1` shuts this stage down too | The documented CPU-forcing escape hatch would not actually force the CPU |
+| `EmbeddedIcgnKernelIsSelfContained` | The embedded source resolves its includes, keeps `FP_CONTRACT OFF`, calls the same canonical routines as the host, and contains **no `double` after the kernel entry point** | A stray double would stop this kernel building on a device without `cl_khr_fp64`; since a build failure must not flip `caps().available`, the symptom would be a silent CPU fallback |
+| `IcgnMatchesCpuBitExactly` | **Device-gated.** Four grid geometries — including one deliberately run off the image edge — exact equality on all six warp parameters, the correlation score, the iteration count and the invalid-pixel count | The kernel and the CPU reference have diverged; the GPU path cannot ship |
+| `IcgnKeysInterpolatorMatchesCpuBitExactly` | **Device-gated.** The same, with the Keys 6x6 sampler instead of bicubic | The two interpolators share one sampler in `canonical_math.h`; a divergence in only one of them means the shared source drifted on the device side |
+| `IcgnPartialPathMatchesCpuBitExactly` | **Device-gated.** On a grid stamped with a ghost wall, both paths take *the same* points down the partial-subset route and refuse the same points outright | Agreeing on values while disagreeing on which points to give up on is still a parity failure |
+| `IcgnTiledLaunchMatchesCpuBitExactly` | **Device-gated.** A 2 209-point batch too large for the scratch budget is split into tiles, and the answer is identical to an untiled one | Tiling is a host-side memory decision; if it were observable in the result, the field would depend on the device's available memory |
+| `IcgnIsRunToRunReproducible` | **Device-gated.** Repeat dispatches of one input return identical bytes | A result depending on work-group scheduling would pass the parity tests only intermittently |
+| `IcgnKernelAbsentWithoutOpenCLBuild` | The file reduces to one case under `-DSEMPER_OPENCL=OFF` | A build-flag combination would drop the suite with no trace in the count |
+
 ## Suite: `ClPipelineParity` — `integration/test_full_field_gpu_prepass.cpp`
 
 `ClParity` drives the GPU dispatch functions directly, at whatever geometry it
@@ -411,12 +448,16 @@ would mean the result depended on state carried across solves.
 
 | Test | Proves | Failure would mean |
 |---|---|---|
-| `FullFieldOutputIsIdenticalWithAndWithoutGpu` | **Device-gated.** One solve with `SEMPER_OPENCL_DISABLE=1` and two with the device: identical packed output, identical valid count, identical Path A / Path B split, and cold and warm device solves identical to each other | The dispatch functions pass parity but the wired callers do not — a threshold, a buffer lifetime or the fallback decision is wrong, and the field the user gets depends on their hardware |
+| `FullFieldOutputIsIdenticalWithAndWithoutGpu` | **Device-gated.** One solve with `SEMPER_OPENCL_DISABLE=1` and two with the device: identical packed output, identical valid count, identical Path A / Path B split, identical simplex-rescue count, identical mean ICGN iteration count, and cold and warm device solves identical to each other | The dispatch functions pass parity but the wired callers do not — a threshold, a buffer lifetime or the fallback decision is wrong, and the field the user gets depends on their hardware |
 | `PipelineGpuStagesCompiledOut` | The file is inert without OpenCV or without `SEMPER_OPENCL` | A build-flag combination would drop the suite with no trace in the count |
 
 A moved Path A / Path B split is asserted separately from the values because
 it means propagation changed even when every surviving point still matches —
-see [DETERMINISM.md](DETERMINISM.md).
+see [DETERMINISM.md](DETERMINISM.md). The rescue count and the mean iteration
+count are asserted for the same reason: when Phase 4's ICGN stage is enabled,
+the device result is accepted only where it would not have tripped the CPU's
+Nelder-Mead rescue test, so those two counters are what would expose a device
+answer that agreed numerically but arrived by a different route.
 
 ## Suite: `CanonicalReduce` — `unit/test_canonical_reduce.cpp`
 
@@ -660,6 +701,8 @@ on.
 | `SubsetSolveThroughput` | 225 subsets precompute and solve, at least one converges, and the whole grid finishes well inside 120 s | A hang, a pathological slowdown, or a regression that stops every subset converging |
 | `StrainVsgThroughputCpuVsGpu` | The VSG fit on CPU and on the device, swept across five grid sizes. Compiled only under `-DSEMPER_OPENCL=ON`; prints CPU-only figures when no fp64 device is present | The printed break-even is where the size threshold in `full_field_solver_stats.cpp` comes from, so a shift here means that constant is stale — re-run this after touching the kernel or its buffer transfers |
 | `HessianPrepassThroughputCpuVsGpu` | The static Hessian pre-pass on CPU and on the device, swept across five grid sizes at a fixed image size, then the fixed dispatch cost swept across three image sizes. **The CPU column is serial** — this binary does not link OpenMP, while the pipeline pre-pass does | The two sweeps are where the *points-per-megapixel* threshold in `full_field_solver.cpp` comes from. The second one exists because the dispatch floor scales with the image, not the grid, so a flat point count would send a large image with a coarse grid to the device and lose |
+| `IcgnPathAThroughputCpuVsGpu` | The Path A ICGN solve on CPU and on the device across five grid sizes, then an **iteration-cap sweep** at a fixed 11 236 points, then the fixed dispatch cost across three image sizes. **The CPU column is serial**, and the two largest grids are extrapolated from the measured flat serial rate rather than timed | The iteration-cap sweep is the diagnostic, not the headline: it separates the fixed per-point setup from the per-iteration work, and it is what identified warp divergence on iteration count as the reason Phase 4 fails its throughput gate. A change in its slope means the per-iteration cost moved |
+| `PathAPipelineThroughputCpuVsGpu` | The **whole-solve wall clock** of the real `run_full_field` with and without the device, at four geometries, best of three after a warm-up, asserting both arms find the same number of valid points | This is the number the throughput gate actually turns on — every other row in this table races the device against one core. As shipped it measures Phases 2 and 3 only, because Phase 4's stage is off; the header says how to reproduce the Phase 4 table by flipping `kGpuIcgnPathAEnabled` and restricting the process affinity mask |
 
 ---
 
@@ -696,8 +739,8 @@ tests/
   c/contract.c            C ABI Frozen-contract binary (semper_c_contract)
   c/abi_symbols.txt       golden list of exported semper_* symbols
   unit/                   one component vs. an oracle / mathematical identity
-                            test_cl_runtime, test_cl_strain, test_cl_hessian
-                            (OpenCL-gated), test_canonical_reduce,
+                            test_cl_runtime, test_cl_strain, test_cl_hessian,
+                            test_cl_icgn (OpenCL-gated), test_canonical_reduce,
                             test_canonical_inverse, test_simd_kernels, test_image,
                             test_subset_precomputer, test_strain_calculator,
                             test_cancel_token, test_image_codec (OpenCV-gated)

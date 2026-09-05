@@ -49,7 +49,7 @@ run the bit-exact ICGN path and is refused for that stage.
 | **1** | OpenCL runtime + build plumbing: `SEMPER_OPENCL`, dlopen loader, device capability gate, kernel embedding. **No compute kernels.** | **Complete** |
 | **2** | Strain VSG on GPU. One work-item per grid point, fp64. Currently the only fully serial numerical stage. | **Complete** |
 | **3** | Hessian pre-pass on GPU. One work-item per grid point. | **Complete** |
-| **4** | Path A ICGN on GPU. **One work-item per subset**, so the reduction keeps the canonical order rather than becoming a cross-lane tree. | Pending |
+| **4** | Path A ICGN on GPU. **One work-item per subset**, so the reduction keeps the canonical order rather than becoming a cross-lane tree. | **Landed, off by default** — bit-exact, but slower than the threaded CPU on the measured host; gated behind `kGpuIcgnPathAEnabled = false` |
 | **5** | Path B wavefront on GPU. Reuses the Phase 4 kernel; one launch per round. Only possible because Phase 0 made Path B round-based. | Pending |
 | **6** | Image prep (gradients, optional blur). AKAZE stays on CPU — randomized RANSAC, poor return. | Pending |
 
@@ -256,12 +256,181 @@ sub-millisecond loss on a small image with a dense grid, which is why the
 floor is left as it is rather than tuned to the edge.
 
 **Not run, and not claimed.** Still deferred from Phase 3a: the determinism
-job's Linux cross-`-march` compare, and a `FullFieldGolden` run on CI's
-OpenCV. On the Windows host the full suite is 127 tests, 124 passing; the
+job's Linux cross-`-march` compare (subsequently **run in Phase 4** — see
+below), and a `FullFieldGolden` run on CI's OpenCV. On the Windows host the full suite is 127 tests, 124 passing; the
 three failures are `FullFieldGolden.CaptureOrCompare` and the two
 `GoldenCorpus` cases, and **the same three fail from the same binary with
 `SEMPER_OPENCL_DISABLE=1`** — they are the vendored-OpenCV AKAZE difference
 and the MinGW `libm` gap described above, not the GPU path.
+
+### Phase 4 results (measured)
+
+**Phase 4 clears two of its three gates and fails the third.** The ICGN
+kernel is bit-exact against the CPU, and it is slower than the CPU here, so
+it ships behind `kGpuIcgnPathAEnabled = false` in
+`src/pipeline/full_field_path_a.cpp`. The kernel, the dispatch and the parity
+tests are in the tree because Phase 5 reuses them and because the parity
+result is worth keeping; what is not in the tree is a claim that this is
+faster.
+
+Same host as Phases 2 and 3: Windows 11, MinGW-w64 GCC (UCRT), Release,
+NVIDIA GeForce RTX 3060 Laptop GPU on the CUDA ICD. fp32 end to end, so like
+Phase 3 it is gated on **`exact_fp32`**, not `fp64`.
+
+| Check | Result |
+|---|---|
+| `SEMPER_OPENCL=ON` + OpenCV, RTX 3060 | 139 tests run, 136 pass (`ClParity` 24/24, `ClRuntime` 7/7) |
+| `SEMPER_OPENCL=OFF` + OpenCV, Windows | 108 tests run, 105 pass — **the same three fail**, from a binary with no GPU code in it |
+| Linux, GCC 11.4, no OpenCV, `OFF` → `ON` | 74 → 104 tests, **all passing in both**; the device cases skip themselves with no ICD |
+| `SEMPER_OPENCL=OFF`, `nm -D \| grep -i opencl` | Silent, and no `libOpenCL` string in the binary |
+| **CPU/GPU parity, values** | **Exact** over **3 235 points** across seven geometries — `==`, not a tolerance, on all six warp parameters, the correlation score, the iteration count and the invalid-pixel count |
+| **CPU/GPU parity, rejections** | **Exact** — 12 of 132 points refused identically on a grid deliberately run off the image edge; 240 of 400 taken by the partial path identically on a ghost-wall grid |
+| **CPU/GPU parity, iteration counts** | **Identical per point.** An equal answer reached in a different number of iterations would mean the convergence test diverged; it does not |
+| Both interpolators | Bicubic and Keys 6×6 both exact |
+| Multi-tile launch | A 2 209-point batch split across scratch-budget tiles: 0 mismatches, so the tiling is not observable in the answer |
+| **Throughput vs the threaded CPU** | **FAILED — 1.12× to 1.44× slower on 20 threads, noise-level on 8 and 4** |
+| Cross-ABI determinism | Subset corpus byte-identical, `x86-64` vs `x86-64-v3`, on Linux GCC — see below |
+
+The seven parity geometries in detail, all `==`:
+
+| Geometry | Compared | Converged | Refused | Mismatch |
+|---|---|---|---|---|
+| 12×10 step 9, subset 21 | 120 | 120 | 0 | **0** |
+| 14×13 step 7, subset 31 | 182 | 182 | 0 | **0** |
+| 9×8 step 11, subset 15 | 72 | 72 | 0 | **0** |
+| 12×12 step 13, subset 25 (edge overrun) | 132 | 130 | 12 | **0** |
+| 12×10 step 9, Keys 6×6 | 120 | 120 | 0 | **0** |
+| Ghost wall, 20×20 | 400 | 160 (240 partial) | 0 | **0** |
+| Tiled, 2 209 points | 2 209 | — | 0 | **0** |
+
+**End to end, on the device.** With `kGpuIcgnPathAEnabled` temporarily
+flipped to `true`, `ClPipelineParity` runs the real `run_full_field` on one
+512×512 pair at step 7 — 5 329 grid points — once with
+`SEMPER_OPENCL_DISABLE=1` and once with the RTX 3060 solving Path A:
+
+| | Result |
+|---|---|
+| Packed output, CPU vs GPU | **0 float mismatches** of 42 632 — `==`, all 8 slots of all 5 329 points |
+| Valid points | 3 265 on both |
+| Path A / Path B split | 3 470 / 489 on both |
+| Simplex rescues | 262 on both |
+| Mean ICGN iterations | 9.398162 on both |
+
+That the rescue tally and the mean iteration count are identical is the
+substantive part. The device answer is accepted **only** when it would not
+have tripped the CPU rescue test — `status == 0 && score <=
+kCorrSimplexTrigger`, the condition `optimization_engine.cpp:54` uses — and
+every other point, including every `kIcgnHostRequired` point, falls through
+to the untouched CPU path. The substitution is therefore equivalent by
+construction rather than by approximation, and these two counters are what
+would expose it if it were not.
+
+**Throughput, against a serial CPU loop.** 1024×1024 reference, subset 21,
+best of three, sweeping the step:
+
+| Grid points | CPU (serial) | GPU | | GPU µs/pt |
+|---|---|---|---|---|
+| 2 500 (step 19) | 180.16 ms | 32.72 ms | 4.8× | 13.09 |
+| 5 329 (step 13) | 385.01 ms | 55.65 ms | 6.9× | 8.93 |
+| 11 236 (step 9) | 811.78 ms\* | 67.75 ms | 10.2× | 6.03 |
+| 25 600 (step 6) | 1 849.56 ms\* | 160.66 ms | 11.5× | 5.36 |
+| 57 600 (step 4) | 4 161.51 ms\* | 332.63 ms | **12.5×** | 4.94 |
+
+\* extrapolated at the measured flat serial rate; that rate varies by under
+2% across the sweep, so the two smallest grids are timed and the rest are
+not, to keep the suite from spending half a minute on solves that tell us
+nothing new.
+
+**That table is not the gate, and it is why the gate exists.** The CPU column
+is one core. Path A runs on `hardware_concurrency()` threads. The number that
+decides whether to engage the device is the whole-solve wall clock with and
+without it, which `Perf.PathAPipelineThroughputCpuVsGpu` measures on the real
+`run_full_field`, best of three after a warm-up, with every other stage —
+image prep, AKAZE, RANSAC, Delaunay, Path B, strain — running identically in
+both arms:
+
+| Path A points | 20 threads | 8 threads | 4 threads |
+|---|---|---|---|
+| 3 470 | 1.27× **CPU** | 1.09× **CPU** | 1.07× **CPU** |
+| 10 562 | 1.44× **CPU** | 1.05× **CPU** | 1.01× **CPU** |
+| 17 110 | 1.21× **CPU** | 1.00× | 1.06× GPU |
+| 32 645 | 1.12× **CPU** | 1.02× GPU | 1.04× GPU |
+
+The thread counts below 20 were produced by masking the process affinity
+(`Start-Process -PassThru`, then `$p.ProcessorAffinity`), because `safe_cores`
+comes from `std::thread::hardware_concurrency()` and there is no knob for it.
+
+**Why, measured rather than guessed.** Capping the iteration count separates
+the fixed per-point setup from the per-iteration work. At 11 236 points:
+
+| Iteration cap | Time | µs/pt |
+|---|---|---|
+| 1 | 10.2 ms | 0.91 |
+| 2 | 11.8 ms | 1.05 |
+| 4 | 14.5 ms | 1.29 |
+| 8 | 20.4 ms | 1.82 |
+| 50 (the real cap) | **68.0 ms** | 6.05 |
+
+The mean is **~9.4 iterations per point**, which by the table above should
+cost about 22 ms. It costs 68. One work-item per subset — the constraint that
+keeps the reduction bit-exact, and which is not negotiable — means a warp
+runs until its *slowest* lane converges, and a full-field solve puts roughly
+137 points that time out at 50 iterations among 3 470. At 32 lanes per warp
+nearly every warp contains one, so the launch effectively pays 50 iterations
+for every point. Memory bandwidth and the interpolator were ruled out
+arithmetically: the per-point scratch is 8n floats and `canonical_interp.inc`
+contains no divisions.
+
+The fixed cost, isolated the same way as in Phase 3 — it scales with the
+image, not the grid:
+
+| Reference image | Dispatch floor |
+|---|---|
+| 512×512 | 2.12 ms |
+| 1024×1024 | 4.87 ms |
+| 2048×2048 | 10.84 ms |
+
+**The remedy, and why it is not in this commit.** It is the one the roadmap
+already names: **round-based launches over a compacted active-point list**,
+not a different reduction shape. Stage the reference planes once, run a
+bounded number of iterations per launch, read back which points are still
+running, relaunch over just those. Resuming from the stored warp matrix is
+bit-identical — every per-iteration input is either recomputed or carried in
+full precision — so it costs no accuracy. It is a real restructure of the
+kernel, it was not attempted here, and shipping a 1.1×-to-1.4× regression
+while it is pending would be worse than shipping the flag off. The two
+thresholds in the caller (`kGpuIcgnPointsPerMegapixel = 16000`,
+`kGpuIcgnMinPoints = 16000`) are where the 4- and 8-thread measurements put
+the crossover **today**; whoever lands the compaction must re-measure them,
+because the shape of the curve changes.
+
+**Newly run this phase, previously deferred.** The determinism job Linux
+cross-`-march` compare, deferred since Phase 3a, was executed: two Release
+builds under WSL Ubuntu 22.04 / GCC 11.4, `-march=x86-64` (SSE2 baseline)
+against `-march=x86-64-v3` (AVX2/FMA), golden corpus captured from each. Both
+`cmp`s silent — `corpus.bin.bicubic` and `corpus.bin.keys6x6` byte-identical
+across the two instruction sets. The third `cmp` in §4b, `ff_*.bin`, needs
+`FullFieldGolden`, which needs OpenCV; WSL has none and the vendored
+submodule was not built there, so **that one `cmp` remains deferred**.
+
+The same Linux run also settles the standing Windows failures: `GoldenCorpus`
+passes there with **0 value mismatches on all 580 points, both
+interpolators**, confirming the 13-point Windows discrepancy is the
+MinGW-vs-glibc `libm` gap the pinning of the fixture already describes, and
+not a defect.
+
+**Not run, and not claimed.**
+
+- The Linux/POCL parity run. WSL has no OpenCL ICD, installing
+  `pocl-opencl-icd` needs `sudo` and the session is non-interactive, so
+  `ClParity` and `ClPipelineParity` **skip themselves** there. Every parity
+  number above is from the RTX 3060 on Windows and from nowhere else.
+- The `ff_*.bin` leg of the cross-`-march` compare, and a `FullFieldGolden`
+  run on CI's OpenCV — both still blocked on an OpenCV build, as in Phase 3.
+- On Windows the suite is 139 tests, 136 passing; the three failures are
+  `FullFieldGolden.CaptureOrCompare` and the two `GoldenCorpus` cases, and
+  **the same three fail from the `SEMPER_OPENCL=OFF` binary** — vendored-OpenCV
+  AKAZE and the MinGW `libm` gap, not the GPU path.
 
 ### Per-phase gate
 
@@ -425,6 +594,7 @@ chat log.
 | 2026-09 | POCL CPU device | pocl-opencl-icd 5.0 | 3.0 (CL C 1.2) | yes | yes | 2900 ON / 2910 OFF (median, back-to-back) | pass | `cpu-skylake-avx512`. Canonical reduction exact vs host at every size |
 | 2026-09 | NVIDIA GeForce RTX 3060 Laptop | CUDA ICD | 3.0 | yes | yes | strain 0.67× at 2.2k pts → 5.32× at 37k pts | pass | Windows 11 / MinGW-w64. Phase 2. Fixed ~0.45 ms dispatch cost sets a 3600-point break-even; below it the caller stays on CPU |
 | 2026-09 | NVIDIA GeForce RTX 3060 Laptop | CUDA ICD | 3.0 | yes | yes | Hessian pre-pass 3.5× at 2.5k pts → 25.7× at 58k pts (vs serial CPU) | pass | Windows 11 / MinGW-w64. Phase 3. fp32 only, so gated on `exact_fp32`. Dispatch floor ~0.6 ms + ~2 ms per megapixel of reference image, which is why the caller's threshold is per megapixel rather than a flat point count |
+| 2026-09 | NVIDIA GeForce RTX 3060 Laptop | CUDA ICD | 3.0 | yes | yes | **Path A ICGN 1.12×–1.44× SLOWER than 20 threads; 1.00×–1.06× at 8 and 4 threads** (4.8×–12.5× vs *serial* CPU) | pass — 3 235 points, 0 mismatches | Windows 11 / MinGW-w64. Phase 4. **Throughput gate failed, so the stage ships off** (`kGpuIcgnPathAEnabled = false`). Cause is warp divergence on iteration count: one work-item per subset makes a warp run until its slowest lane converges, and ~137 of 3 470 points hit the 50-iteration cap. Remedy is round-based launches over a compacted active list |
 |  |  |  |  |  |  |  |  |  |
 
 ---

@@ -11,6 +11,7 @@ set(SEMPER_GPU_KERNELS
         ${SEMPER_ROOT_FOR_GPU}/src/gpu/kernels/probe.cl
         ${SEMPER_ROOT_FOR_GPU}/src/gpu/kernels/strain_vsg.cl
         ${SEMPER_ROOT_FOR_GPU}/src/gpu/kernels/hessian_prepass.cl
+        ${SEMPER_ROOT_FOR_GPU}/src/gpu/kernels/icgn_solve.cl
 )
 
 # Host-side dispatch. One file per stage; each is the CPU-side twin of a
@@ -19,6 +20,7 @@ set(SEMPER_GPU_SOURCES
         ${SEMPER_ROOT_FOR_GPU}/src/gpu/cl_runtime.cpp
         ${SEMPER_ROOT_FOR_GPU}/src/gpu/strain_dispatch.cpp
         ${SEMPER_ROOT_FOR_GPU}/src/gpu/hessian_dispatch.cpp
+        ${SEMPER_ROOT_FOR_GPU}/src/gpu/icgn_dispatch.cpp
 )
 
 # Bake the .cl sources into a header, resolving first-party includes. An

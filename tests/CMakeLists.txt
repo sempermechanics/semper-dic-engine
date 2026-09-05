@@ -68,6 +68,7 @@ set(DIC_UNIT_TESTS
         unit/test_cl_runtime.cpp
         unit/test_cl_strain.cpp
         unit/test_cl_hessian.cpp
+        unit/test_cl_icgn.cpp
         unit/test_canonical_reduce.cpp
         unit/test_canonical_inverse.cpp
         unit/test_simd_kernels.cpp
