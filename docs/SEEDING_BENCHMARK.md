@@ -181,8 +181,8 @@ therefore reduces `SEMPER_OPENCV_BUILD_LIST` from
 core,imgproc,imgcodecs,features2d,calib3d,flann   ->   core,imgproc,imgcodecs
 ```
 
-Measured on `libsemper_c.so`, host x86_64, Release, OpenCV statically linked
-from the pinned 4.13 submodule:
+Measured on `libsemper_c.so`, Release, OpenCV statically linked from the
+pinned 4.13 submodule. Host x86_64 first:
 
 | | before | after | delta |
 |---|---|---|---|
@@ -195,11 +195,53 @@ from the pinned 4.13 submodule:
 
 This is substantially more than the three modules' own footprint suggests
 (2.95 MB of 11.44 MB in the distro shared builds): static linking pulls their
-transitive dependencies in as well. The reduced library was verified working —
-`semper_c_smoke` passes and the anchor lattice routes `FULL` through the C ABI.
+transitive dependencies in as well.
 
-The **arm64-v8a figure is unmeasured** — no NDK in this environment. The host
-number is indicative, not the shipping number.
+### 6.1 aarch64
+
+The engine ships as `arm64-v8a`, so the x86_64 figure alone is not sufficient.
+Repeated with an aarch64 cross-compile
+(`cmake/toolchains/aarch64-linux-gnu.cmake`), identical in every respect except
+`SEMPER_OPENCV_BUILD_LIST`:
+
+| | before | after | delta |
+|---|---|---|---|
+| stripped `.so` | 9.475 MB | **6.720 MB** | **−2.755 MB (−29.1%)** |
+| unstripped `.so` | 11.458 MB | 7.925 MB | −3.533 MB (−30.8%) |
+| `.text` | 7.275 MB | 5.146 MB | −2.129 MB (−29.3%) |
+| `.rodata` | 0.671 MB | 0.567 MB | −0.104 MB (−15.5%) |
+| `.eh_frame` | 0.610 MB | 0.442 MB | −0.168 MB (−27.5%) |
+| `.data.rel.ro` | 0.142 MB | 0.080 MB | −0.063 MB (−44.2%) |
+
+**The saving holds on ARM, but it is smaller than x86_64 suggested** — 29.1%
+and 2.755 MB against 35.9% and 4.864 MB. Part of that is `WITH_CAROTENE`, which
+compiles on aarch64 and was skipped on x86_64 ("NEON is not available,
+disabling carotene"): it adds code to *both* aarch64 builds, enlarging the
+shared baseline and diluting the percentage. Quote 29% and ~2.8 MB per ABI, not
+the host number.
+
+Both reduced libraries were verified working, not merely linked:
+`semper_c_smoke` passes on x86_64 natively and on aarch64 under
+`qemu-aarch64-static`, in both cases with the anchor lattice accepting 121/121
+anchors and routing `FULL` through the C ABI.
+
+### 6.2 What the aarch64 measurement does not reproduce
+
+The Android NDK could not be obtained here — `dl.google.com` does not respond
+through the proxy — so this is a GNU cross-compile, not the shipping build:
+
+- **GCC 13.3 aarch64, not NDK clang.** The before/after ratio is dominated by
+  which OpenCV modules link rather than by the compiler, but absolute sizes
+  will differ.
+- **glibc, not Bionic.**
+- **No `-flto`.** The Android build applies it to `semper_pipeline`
+  (`SEMPER_ANDROID=ON`). Cross-TU dead-code elimination would plausibly
+  *increase* the relative saving, so 29.1% is likely conservative — but that is
+  an expectation, not a measurement.
+- No 16 KB page alignment (`-Wl,-z,max-page-size=16384`), which affects on-disk
+  padding.
+
+The one number that still needs an NDK is the shipping `libsemper_core.so`.
 
 One detail Phase 3 has to handle: `draw_outlined_text` is a debug-drawing
 helper that currently lives in the descriptor translation unit and is used by
@@ -248,7 +290,7 @@ measurement:
 | 4 | total CPU time ≤ baseline, single and multi-threaded | **pass** — 678.3 vs 706.7 ms at 4 threads, 622.9 vs 691.3 ms pinned to one core |
 | 5 | peak RSS ≤ baseline | **pass** — 65.9 vs 67.9 MB, the lowest of all seven candidates |
 | 6 | coverage and convergence no worse | **pass** — mesh coverage 1.000 vs 0.446 (DICe) and 0.762 (Sample 14); convergence identical everywhere; never routes below the baseline's quality |
-| 7 | binary size not larger | **pass** — 35.9% smaller, −4.864 MB per ABI |
+| 7 | binary size not larger | **pass** — aarch64 29.1% smaller (−2.755 MB per ABI); x86_64 35.9% (−4.864 MB). Quote the aarch64 figure |
 
 Two criteria are not met literally. Criterion 1 fails on Sample 5 by 7% at a
 level where the field result is identical across all candidates, and criterion 2
