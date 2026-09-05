@@ -3,6 +3,7 @@
 
 #include <semper/cancel.hpp>
 #include <semper/image.hpp>
+#include <semper/seeding.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/features2d.hpp>
 #include <functional>
@@ -31,6 +32,10 @@ struct ReferenceCache {
     std::vector<cv::KeyPoint> akaze_kp;
     cv::Mat akaze_desc;
     double akaze_scale = 0.25;
+    // Which seeding front-end detect_mesh_seeds uses. Internal member: the
+    // shipping default is the only value the pipeline itself ever sets. The
+    // seeding benchmark writes it to compare candidates on identical inputs.
+    seeding::SeedMethod seed_method = seeding::SeedMethod::AkazePyramid;
     std::mutex mutex;
     std::string debug_dir;
 

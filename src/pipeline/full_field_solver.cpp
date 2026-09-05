@@ -107,7 +107,7 @@ int run_full_field(
         int safe_cores = std::max(1, (int)std::thread::hardware_concurrency());
 
         // 🚀 IMPLEMENTATION: Priority 6 & 4 States — adaptive AKAZE scale pyramid
-        MeshSeedResult seeds = detect_mesh_seeds(cache, defMat, roiMask, params, local_debug_dir);
+        MeshSeedResult seeds = detect_mesh_seeds(cache, defMat, defImg, roiMask, params, local_debug_dir);
         const std::vector<cv::Point2f>& akaze_ref_pts = seeds.ref_pts;
         const std::vector<cv::Point2f>& akaze_def_pts = seeds.def_pts;
         MeshQuality mesh_quality = seeds.quality;

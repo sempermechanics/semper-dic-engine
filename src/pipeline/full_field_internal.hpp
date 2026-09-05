@@ -191,11 +191,17 @@ struct MeshSeedResult {
     float globalV = 0.0f;
     double time_akaze_ms = 0.0;
     double time_ransac_ms = 0.0;
+    // Reported by every front-end so the seeding benchmark can compare them.
+    float coverage = 0.0f;
+    int anchors_attempted = 0;
+    int anchors_accepted = 0;
+    bool phase_locked = false;
 };
 
 MeshSeedResult detect_mesh_seeds(
         ReferenceCache &cache,
         const cv::Mat &defMat,
+        const Image &def_img,
         cv::Mat &roiMask,
         const FullFieldParams &params,
         const std::string &debug_dir);

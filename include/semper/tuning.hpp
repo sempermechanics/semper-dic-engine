@@ -30,6 +30,21 @@ inline constexpr float kGhostRejectFraction = 0.05f;
 /** AKAZE inlier convex-hull coverage for SPARSE vs clustered routing. */
 inline constexpr float kAkazeSparseCoverage = 0.05f;
 
+/** Anchor-lattice seeding: target number of lattice nodes over the ROI. */
+inline constexpr int kAnchorTarget = 256;
+
+/** Anchor-lattice seeding: minimum lattice stride in grid nodes. */
+inline constexpr int kAnchorStrideMin = 1;
+
+/** Anchor-lattice seeding: universal-median-test rejection radius (px). */
+inline constexpr float kAnchorMedianTol = 1.0f;
+
+/** Anchor-lattice seeding: accepted/attempted fraction for a FULL mesh. */
+inline constexpr float kAnchorFullFraction = 0.60f;
+
+/** Phase-correlation peak response below which the global shift is not trusted. */
+inline constexpr float kPhaseCorrMinResponse = 0.05f;
+
 /** Packed-field sentinel for "no valid correlation at this grid point". */
 inline constexpr float kCorrInvalid = -1.0f;
 

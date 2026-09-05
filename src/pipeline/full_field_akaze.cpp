@@ -26,12 +26,71 @@ namespace Semper {
 namespace pipeline {
 namespace internal {
 
+// Anchor-lattice front-end: phase correlation for the global rigid shift, then
+// IC-GN on a regular lattice of ROI grid nodes. No detector, no descriptor.
+static MeshSeedResult detect_anchor_seeds(
+        ReferenceCache& cache,
+        const cv::Mat& defMat,
+        const Image& def_img,
+        cv::Mat& roiMask,
+        const FullFieldParams& params) {
+
+    MeshSeedResult out;
+    if (cache.gray.empty() || cache.ref_img == nullptr) return out;
+
+    const cv::Rect roi(params.rect_x, params.rect_y, params.rect_w, params.rect_h);
+
+    auto t_phase = std::chrono::high_resolution_clock::now();
+    double pu = 0.0, pv = 0.0, presp = 0.0;
+    const bool locked = seeding::phase_correlate_roi(cache.gray, defMat, roi, pu, pv, presp);
+    out.time_ransac_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - t_phase).count();
+
+    seeding::AnchorSeedResult anchors = seeding::solve_anchor_lattice(
+            *cache.ref_img, def_img, roiMask,
+            params.rect_x, params.rect_y, params.rect_w, params.rect_h,
+            params.step, params.subset_size, params.use_6x6_interpolator,
+            (float)pu, (float)pv, locked);
+
+    out.ref_pts = std::move(anchors.ref_pts);
+    out.def_pts = std::move(anchors.def_pts);
+    out.globalU = anchors.globalU;
+    out.globalV = anchors.globalV;
+    out.coverage = anchors.coverage;
+    out.anchors_attempted = anchors.attempted;
+    out.anchors_accepted = anchors.accepted;
+    out.phase_locked = locked;
+    out.time_akaze_ms = anchors.anchor_ms;
+
+    const float accepted_fraction = anchors.attempted > 0
+            ? (float)anchors.accepted / (float)anchors.attempted : 0.0f;
+
+    if (anchors.accepted >= 10 && accepted_fraction >= tuning::kAnchorFullFraction &&
+        anchors.coverage >= 0.30f) {
+        out.quality = MeshQuality::FULL;
+    } else if (anchors.accepted >= 10 && anchors.coverage >= tuning::kAkazeSparseCoverage) {
+        out.quality = MeshQuality::SPARSE;
+    } else {
+        out.quality = MeshQuality::NONE;
+    }
+
+    LOGD("ROUTING: anchor lattice %d/%d accepted (cov %.2f, phase %s) -> quality %d",
+         anchors.accepted, anchors.attempted, (double)anchors.coverage,
+         locked ? "locked" : "none", (int)out.quality);
+    return out;
+}
+
 MeshSeedResult detect_mesh_seeds(
         ReferenceCache& cache,
         const cv::Mat& defMat,
+        const Image& def_img,
         cv::Mat& roiMask,
         const FullFieldParams& params,
         const std::string& local_debug_dir) {
+
+    if (cache.seed_method == seeding::SeedMethod::AnchorLattice) {
+        return detect_anchor_seeds(cache, defMat, def_img, roiMask, params);
+    }
 
     MeshSeedResult out;
     float inlier_bb_area_ratio = 0.0f;
@@ -49,7 +108,12 @@ MeshSeedResult detect_mesh_seeds(
                 // 🚀 PRIORITY 2: ADAPTIVE SCALE PYRAMID
                 // Build the scale list based on the globally established baseline for this specimen
                 std::vector<double> scales_to_try;
-                if (cache.akaze_scale <= 0.25) scales_to_try = { 0.25,0.5,1.0};
+                if (cache.seed_method != seeding::SeedMethod::AkazePyramid) {
+                    // Every candidate other than the shipping default is measured
+                    // at full resolution, so the comparison isolates the detector
+                    // rather than the downscale it happens to run at.
+                    scales_to_try = {1.0};
+                } else if (cache.akaze_scale <= 0.25) scales_to_try = { 0.25,0.5,1.0};
                 else if (cache.akaze_scale <= 0.5) scales_to_try = {0.5,1.0};
                 else scales_to_try = {1.0};
 
@@ -73,7 +137,7 @@ MeshSeedResult detect_mesh_seeds(
 
                     double iter_akaze = 0, iter_ransac = 0;
                     // 🚀 FIX: Pass padded_roi.x and padded_roi.y into the function!
-                    bool success = seeding::extract_akaze_features(refROI, defROI, roiMask, current_scale, out.ref_pts, out.def_pts, inlier_bb_area_ratio, iter_akaze, iter_ransac, cache.akaze_kp, cache.akaze_desc, padded_roi.x, padded_roi.y, local_debug_dir);
+                    bool success = seeding::extract_descriptor_features(refROI, defROI, roiMask, current_scale, out.ref_pts, out.def_pts, inlier_bb_area_ratio, iter_akaze, iter_ransac, cache.akaze_kp, cache.akaze_desc, padded_roi.x, padded_roi.y, cache.seed_method, local_debug_dir);
                     out.time_akaze_ms += iter_akaze;
                     out.time_ransac_ms += iter_ransac;
 
@@ -81,6 +145,7 @@ MeshSeedResult detect_mesh_seeds(
                     if (success && out.ref_pts.size() >= 25) {
                         // We found enough features! Zooming in further won't change the physical coverage area.
                         has_good_akaze = true;
+                        out.coverage = inlier_bb_area_ratio;
                         winning_padded_roi = padded_roi; // 🚀 SAVE OFFSETS
 
                         // Now, evaluate the structural integrity of the mesh
