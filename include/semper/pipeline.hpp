@@ -3,9 +3,7 @@
 
 #include <semper/cancel.hpp>
 #include <semper/image.hpp>
-#include <semper/seeding.hpp>
 #include <opencv2/core.hpp>
-#include <opencv2/features2d.hpp>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -17,7 +15,7 @@ namespace pipeline {
 using ProgressCallback = std::function<void(int percentage)>;
 
 /**
- * Cached reference for multi-frame solves (AKAZE + Image).
+ * Cached reference for multi-frame solves (decoded gray + Image).
  *
  * Owns a raw Image* (freed in reset()), so it is non-copyable/non-movable to
  * avoid a double-free — there is one process-wide instance (see the JNI layer).
@@ -29,13 +27,6 @@ struct ReferenceCache {
     int width = 0;
     int height = 0;
     cv::Mat gray;
-    std::vector<cv::KeyPoint> akaze_kp;
-    cv::Mat akaze_desc;
-    double akaze_scale = 0.25;
-    // Which seeding front-end detect_mesh_seeds uses. Internal member: the
-    // shipping default is the only value the pipeline itself ever sets. The
-    // seeding benchmark writes it to compare candidates on identical inputs.
-    seeding::SeedMethod seed_method = seeding::SeedMethod::AkazePyramid;
     std::mutex mutex;
     std::string debug_dir;
 

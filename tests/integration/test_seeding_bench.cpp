@@ -52,13 +52,14 @@
 #include <sstream>
 #include <functional>
 #include <random>
+#include <thread>
 #include <string>
 #include <vector>
 
 using Semper::Image;
 using Semper::pipeline::FullFieldParams;
 using Semper::pipeline::ReferenceCache;
-using Semper::seeding::SeedMethod;
+using Semper::SubsetPrecomputer;
 
 namespace {
 
@@ -134,16 +135,6 @@ constexpr int RECT_ORIGIN = 80;
 constexpr int STEP = 5;
 constexpr int SUBSET = 41;
 constexpr int STRAIN_WIN = 15;
-
-const SeedMethod kCandidates[] = {
-        SeedMethod::AkazePyramid,
-        SeedMethod::AkazeFull,
-        SeedMethod::Sift,
-        SeedMethod::Orb,
-        SeedMethod::Brisk,
-        SeedMethod::Kaze,
-        SeedMethod::AnchorLattice,
-};
 
 struct Scenario {
     const char *name;
@@ -286,7 +277,7 @@ struct Row {
 
 // Seed-level + mesh-level measurement. Calls the seeding front-end and the
 // Delaunay mesh builder directly, so the two error columns are separated.
-void measure_seed(Row &row, const TruthFn &truth, SeedMethod method,
+void measure_seed(Row &row, const TruthFn &truth,
                   const cv::Mat &ref_gray, const cv::Mat &def_gray,
                   const FullFieldParams &params) {
     using namespace Semper::pipeline::internal;
@@ -294,39 +285,72 @@ void measure_seed(Row &row, const TruthFn &truth, SeedMethod method,
     ReferenceCache cache;
     cv::Mat no_mask;
     cache.set_from_gray(ref_gray, no_mask);
-    cache.seed_method = method;
 
     Image def_img(def_gray.cols, def_gray.rows, def_gray.data);
     def_img.prepare_data(false);
 
-    cv::Mat roi_mask;
+    const int gridW = params.rect_w / params.step;
+    const int gridH = params.rect_h / params.step;
 
-    // First call populates the reference-descriptor cache; time the repeats so
-    // the number reflects the steady state of a multi-frame solve.
-    MeshSeedResult seeds = detect_mesh_seeds(cache, def_gray, def_img, roi_mask, params, "");
+    // Mirror run_full_field's setup: mark boundary-violating nodes as skipped,
+    // then build the Hessian pool the anchor lattice reuses.
+    const int reserve = params.subset_size / 2 + 4 + 15;
+    ResultGrid grid(gridH, std::vector<GridPoint>(gridW));
+    HessianPool pool((size_t)gridW * gridH);
+    for (int gy = 0; gy < gridH; ++gy) {
+        for (int gx = 0; gx < gridW; ++gx) {
+            const int rx = params.rect_x + gx * params.step;
+            const int ry = params.rect_y + gy * params.step;
+            const bool skip = rx - reserve < 0 || rx + reserve >= cache.width ||
+                              ry - reserve < 0 || ry + reserve >= cache.height;
+            grid[gy][gx] = {(float)rx, (float)ry, 0, 0, 0, 0, 0, 0,
+                            -1.0f, skip, -1, -1, 0, false, 0};
+            if (!skip) {
+                pool[(size_t)gy * gridW + gx] = SubsetPrecomputer::compute_hessian_only(
+                        *cache.ref_img, rx, ry, params.subset_size);
+            }
+        }
+    }
+
+    // Match the pipeline's thread count so seeding cost is comparable to the
+    // ff_ columns rather than being an artificially serial number.
+    const int cores = std::max(1, (int)std::thread::hardware_concurrency());
+    std::atomic<int> solved_count(0), order(1);
+    std::vector<ThreadStats> stats((size_t)cores);
+    PhaseTimings timings;
+    MeshSeedResult seeds;
+
+    // First call warms nothing (there is no descriptor cache any more), but the
+    // repeats still give a median that survives VM scheduling noise.
     std::vector<double> seed_walls, seed_cpus;
     for (int rep = 0; rep < repeat_count(); ++rep) {
+        ResultGrid g = grid;
+        std::atomic<int> sc(0), od(1);
+        std::vector<ThreadStats> st((size_t)cores);
+        PhaseTimings t;
         auto t0 = std::chrono::high_resolution_clock::now();
         const CpuClock c0 = CpuClock::now();
-        seeds = detect_mesh_seeds(cache, def_gray, def_img, roi_mask, params, "");
+        seeds = solve_anchor_seeds(cache, def_gray, def_img, params, gridW, gridH,
+                                   cores, pool, sc, od, g, st, t);
         seed_cpus.push_back(CpuClock::now().total_ms() - c0.total_ms());
         seed_walls.push_back(std::chrono::duration<double, std::milli>(
                 std::chrono::high_resolution_clock::now() - t0).count());
+        if (rep + 1 == repeat_count()) { grid = g; timings = t; }
     }
     row.seed_ms = percentile(seed_walls, 0.50);
     row.seed_cpu_ms = percentile(seed_cpus, 0.50);
-    row.seed_precompute_ms = seeds.time_precompute_ms;
-    row.seed_icgn_ms = seeds.time_icgn_ms;
+    row.seed_precompute_ms = timings.phase_corr;
+    row.seed_icgn_ms = timings.anchors;
     row.phase_locked = seeds.phase_locked;
-    row.anchors_accepted = seeds.anchors_accepted;
-    row.anchors_attempted = seeds.anchors_attempted;
+    row.anchors_accepted = seeds.accepted;
+    row.anchors_attempted = seeds.attempted;
+    (void)solved_count; (void)order; (void)stats;
 
     row.vertices = (int)seeds.ref_pts.size();
     row.coverage = seeds.coverage;
     row.quality = seeds.quality == MeshQuality::FULL ? 2
                 : seeds.quality == MeshQuality::SPARSE ? 1 : 0;
 
-    // Vertex displacement error against the analytic warp at each vertex.
     std::vector<double> dus;
     for (size_t i = 0; i < seeds.ref_pts.size(); ++i) {
         const Truth t = truth(seeds.ref_pts[i].x, seeds.ref_pts[i].y);
@@ -337,18 +361,7 @@ void measure_seed(Row &row, const TruthFn &truth, SeedMethod method,
     row.vtx_med_du = percentile(dus, 0.50);
     row.vtx_p95_du = percentile(dus, 0.95);
 
-    // Mesh guess field: the gradients the solve actually receives.
-    const int gridW = params.rect_w / params.step;
-    const int gridH = params.rect_h / params.step;
-    ResultGrid grid(gridH, std::vector<GridPoint>(gridW));
-    for (int gy = 0; gy < gridH; ++gy) {
-        for (int gx = 0; gx < gridW; ++gx) {
-            grid[gy][gx].x = (float)(params.rect_x + gx * params.step);
-            grid[gy][gx].y = (float)(params.rect_y + gy * params.step);
-        }
-    }
     std::vector<AffineTriangle> tris;
-    PhaseTimings timings;
     MeshGuessField guess = build_mesh_guess_field(
             cache, params, seeds.ref_pts, seeds.def_pts, seeds.quality,
             seeds.globalU, seeds.globalV, gridW, gridH, "", grid, tris, timings);
@@ -365,7 +378,6 @@ void measure_seed(Row &row, const TruthFn &truth, SeedMethod method,
             const double du = guess.u[(size_t)idx] - t.u;
             const double dv = guess.v[(size_t)idx] - t.v;
             gdu.push_back(std::sqrt(du * du + dv * dv));
-            // Frobenius error of the guessed displacement-gradient tensor.
             const double e00 = guess.ux[(size_t)idx] - t.ux;
             const double e01 = guess.uy[(size_t)idx] - t.uy;
             const double e10 = guess.vx[(size_t)idx] - t.vx;
@@ -373,20 +385,21 @@ void measure_seed(Row &row, const TruthFn &truth, SeedMethod method,
             gdux.push_back(std::sqrt(e00 * e00 + e01 * e01 + e10 * e10 + e11 * e11));
         }
     }
-    row.mesh_frac = (double)in_mesh / (double)(gridW * gridH);
+    // Anchors that clear the result gate are already solved, so they are not in
+    // the mesh guess field; count them as covered.
+    row.mesh_frac = (double)(in_mesh + seeds.solved) / (double)(gridW * gridH);
     row.mesh_med_du = percentile(gdu, 0.50);
     row.mesh_med_dux = percentile(gdux, 0.50);
     row.mesh_p95_dux = percentile(gdux, 0.95);
 }
 
 // Downstream measurement: the whole solve, with this candidate seeding it.
-void measure_full_field(Row &row, const TruthFn &truth, SeedMethod method,
+void measure_full_field(Row &row, const TruthFn &truth,
                         const cv::Mat &ref_gray, const cv::Mat &def_gray,
                         const FullFieldParams &params) {
     ReferenceCache cache;
     cv::Mat no_mask;
     cache.set_from_gray(ref_gray, no_mask);
-    cache.seed_method = method;
 
     const int gridW = params.rect_w / params.step;
     const int gridH = params.rect_h / params.step;
@@ -558,21 +571,17 @@ TruthFn sinusoid_truth(const CommandCurve &c) {
     };
 }
 
-void run_candidates(const char *scenario, const TruthFn &truth,
-                    const cv::Mat &ref_gray, const cv::Mat &def_gray,
-                    const FullFieldParams &params, std::vector<Row> &rows) {
-    const char *only = std::getenv("SEMPER_SEEDBENCH_ONLY");
-    for (SeedMethod m : kCandidates) {
-        if (only != nullptr && std::string(only) != Semper::seeding::seed_method_name(m)) continue;
-        Row row;
-        row.scenario = scenario;
-        row.method = Semper::seeding::seed_method_name(m);
-        std::printf("    [%s / %s] ...\n", row.scenario.c_str(), row.method.c_str());
-        std::fflush(stdout);
-        measure_seed(row, truth, m, ref_gray, def_gray, params);
-        measure_full_field(row, truth, m, ref_gray, def_gray, params);
-        rows.push_back(row);
-    }
+void run_scenario(const char *scenario, const TruthFn &truth,
+                  const cv::Mat &ref_gray, const cv::Mat &def_gray,
+                  const FullFieldParams &params, std::vector<Row> &rows) {
+    Row row;
+    row.scenario = scenario;
+    row.method = "anchor_lattice";
+    std::printf("    [%s] ...\n", row.scenario.c_str());
+    std::fflush(stdout);
+    measure_seed(row, truth, ref_gray, def_gray, params);
+    measure_full_field(row, truth, ref_gray, def_gray, params);
+    rows.push_back(row);
 }
 
 FullFieldParams params_for(int img_w, int img_h, int subset, int step) {
@@ -645,7 +654,7 @@ TEST_CASE(SeedBench, CandidateSweep) {
         const cv::Mat ref_gray = gray8(ref, sc.noise_sigma, 101);
         const cv::Mat def_gray = gray8(def, sc.noise_sigma, 202);
 
-        run_candidates(sc.name, affine_truth(sc.def), ref_gray, def_gray,
+        run_scenario(sc.name, affine_truth(sc.def), ref_gray, def_gray,
                        bench_params(), rows);
     }
 
@@ -697,7 +706,7 @@ TEST_CASE(SeedBench, RealSpeckleSweep) {
     params.use_6x6_interpolator = false;
 
     std::vector<Row> rows;
-    run_candidates(sc.name, affine_truth(sc.def), ref_gray, def_gray, params, rows);
+    run_scenario(sc.name, affine_truth(sc.def), ref_gray, def_gray, params, rows);
 
     print_table(rows);
     if (const char *csv = std::getenv("SEMPER_SEEDBENCH_CSV_REAL")) write_csv(rows, csv);
@@ -728,8 +737,8 @@ TEST_CASE(SeedBench, Challenge5) {
     d.cx = 256.0f; d.cy = 256.0f;
 
     std::vector<Row> rows;
-    run_candidates("C5_real_0.10px", affine_truth(d), ref_gray, def_gray,
-                   params_for(512, 512, SUBSET, STEP), rows);
+    run_scenario("C5_real_0.10px", affine_truth(d), ref_gray, def_gray,
+                 params_for(512, 512, SUBSET, STEP), rows);
     print_table(rows);
     if (const char *csv = std::getenv("SEMPER_SEEDBENCH_CSV_C5")) write_csv(rows, csv);
 }
@@ -775,7 +784,7 @@ TEST_CASE(SeedBench, Challenge14Sinusoid) {
 
         // 589 rows is short, so the ROI is height-limited; keep the full width
         // where the sinusoid lives.
-        run_candidates(set.tag, sinusoid_truth(curve), ref_gray, def_gray,
+        run_scenario(set.tag, sinusoid_truth(curve), ref_gray, def_gray,
                        params_for(2048, 589, SUBSET, 10), rows);
     }
     print_table(rows);
@@ -819,7 +828,7 @@ TEST_CASE(SeedBench, LargeMotionSweep) {
         const Image def = dictest::make_deformed_image(field, W, H, sc.def);
         const cv::Mat ref_gray = gray8(ref, sc.noise_sigma, 101);
         const cv::Mat def_gray = gray8(def, sc.noise_sigma, 202);
-        run_candidates(sc.name, affine_truth(sc.def), ref_gray, def_gray, params, rows);
+        run_scenario(sc.name, affine_truth(sc.def), ref_gray, def_gray, params, rows);
     }
 
     print_table(rows);

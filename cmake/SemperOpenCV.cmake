@@ -11,11 +11,11 @@ foreach(_stub doc data)
     endif()
 endforeach()
 
-# Overridable so the binary-size cost of the descriptor seeding front-end can be
-# measured: features2d and flann serve only AKAZE + BFMatcher, and calib3d is
-# pulled in by a single cv::findHomography call in src/seeding/akaze_seed.cpp.
-# Default reproduces the previous hard-coded list exactly.
-set(SEMPER_OPENCV_BUILD_LIST "core,imgproc,imgcodecs,features2d,calib3d,flann"
+# The engine needs core/imgproc/imgcodecs only. features2d, flann and calib3d
+# went out with the descriptor seeding front-end (they served AKAZE, BFMatcher
+# and one cv::findHomography call); dropping them takes ~29% off the aarch64
+# libsemper_c.so. Overridable so the cost can be re-measured.
+set(SEMPER_OPENCV_BUILD_LIST "core,imgproc,imgcodecs"
     CACHE STRING "OpenCV modules compiled from source")
 set(BUILD_LIST "${SEMPER_OPENCV_BUILD_LIST}" CACHE STRING "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)

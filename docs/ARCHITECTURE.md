@@ -15,7 +15,7 @@ Downstream Android app (private)
        |
        v  adapters/android (JNI marshalling only)
 this repository
-  src/io + seeding + pipeline   (decode, AKAZE/mesh/RGDIC, OpenMP)
+  src/io + seeding + pipeline   (decode, anchors/mesh/RGDIC, OpenMP)
        |
        v
   src/math + strain
@@ -24,9 +24,17 @@ this repository
 ```
 
 **Data flow for one analysis:** decode images → `Image` (float intensities +
-gradients) → for each grid point: `SubsetPrecomputer` builds a `SubsetData` →
+gradients) → Hessian pre-pass → **anchor-lattice seeding** (phase correlation for
+the global rigid shift, then IC-GN on a lattice of grid nodes) → Delaunay mesh →
+for each remaining grid point: `SubsetPrecomputer` builds a `SubsetData` →
 `OptimizationEngine.calculate_deformation` solves the 6-DOF warp →
 displacement field → `StrainCalculator` → results buffer back through JNI.
+
+Seeding runs **after** the Hessian pre-pass on purpose: the anchors sit on grid
+nodes, so they reuse the pooled Hessians and a node that converges well enough
+is a final result for that node. Path A then skips it and Path B takes it as a
+boundary seed. See [SEEDING_BENCHMARK.md](SEEDING_BENCHMARK.md) for why this
+replaced AKAZE feature matching.
 
 Package layout and contributor rules: [`README.md`](../README.md).
 
@@ -298,8 +306,8 @@ starts — a pending edit can never reach the engine uncommitted.
 | `src/math/` | Image / SubsetPrecomputer / OptimizationEngine |
 | `src/strain/` | StrainCalculator |
 | `src/io/` | Platform-agnostic OpenCV decode |
-| `src/seeding/` | AKAZE + RANSAC |
-| `src/pipeline/` | Full-field Path A/B/C + OpenMP |
+| `src/seeding/` | phase correlation (global rigid shift) |
+| `src/pipeline/` | Anchor seeding + full-field Path A/B/C + OpenMP |
 | `adapters/android/` | JNI only → `libsemper_core.so` |
 | `adapters/c/` | Stable C ABI → `libsemper_c` |
 | `bindings/python/` | pybind11 module |

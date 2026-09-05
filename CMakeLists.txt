@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.22)
 # Version tracks include/semper/version.hpp (keep the two in sync).
 # C is required: vendored OpenCV and the C ABI smoke binary compile C sources.
-project(semper VERSION 0.2.1 LANGUAGES C CXX)
+project(semper VERSION 0.2.2 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -27,9 +27,6 @@ set(SEMPER_OPENCV_INCLUDE_DIRS
         ${OPENCV_SRC_DIR}/modules/core/include
         ${OPENCV_SRC_DIR}/modules/imgproc/include
         ${OPENCV_SRC_DIR}/modules/imgcodecs/include
-        ${OPENCV_SRC_DIR}/modules/features2d/include
-        ${OPENCV_SRC_DIR}/modules/calib3d/include
-        ${OPENCV_SRC_DIR}/modules/flann/include
         ${CMAKE_BINARY_DIR}
 )
 
@@ -74,12 +71,11 @@ endif()
 # ---------------------------------------------------------------------------
 add_library(semper_pipeline STATIC
         src/io/image_codec.cpp
-        src/seeding/akaze_seed.cpp
         src/seeding/anchor_seed.cpp
         src/pipeline/reference_cache.cpp
         src/pipeline/cancel.cpp
         src/pipeline/full_field_solver.cpp
-        src/pipeline/full_field_akaze.cpp
+        src/pipeline/full_field_anchors.cpp
         src/pipeline/full_field_mesh.cpp
         src/pipeline/full_field_path_a.cpp
         src/pipeline/full_field_path_b.cpp
@@ -97,16 +93,13 @@ target_include_directories(semper_pipeline SYSTEM PUBLIC
             ${SEMPER_OPENCV_INCLUDE_DIRS}
             ${EIGEN_SRC_DIR}
 )
-# core/imgproc/imgcodecs are always required. features2d, flann and calib3d are
-# needed only by the descriptor seeding front-end, so they are linked when the
-# configured SEMPER_OPENCV_BUILD_LIST actually builds them.
-set(_semper_opencv_libs semper_math opencv_core opencv_imgproc opencv_imgcodecs)
-foreach(_optional_cv opencv_features2d opencv_calib3d opencv_flann)
-    if(TARGET ${_optional_cv})
-        list(APPEND _semper_opencv_libs ${_optional_cv})
-    endif()
-endforeach()
-target_link_libraries(semper_pipeline PUBLIC ${_semper_opencv_libs})
+target_link_libraries(semper_pipeline
+        PUBLIC
+            semper_math
+            opencv_core
+            opencv_imgproc
+            opencv_imgcodecs
+)
 target_compile_definitions(semper_pipeline PRIVATE
         $<$<BOOL:${SEMPER_ANDROID}>:SEMPER_ANDROID_LOG=1>
         $<$<NOT:$<BOOL:${SEMPER_ANDROID}>>:SEMPER_HOST_LOG=1>

@@ -412,39 +412,84 @@ At each simplex vertex, evaluate ZNSSD:
 
 ---
 
-## 8. Feature-Based Initialization
+## 8. Anchor-Lattice Initialization
 
-### 8.1 AKAZE Feature Detection
+The seeding stage supplies the initial guess for §6's IC-GN iteration. It does
+not measure displacement; its job is to put every subset inside the basin of
+attraction and, through the Delaunay mesh of §8.4, to supply a first-order
+guess of the deformation gradient.
 
-**Algorithm:** Accelerated-KAZE (AKAZE) - fast variant of KAZE using binary descriptors.
+### 8.1 Global Rigid Shift by Phase Correlation
 
-**Keypoint Detection:**
-Construct nonlinear scale space using Perona-Malik diffusion:
+Let $f$ and $g$ be the reference and deformed intensity fields over the ROI,
+windowed by a Hann taper to suppress edge discontinuity. Their cross-power
+spectrum is normalised to unit magnitude:
 
-where  is the diffusivity function.
+$$ R(\bm{k}) = \frac{F(\bm{k})\,\overline{G(\bm{k})}}{\left|F(\bm{k})\,\overline{G(\bm{k})}\right|} $$
 
-Detect extrema in scale-normalized determinant of Hessian:
+For a pure translation $g(\bm{x}) = f(\bm{x} - \bm{d})$ the normalisation leaves
+a pure phase ramp, $R(\bm{k}) = e^{-i\bm{k}\cdot\bm{d}}$, whose inverse transform
+is a Dirac impulse at $\bm{d}$. The estimator takes the centroid of that peak,
+giving sub-pixel resolution, and its height as a confidence measure; a response
+below $k_{\text{PhaseCorrMinResponse}}$ is treated as no lock.
 
-**Descriptor:** Modified-Local Difference Binary (M-LDB) - 486-bit binary descriptor
+Discarding magnitude and keeping only phase is what makes this invariant to
+affine intensity change $a\,f + b$, matching the ZNSSD criterion the solver
+minimises. It uses every pixel in the ROI rather than a sparse keypoint set,
+which is why its accuracy on a rigid shift (~0.005 px measured) is two orders of
+magnitude better than any keypoint detector.
 
-### 8.2 Feature Matching
+**Limitation.** The estimate is a *translation*. Under a rotation $\theta$ about
+the ROI centre the true displacement at radius $r$ is $2r\sin(\theta/2)$, so a
+single global shift is increasingly wrong away from the centre. Measured
+behaviour: usable to about $2°$, degraded by $5°$, no lock by $15°$
+(see [SEEDING_BENCHMARK.md](SEEDING_BENCHMARK.md) §4.5).
 
-**Distance Metric:** Hamming distance between binary descriptors:
+### 8.2 Anchor Lattice
 
-**Matching Strategy:** Brute-force matching with cross-check:
+A regular lattice of ROI grid nodes with stride
 
-1. For each descriptor in reference, find nearest neighbor in deformed.
-2. Accept match only if reverse nearest neighbor agrees.
+$$ s = \max\left(1,\ \operatorname{round}\sqrt{\frac{N_x N_y}{N_{\text{target}}}}\right) $$
 
-**Outlier Rejection:** Reject matches with  (threshold = 25% bits different).
+is solved by the engine's own IC-GN, initialised from §8.1, with the last row
+and column always included so the convex hull reaches the ROI boundary. Because
+the anchors coincide with grid nodes they reuse the pooled Hessians of §6, and a
+node whose ZNSSD clears the result gate is retained as a **final** measurement
+rather than being re-solved.
 
-### 8.3 Global Displacement Estimation
+Two thresholds apply, because a seed and a result are held to different
+standards:
 
-From accepted matches, estimate bulk translation:
+| role | gate |
+|---|---|
+| mesh vertex | $C_{\text{ZNSSD}} \le k_{\text{AnchorAcceptScore}}$ (loose — the median test rejects blunders) |
+| output point | $C_{\text{ZNSSD}} \le k_{\text{CorrAccept}}$ (the same bar Path A applies) |
 
-**Median Estimator:** Robust to outliers (up to 50% contamination).
+### 8.3 Outlier Rejection — Universal Median Test
 
-**Typical Accuracy:** Within 1-2 pixels of true displacement for well-textured images.
+For anchor $i$ with lattice neighbours $\mathcal{N}(i)$, reject when
+
+$$ \left|u_i - \operatorname{median}_{j \in \mathcal{N}(i)} u_j\right| > k_{\text{AnchorMedianTol}} $$
+
+and likewise for $v$. This is the Westerweel–Scarano test from PIV. It is used
+in preference to a global homography or affine fit because a deforming specimen
+does not have an affine displacement field — a global model rejects signal, not
+just blunders — whereas the median test assumes no field shape at all. The
+lattice makes the neighbourhood lookup $O(1)$.
+
+### 8.4 Mesh Guess Field
+
+Delaunay triangulation over the surviving anchors gives, per triangle, an affine
+map from three reference vertices to their deformed positions, and hence a
+6-DOF guess $(u, v, u_x, u_y, v_x, v_y)$ at every enclosed grid point.
+
+The accuracy of the gradient components is what motivates the lattice. A vertex
+position error $\varepsilon$ over a triangle edge of length $L$ propagates to a
+gradient error of order $\varepsilon / L$. Keypoint detectors give
+$\varepsilon \sim 1$ px on short, clustered edges; IC-GN anchors give
+$\varepsilon \sim 0.01$ px on edges fixed at $s \cdot \text{step}$ — a measured
+improvement of 5–17× in $\|\nabla\bm{u} - \nabla\bm{u}_{\text{true}}\|_F$ on
+real speckle.
 
 ---
 

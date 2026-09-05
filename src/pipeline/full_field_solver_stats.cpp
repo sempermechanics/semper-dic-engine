@@ -111,7 +111,7 @@ void log_profiling_summary(
         int valid_count) {
     LOGD("=== ⏱️ ADVANCED PERFORMANCE PROFILING ===");
     LOGD("Image Prep & Masking: %.2f ms", t.img_prep);
-    LOGD("AKAZE & RANSAC:       %.2f ms", t.akaze + t.ransac);
+    LOGD("Seeding (phase+anchors): %.2f ms", t.phase_corr + t.anchors);
     LOGD("Hessian Pre-pass:     %.2f ms (One-time Global Math)", t.prepass);
 
     LOGD("Delaunay Mesh Setup:  %.2f ms", t.delaunay);
@@ -181,7 +181,7 @@ void fill_engine_metrics(
 
             // 9-13: Timestamps & Performance (ms)
             metrics_data[9]  = (float)t.total;                // Total Wall Time
-            metrics_data[10] = (float)(t.akaze + t.ransac);   // AKAZE/RANSAC Time
+            metrics_data[10] = (float)(t.phase_corr + t.anchors); // Seeding time (Frozen slot)
             metrics_data[11] = (float)t.prepass;              // Hessian Pre-Pass Time
             metrics_data[12] = (float)t.delaunay;             // Mesh Setup Time
             metrics_data[13] = (float)t.strain;               // Strain Calc Time
@@ -194,9 +194,9 @@ void fill_engine_metrics(
             metrics_data[15] = (total_valid_points > 0) ? ((float)valid_count / total_valid_points) * 100.0f : 0.0f; // Convergence %
 
             // 16: How the solve was seeded. Surfaces silently-skipped mesh
-            // phases (AKAZE fail / clustered features → Path C, RGDIC-only)
-            // in the report instead of just "0.0 ms / 0 points".
-            //   2 = full AKAZE mesh, 1 = sparse mesh, 0 = Path C fallback
+            // phases (too few anchors kept → Path C, RGDIC-only) in the report
+            // instead of just "0.0 ms / 0 points".
+            //   2 = full mesh, 1 = sparse mesh, 0 = Path C fallback
             metrics_data[16] = (mesh_quality == MeshQuality::FULL) ? 2.0f
                              : (mesh_quality == MeshQuality::SPARSE) ? 1.0f : 0.0f;
 

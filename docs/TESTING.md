@@ -7,6 +7,39 @@ and how to run everything. The engine it exercises is described in
 
 ---
 
+## Known gap: the sanitizer jobs do not cover the full-field pipeline
+
+`.github/workflows/ci.yml`'s `sanitizers` matrix installs only ccache, not
+`libopencv-dev`, and configures without `-DDIC_REQUIRE_OPENCV=ON`. OpenCV is
+therefore not found, `_SEMPER_OPENCV_READY` stays false, and
+`DIC_PIPELINE_SOURCES` / `DIC_PIPELINE_TESTS` are never compiled. ASan, UBSan
+and TSan consequently see the math suite only — never `run_full_field`, its
+OpenMP regions, or Path B's `std::thread` workers.
+
+Running them locally with OpenCV present is therefore stricter than CI:
+
+```bash
+cmake -S tests -B build/asan -DCMAKE_BUILD_TYPE=Release \
+      -DDIC_REQUIRE_OPENCV=ON -DDIC_SANITIZER=address,undefined
+cmake --build build/asan -j"$(nproc)" && ./build/asan/dic_tests
+```
+
+ASan + UBSan over the full pipeline is clean (89/89, exit 0, zero findings).
+
+**TSan over the full pipeline is not, and was not before the seeding change.**
+Measured on identical hardware: pristine `074602a` reports 363 data races and
+exits 66; the anchor-seeding branch reports 434 and also exits 66. Both pass all
+their tests. The reports land on OpenMP fork/join edges — including
+`full_field_solver.cpp`'s Hessian pre-pass, untouched by any recent work — and
+on `std::vector::operator[]` reads of read-only data. GCC's `libgomp` is not
+TSan-instrumented, so TSan cannot see the barriers that order these accesses.
+
+Treat the TSan numbers as a baseline to compare against, not a pass/fail gate,
+until either `libgomp` is replaced with an instrumented runtime or the OpenMP
+regions are annotated. Enabling OpenCV in the CI sanitizer job without doing
+that first would turn the job red.
+
+
 ## Running the tests
 
 ### Host engine tests (no device / NDK needed)
@@ -286,7 +319,7 @@ solver skips them. OpenCV-gated.
 | `RoiSterilization_MasksLeftHalf` | Masked pixels become exactly `-10.0f`; unmasked stay real | ROI mask ignored, or the wrong region sterilized — masked material enters the solve |
 | `MaskResize_NearestKeepsHalfSplit` | A differently-sized mask is `INTER_NEAREST`-resized to the reference before sterilizing | Mask/reference misalignment silently masks the wrong pixels |
 | `NoMask_LeavesAllPixelsReal` | Empty mask → no sentinels written | Phantom masking with no ROI supplied |
-| `Relifecycle_UpdatesDimsAndClearsAkaze` | Re-`set_from_gray` with a new size updates dims and clears AKAZE state (`akaze_scale == 0.25`) | Stale seeding/dimension state leaks across references |
+| `Relifecycle_UpdatesDims` | Re-`set_from_gray` with a new size updates the cached dimensions | Stale dimension state leaks across references |
 | `EmptyInput_LeavesCacheCleared` | Empty gray clears the cache (`width == 0`, `ref_img == nullptr`) instead of retaining the old reference | A failed re-init silently solves against the previous frame |
 | `Reset_ClearsEverything` | `reset()` frees and zeroes all state | Double-free or leak on teardown |
 

@@ -27,8 +27,8 @@ inline constexpr int kIcgnMaxIter = 50;
 /** Reject a subset if more than this fraction of ref pixels hit the ghost wall. */
 inline constexpr float kGhostRejectFraction = 0.05f;
 
-/** AKAZE inlier convex-hull coverage for SPARSE vs clustered routing. */
-inline constexpr float kAkazeSparseCoverage = 0.05f;
+/** Anchor convex-hull coverage for SPARSE vs clustered routing. */
+inline constexpr float kAnchorSparseCoverage = 0.05f;
 
 /** Anchor-lattice seeding: target number of lattice nodes over the ROI. */
 inline constexpr int kAnchorTarget = 256;

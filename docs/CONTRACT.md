@@ -194,6 +194,13 @@ field:  x   y   u   v    exx   eyy   exy   corr
 Slot indices are Frozen; new telemetry appends. `metrics_len == 16` is the
 minimum honored; 17 preferred.
 
+**Slot 10 semantic change (v0.2.2).** The index, type and layout are unchanged
+and remain Frozen. Its *meaning* changed from "AKAZE + RANSAC time (ms)" to
+**"seeding time (ms)"** — phase correlation plus the anchor lattice — when the
+descriptor seeding front-end was replaced. Callers that display this value
+should relabel it; nothing about the buffer's shape moved. Slot 16 keeps
+`2 = full mesh / 1 = sparse mesh / 0 = Path C fallback`.
+
 ### Return / error codes — Frozen
 
 | Value | Meaning |
@@ -207,7 +214,7 @@ minimum honored; 17 preferred.
 
 ## A.5 Change checklist
 
-- **Free to change (patch):** correlation math, ICGN, AKAZE, SIMD, threading,
+- **Free to change (patch):** correlation math, ICGN, seeding, SIMD, threading,
   `tuning.hpp`, anything under `src/` — golden test must still pass.
 - **Additive only (minor):** trailing `FullFieldParams` field, new metrics slot,
   new overload/function, new SDK entry point.

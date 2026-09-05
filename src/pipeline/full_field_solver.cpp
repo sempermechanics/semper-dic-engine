@@ -1,7 +1,7 @@
 // Orchestration for the hybrid full-field DIC solve.
 //
 // The individual phases live in sibling translation units (see
-// full_field_internal.hpp): AKAZE routing + Delaunay mesh + mesh-guided solve
+// full_field_internal.hpp): anchor seeding + Delaunay mesh + mesh-guided solve
 // in full_field_path_a.cpp, the flood fill in full_field_path_b.cpp, fallback
 // seeding in full_field_path_c.cpp, packing/telemetry in
 // full_field_solver_stats.cpp and the debug maps in
@@ -105,18 +105,6 @@ int run_full_field(
         timings.img_prep = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_prep_start).count();
 
         int safe_cores = std::max(1, (int)std::thread::hardware_concurrency());
-
-        // 🚀 IMPLEMENTATION: Priority 6 & 4 States — adaptive AKAZE scale pyramid
-        MeshSeedResult seeds = detect_mesh_seeds(cache, defMat, defImg, roiMask, params, local_debug_dir);
-        const std::vector<cv::Point2f>& akaze_ref_pts = seeds.ref_pts;
-        const std::vector<cv::Point2f>& akaze_def_pts = seeds.def_pts;
-        MeshQuality mesh_quality = seeds.quality;
-        float globalU = seeds.globalU, globalV = seeds.globalV;
-        timings.akaze = seeds.time_akaze_ms;
-        timings.ransac = seeds.time_ransac_ms;
-
-        // 🚀 IMPLEMENTATION: If we didn't even get a SPARSE mesh, trigger Path C
-        bool execute_path_c = (mesh_quality == MeshQuality::NONE);
 
         int gridW = params.rect_w / params.step;
         int gridH = params.rect_h / params.step;
@@ -235,15 +223,11 @@ int run_full_field(
         };
         ThreadJoinGuard progressGuard{progress_thread, progress_thread_should_stop, progress_cv, progress_cv_mutex, progress_thread_detached};
 
-        std::vector<AffineTriangle> affTriangles;
-        MeshGuessField guess = build_mesh_guess_field(
-                cache, params, akaze_ref_pts, akaze_def_pts, mesh_quality,
-                globalU, globalV, gridW, gridH, local_debug_dir,
-                resultGrid, affTriangles, timings);
-
         // =========================================================
         // 🚀 GLOBAL HESSIAN PRE-PASS & CONTRAST THRESHOLDING
         // =========================================================
+        // Runs before seeding: the anchor lattice sits on grid nodes and reuses
+        // this pool, so its solves cost little more than the field costs anyway.
         auto t_prepass_start = std::chrono::high_resolution_clock::now();
         HessianPool hessian_pool(gridW * gridH);
 
@@ -262,11 +246,43 @@ int run_full_field(
 
         timings.prepass = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_prepass_start).count();
 
+        // Anchor-lattice seeding: phase correlation for the global rigid shift,
+        // then IC-GN on a lattice of grid nodes. Nodes that clear the result
+        // gate are marked solved here, so Path A skips them and Path B takes
+        // them as boundary seeds.
+        std::vector<ThreadStats> stats_anchors(safe_cores);
+        MeshSeedResult seeds = solve_anchor_seeds(
+                cache, defMat, defImg, params, gridW, gridH, safe_cores,
+                hessian_pool, global_points_solved, compute_order_counter,
+                resultGrid, stats_anchors, timings);
+
+        const std::vector<cv::Point2f>& anchor_ref_pts = seeds.ref_pts;
+        const std::vector<cv::Point2f>& anchor_def_pts = seeds.def_pts;
+        MeshQuality mesh_quality = seeds.quality;
+        float globalU = seeds.globalU, globalV = seeds.globalV;
+
+        // Path C is the "we have no seed at all" fallback, and its failure aborts
+        // the solve. That was right when the front-end was AKAZE, which either
+        // produced a mesh or produced nothing. The anchor lattice also yields a
+        // phase-correlation lock and often some solved nodes, so a mesh too
+        // sparse to guide Path A is not the same as having no seed: Path B can
+        // flood-fill from what the lattice already found.
+        const bool have_seed = seeds.phase_locked || seeds.solved > 0 || seeds.accepted >= 3;
+        bool execute_path_c = (mesh_quality == MeshQuality::NONE) && !have_seed;
+
+        if (cancel_requested()) return kCancelled;
+
+        std::vector<AffineTriangle> affTriangles;
+        MeshGuessField guess = build_mesh_guess_field(
+                cache, params, anchor_ref_pts, anchor_def_pts, mesh_quality,
+                globalU, globalV, gridW, gridH, local_debug_dir,
+                resultGrid, affTriangles, timings);
+
         const SolveContext ctx{cache, params, defImg, gridW, gridH, safe_cores,
                                hessian_pool, global_points_solved, compute_order_counter};
 
         if (execute_path_c) {
-            int rc = run_path_c(ctx, akaze_ref_pts, resultGrid, path_c_seed_x, path_c_seed_y, globalU, globalV);
+            int rc = run_path_c(ctx, anchor_ref_pts, resultGrid, path_c_seed_x, path_c_seed_y, globalU, globalV);
             if (rc != 0) return rc;
         }
 
@@ -281,7 +297,7 @@ int run_full_field(
 
         {
             ScopedTimer pathB_timer(timings.pathB);
-            run_path_b(ctx, akaze_ref_pts, akaze_def_pts, globalU, globalV,
+            run_path_b(ctx, anchor_ref_pts, anchor_def_pts, globalU, globalV,
                        path_c_seed_x, path_c_seed_y, resultGrid, stats_pathB);
         }
 

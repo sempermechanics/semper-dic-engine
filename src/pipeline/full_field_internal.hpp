@@ -117,7 +117,7 @@ struct AffineTriangle {
     cv::Rect2f boundingBox;
 };
 
-// Priority 6 & 4 states: how much of the ROI the AKAZE mesh actually covers.
+// How much of the ROI the anchor mesh actually covers.
 enum class MeshQuality { NONE, SPARSE, FULL };
 
 using HessianPool = std::vector<CachedHessianData, Eigen::aligned_allocator<CachedHessianData>>;
@@ -139,7 +139,9 @@ struct SolveContext {
 
 // Per-phase wall clock, aggregated for the profiling log and the metrics array.
 struct PhaseTimings {
-    double img_prep = 0, akaze = 0, ransac = 0, delaunay = 0, contour_assign = 0;
+    // `anchors` and `phase_corr` were `akaze` and `ransac`; they feed the same
+    // Frozen metrics[10] slot, whose meaning is now "seeding time (ms)".
+    double img_prep = 0, anchors = 0, phase_corr = 0, delaunay = 0, contour_assign = 0;
     double extrapolate = 0, smoothing = 0, prepass = 0, pathA = 0, pathB = 0;
     double strain = 0, total = 0;
 };
@@ -177,37 +179,44 @@ inline void record_simplex_outcome(ThreadStats &bucket, const AnalysisResult &re
 }
 
 // ---------------------------------------------------------------------------
-// Path A — AKAZE routing, Delaunay mesh, mesh-guided solve
-// (full_field_path_a.cpp)
+// Anchor-lattice seeding, Delaunay mesh, mesh-guided solve
+// (full_field_anchors.cpp, full_field_mesh.cpp, full_field_path_a.cpp)
 // ---------------------------------------------------------------------------
 
-// Outcome of the adaptive AKAZE scale pyramid: matched feature pairs in image
-// coordinates, how well they cover the ROI, and the median rigid shift.
+// Outcome of the anchor lattice: the mesh vertices it produced, how well they
+// cover the ROI, and the median rigid shift.
+//
+// The anchors are grid nodes, so they reuse the Hessian pool and their solved
+// results are final for those nodes — Path A skips them and Path B picks them
+// up as boundary seeds. Vertices are kept on a looser ZNSSD gate than results:
+// a seed only has to be approximately right, an output point has to be right.
 struct MeshSeedResult {
     std::vector<cv::Point2f> ref_pts;
     std::vector<cv::Point2f> def_pts;
     MeshQuality quality = MeshQuality::NONE;
     float globalU = 0.0f;
     float globalV = 0.0f;
-    double time_akaze_ms = 0.0;
-    double time_ransac_ms = 0.0;
-    // Reported by every front-end so the seeding benchmark can compare them.
     float coverage = 0.0f;
-    int anchors_attempted = 0;
-    int anchors_accepted = 0;
+    int attempted = 0;
+    int accepted = 0;      // kept as mesh vertices
+    int solved = 0;        // also good enough to keep as output points
     bool phase_locked = false;
-    // Anchor-lattice cost split (zero for the descriptor front-ends).
-    double time_precompute_ms = 0.0;
-    double time_icgn_ms = 0.0;
 };
 
-MeshSeedResult detect_mesh_seeds(
+MeshSeedResult solve_anchor_seeds(
         ReferenceCache &cache,
         const cv::Mat &defMat,
         const Image &def_img,
-        cv::Mat &roiMask,
         const FullFieldParams &params,
-        const std::string &debug_dir);
+        int gridW,
+        int gridH,
+        int safe_cores,
+        const HessianPool &hessian_pool,
+        std::atomic<int> &global_points_solved,
+        std::atomic<int> &compute_order_counter,
+        ResultGrid &resultGrid,
+        std::vector<ThreadStats> &stats,
+        PhaseTimings &timings);
 
 // Per-grid-point 6-DOF initial guess produced by the Delaunay mesh.
 struct MeshGuessField {

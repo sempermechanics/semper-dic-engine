@@ -102,7 +102,7 @@ TEST_CASE(ReferenceCache, NoMask_LeavesAllPixelsReal) {
     CHECK(ghosts == 0);
 }
 
-TEST_CASE(ReferenceCache, Relifecycle_UpdatesDimsAndClearsAkaze) {
+TEST_CASE(ReferenceCache, Relifecycle_UpdatesDims) {
     ReferenceCache cache;
     cache.set_from_gray(ramp_gray(40, 30), cv::Mat());
     REQUIRE(cache.ref_img != nullptr);
@@ -116,9 +116,6 @@ TEST_CASE(ReferenceCache, Relifecycle_UpdatesDimsAndClearsAkaze) {
     CHECK(cache.height == 50);
     CHECK(cache.ref_img->width == 20);
     CHECK(cache.ref_img->height == 50);
-    CHECK(cache.akaze_kp.empty());          // seeding state reset
-    CHECK(cache.akaze_desc.empty());
-    CHECK(cache.akaze_scale == 0.25);
 }
 
 TEST_CASE(ReferenceCache, EmptyInput_LeavesCacheCleared) {
@@ -145,8 +142,6 @@ TEST_CASE(ReferenceCache, Reset_ClearsEverything) {
     CHECK(cache.width == 0);
     CHECK(cache.height == 0);
     CHECK(cache.gray.empty());
-    CHECK(cache.akaze_kp.empty());
-    CHECK(cache.akaze_scale == 0.25);
 }
 
 #else

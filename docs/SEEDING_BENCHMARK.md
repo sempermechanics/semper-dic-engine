@@ -1,8 +1,29 @@
 # Seeding front-end benchmark
 
-Measured comparison of the candidates that can supply `run_full_field`'s initial
-guess. Produced by `tests/integration/test_seeding_bench.cpp`; this document
-records the results and the reasoning, not the method.
+Measured comparison of the candidates that could supply `run_full_field`'s
+initial guess, and the record of why the descriptor front-end was replaced.
+
+**Outcome: the anchor lattice shipped.** AKAZE, and with it `features2d`,
+`flann` and `calib3d`, was removed in the commit that reordered
+`run_full_field`. The descriptor candidates in §4 are no longer buildable from
+this tree; to reproduce that comparison, check out the last commit that carried
+them (`f5d950f`) and run the sweep there.
+
+Post-swap numbers, real DICe pair, median of 5, four threads — the anchors are
+now final results for their nodes, so the solve saves more than the standalone
+measurement predicted:
+
+| | AKAZE (was) | anchor lattice (is) |
+|---|---|---|
+| field wall time | 198.7 ms | **187.8 ms** |
+| field CPU | 706.7 ms | **662.2 ms** |
+| mean ICGN iterations | 2.56 | **2.11** |
+| mesh coverage | 0.446 | **1.000** |
+| field RMS | 0.016273 px | 0.016270 px |
+| `libsemper_c.so` (x86_64, stripped) | 13.565 MB | **8.697 MB** |
+
+`DiceFieldAgreement` is unchanged: 230/230 points compared, rms 0.0006 px,
+max 0.0033 px.
 
 Run it with:
 

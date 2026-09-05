@@ -11,9 +11,6 @@ void ReferenceCache::reset() {
     width = 0;
     height = 0;
     gray.release();
-    akaze_kp.clear();
-    akaze_desc.release();
-    akaze_scale = 0.25;
 }
 
 void ReferenceCache::set_from_gray(const cv::Mat& gray_in, const cv::Mat& roi_mask) {
@@ -41,9 +38,6 @@ void ReferenceCache::set_from_gray(const cv::Mat& gray_in, const cv::Mat& roi_ma
         }
     }
     LOGD("Ghost Wall signature injected into %d pixels", sterilized_count);
-    akaze_kp.clear();
-    akaze_desc.release();
-    akaze_scale = 0.25;
 }
 
 } // namespace pipeline
