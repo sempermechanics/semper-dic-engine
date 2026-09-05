@@ -6,6 +6,9 @@
 
 #include <semper/strain.hpp>
 #include <semper/tuning.hpp>
+#if defined(SEMPER_OPENCL)
+#include "gpu/strain_dispatch.hpp"
+#endif
 #include "util/log.hpp"
 
 #include <chrono>
@@ -47,7 +50,32 @@ PackedFieldResult pack_full_field_output(
         }
     }
 
-    out.strain = StrainCalculator::compute_vsg_strain(dispField, strain_window);
+    // GPU first when the device can be trusted with this stage AND the field
+    // is big enough to be worth shipping. Not a fast path with different
+    // answers: the kernel is a transcription of the CPU routine and both
+    // produce the same floats bit-for-bit (tests/unit/test_cl_strain.cpp), so
+    // there is nothing to reconcile downstream and nothing here depends on
+    // which one ran.
+    //
+    // The size test is a measured break-even, not a guess -- see the Phase 2
+    // results in docs/GPU_ACCELERATION.md. Dispatch costs a fixed ~0.4 ms in
+    // buffer traffic and launch latency, and below roughly 3600 grid points
+    // the entire CPU fit finishes inside that, so the device is a
+    // pessimisation. Grids really do straddle this: the DICe fixtures are a
+    // few hundred points, while a full frame at a small step is six figures.
+    //
+    // The threshold lives here, in the caller, on purpose.
+    // compute_vsg_strain_gpu itself stays policy-free -- "run this on the
+    // device" -- so the parity tests can exercise it on small fields without
+    // having to defeat a heuristic.
+#if defined(SEMPER_OPENCL)
+    constexpr int kGpuStrainMinPoints = 3600;
+    const bool gpu_worthwhile =
+            dispField.width * dispField.height >= kGpuStrainMinPoints;
+    if (!gpu_worthwhile ||
+        !gpu::compute_vsg_strain_gpu(dispField, strain_window, &out.strain))
+#endif
+        out.strain = StrainCalculator::compute_vsg_strain(dispField, strain_window);
 
     for (int y = 0; y < gridH && !out.output_truncated; ++y) {
         for (int x = 0; x < gridW; ++x) {

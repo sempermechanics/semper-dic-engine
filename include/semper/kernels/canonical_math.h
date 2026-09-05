@@ -61,6 +61,35 @@ the strict-FP source list in CMakeLists.txt / tests/CMakeLists.txt."
   #include <math.h>          /* OpenCL C has sqrt/fabs as builtins */
 #endif
 
+/* Is double precision available?
+ *
+ * The host always has it. A device does NOT: cl_khr_fp64 is an optional
+ * OpenCL 1.2 extension, and Mali/Adreno parts largely lack it. Using
+ * `double` without the pragma is a compile error there, which would fail
+ * the whole clBuildProgram -- taking down the fp32 ICGN path too, even
+ * though it has no fp64 dependency. That would collapse the per-stage
+ * capability gate (see src/gpu/cl_runtime.hpp: fp64 and exact_fp32 are
+ * deliberately separate flags) into one all-or-nothing switch.
+ *
+ * So the double-precision section below is compiled only when the device
+ * actually supports it, and a device without it still builds and runs
+ * every float kernel. Dispatch checks caps().fp64 before enqueuing
+ * anything that needs semper_inv3x3. */
+#if SEMPER_IS_OPENCL
+  #if defined(cl_khr_fp64) || defined(__opencl_c_fp64) || defined(cl_amd_fp64)
+    #if defined(cl_khr_fp64)
+      #pragma OPENCL EXTENSION cl_khr_fp64 : enable
+    #elif defined(cl_amd_fp64)
+      #pragma OPENCL EXTENSION cl_amd_fp64 : enable
+    #endif
+    #define SEMPER_HAS_FP64 1
+  #else
+    #define SEMPER_HAS_FP64 0
+  #endif
+#else
+  #define SEMPER_HAS_FP64 1
+#endif
+
 #ifndef SEMPER_INLINE
   #ifdef __cplusplus
     #define SEMPER_INLINE inline
@@ -169,6 +198,12 @@ SEMPER_INLINE void semper_keys4_weights(float s, float w[4]) {
  * than have the GPU chase Eigen, BOTH sides use the definitions below.
  * ------------------------------------------------------------------- */
 
+/* The double-precision half of this section exists only where fp64 does.
+ * Everything from here to the matching #endif is skipped on a device
+ * without cl_khr_fp64; semper_inv6x6 and the float routines below are
+ * always available. */
+#if SEMPER_HAS_FP64
+
 /* Matches Eigen's default invertibility threshold for double. */
 #define SEMPER_DET_EPS_D 2.220446049250313e-16
 
@@ -197,6 +232,36 @@ SEMPER_INLINE int semper_inv3x3(const double a[9], double inv[9], double *det_ou
     inv[8] =  (a[0] * a[4] - a[1] * a[3]) * r;
     return 1;
 }
+
+/* Row-major 3x3 times 3-vector in double: out = m * v.
+ *
+ * Accumulation is pinned left to right. This is the VSG plane-fit solve,
+ * run on both sides of the CPU/GPU boundary; Eigen's fixed-size product
+ * would vectorize it differently per ISA, which is one of the three
+ * divergence causes docs/DETERMINISM.md documents. */
+SEMPER_INLINE void semper_mat3_vec3(const double m[9], const double v[3],
+                                    double out[3]) {
+    int r;
+    for (r = 0; r < 3; ++r)
+        out[r] = ((m[r * 3 + 0] * v[0]) + (m[r * 3 + 1] * v[1]))
+                 + (m[r * 3 + 2] * v[2]);
+}
+
+/* Max absolute column sum of a row-major 3x3 -- the L1 matrix norm, which
+ * is what LAPACK's GECON('1') uses. Paired with the same norm of the
+ * inverse it gives the reciprocal condition number the VSG fit gates on. */
+SEMPER_INLINE double semper_mat3_l1_norm(const double m[9]) {
+    double best = 0.0;
+    int c;
+    for (c = 0; c < 3; ++c) {
+        const double s = fabs(m[0 * 3 + c]) + fabs(m[1 * 3 + c])
+                         + fabs(m[2 * 3 + c]);
+        if (s > best) best = s;
+    }
+    return best;
+}
+
+#endif /* SEMPER_HAS_FP64 */
 
 /* 6x6 inverse in float by Gauss-Jordan with partial pivoting, for the
  * ICGN Hessian. Row-major a[36] -> inv[36]. *det_out receives the

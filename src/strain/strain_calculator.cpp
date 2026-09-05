@@ -1,7 +1,7 @@
 #include <semper/strain.hpp>
 #include <semper/tuning.hpp>
 #include "util/log.hpp"
-#include <Eigen/Dense>
+#include <semper/kernels/canonical_math.h>
 #include <cmath>
 
 namespace Semper {
@@ -48,9 +48,17 @@ namespace Semper {
                 if (!disp.valid[idx]) continue;
 
                 // 🚀 DICe PARITY: 64-bit precision for Least Squares Matrices
-                Eigen::Matrix3d AtA = Eigen::Matrix3d::Zero();
-                Eigen::Vector3d AtU = Eigen::Vector3d::Zero();
-                Eigen::Vector3d AtV = Eigen::Vector3d::Zero();
+                //
+                // Row-major plain double, not Eigen. This normal-equation fit
+                // is mirrored by src/gpu/kernels/strain_vsg.cl, and the two
+                // must agree bit-for-bit; Eigen packs its fixed-size products
+                // differently at different -march levels, which is one of the
+                // three divergence causes docs/DETERMINISM.md records. Same
+                // reason optimization_engine.cpp:100 dropped it. Layout is
+                // AtA[r * 3 + c].
+                double AtA[9] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+                double AtU[3] = {0.0, 0.0, 0.0};
+                double AtV[3] = {0.0, 0.0, 0.0};
                 int valid_pts = 0;
 
                 // 🚀 DICe PARITY: Floating-point truncation buffer (tiny)
@@ -73,11 +81,20 @@ namespace Semper {
                             double d_u = static_cast<double>(disp.u[nidx]);
                             double d_v = static_cast<double>(disp.v[nidx]);
 
-                            Eigen::Vector3d a(1.0, d_phys_dx, d_phys_dy);
+                            const double a[3] = {1.0, d_phys_dx, d_phys_dy};
 
-                            AtA += a * a.transpose();
-                            AtU += a * d_u;
-                            AtV += a * d_v;
+                            // AtA += a * aT, AtU += a * u, AtV += a * v.
+                            // Every entry accumulates independently, so this
+                            // is the same per-entry addition sequence the
+                            // Eigen expression produced -- what is pinned is
+                            // the dy-outer / dx-inner visit order above.
+                            for (int r = 0; r < 3; ++r) {
+                                for (int c = 0; c < 3; ++c) {
+                                    AtA[r * 3 + c] += a[r] * a[c];
+                                }
+                                AtU[r] += a[r] * d_u;
+                                AtV[r] += a[r] * d_v;
+                            }
                             valid_pts++;
                         }
                     }
@@ -94,26 +111,18 @@ namespace Semper {
                 if (fill_ratio >= 0.90 && valid_pts >= 3) {
 
                     // 🚀 DICe PARITY: LAPACK GECON '1' (L1-Norm) Condition Number Estimation
-                    double anorm = 0.0;
-                    for (int col = 0; col < 3; ++col) {
-                        double col_sum = std::abs(AtA(0, col)) + std::abs(AtA(1, col)) + std::abs(AtA(2, col));
-                        if (col_sum > anorm) anorm = col_sum;
-                    }
+                    double anorm = semper_mat3_l1_norm(AtA);
 
-                    // Compute Inverse safely
-                    Eigen::Matrix3d AtA_inv;
-                    bool invertible;
+                    // Compute Inverse safely. semper_inv3x3 rejects on
+                    // fabs(det) <= 2.220446049250313e-16, which is the same
+                    // test -- and the same threshold -- Eigen's
+                    // computeInverseAndDetWithCheck applied by default.
+                    double AtA_inv[9];
                     double det;
-                    AtA.computeInverseAndDetWithCheck(AtA_inv, det, invertible);
-
-                    if (!invertible) continue;
+                    if (!semper_inv3x3(AtA, AtA_inv, &det)) continue;
 
                     // Calculate L1 Norm of the Inverse to find 'rcond' exactly like LAPACK
-                    double inv_anorm = 0.0;
-                    for (int col = 0; col < 3; ++col) {
-                        double col_sum = std::abs(AtA_inv(0, col)) + std::abs(AtA_inv(1, col)) + std::abs(AtA_inv(2, col));
-                        if (col_sum > inv_anorm) inv_anorm = col_sum;
-                    }
+                    double inv_anorm = semper_mat3_l1_norm(AtA_inv);
 
                     double rcond = (anorm * inv_anorm > 0.0) ? (1.0 / (anorm * inv_anorm)) : 0.0;
 
@@ -121,13 +130,15 @@ namespace Semper {
                     if (rcond < 1e-12) continue;
 
                     // Solve for coefficients
-                    Eigen::Vector3d Cu = AtA_inv * AtU;
-                    Eigen::Vector3d Cv = AtA_inv * AtV;
+                    double Cu[3];
+                    double Cv[3];
+                    semper_mat3_vec3(AtA_inv, AtU, Cu);
+                    semper_mat3_vec3(AtA_inv, AtV, Cv);
 
-                    double dudx = Cu(1);
-                    double dudy = Cu(2);
-                    double dvdx = Cv(1);
-                    double dvdy = Cv(2);
+                    double dudx = Cu[1];
+                    double dudy = Cu[2];
+                    double dvdx = Cv[1];
+                    double dvdy = Cv[2];
 
                     // 🚀 DICe PARITY: Large-Deformation Green-Lagrange Strain Formula
                     strain.exx[idx] = static_cast<float>(0.5 * (2.0 * dudx + dudx * dudx + dvdx * dvdx));

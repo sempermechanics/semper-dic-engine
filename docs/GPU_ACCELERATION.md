@@ -47,7 +47,7 @@ run the bit-exact ICGN path and is refused for that stage.
 |---|---|---|
 | **0** | Make the CPU reference reproducible. Strict FP, canonical reduction order, canonical linear algebra replacing Eigen in the mirrored paths, deterministic Path B. **No GPU code.** | **Complete** |
 | **1** | OpenCL runtime + build plumbing: `SEMPER_OPENCL`, dlopen loader, device capability gate, kernel embedding. **No compute kernels.** | **Complete** |
-| **2** | Strain VSG on GPU. One work-item per grid point, fp64. Currently the only fully serial numerical stage. | Pending |
+| **2** | Strain VSG on GPU. One work-item per grid point, fp64. Currently the only fully serial numerical stage. | **Complete** |
 | **3** | Hessian pre-pass on GPU. One work-item per grid point. | Pending |
 | **4** | Path A ICGN on GPU. **One work-item per subset**, so the reduction keeps the canonical order rather than becoming a cross-lane tree. | Pending |
 | **5** | Path B wavefront on GPU. Reuses the Phase 4 kernel; one launch per round. Only possible because Phase 0 made Path B round-based. | Pending |
@@ -94,6 +94,56 @@ Phases 2-5 are built on.
 > `SEMPER_OPENCL=OFF` build measured 2910 in the same session. This is
 > precisely why §4a says to compare ON against OFF back-to-back rather than
 > against a number recorded on another day.
+
+### Phase 2 results (measured)
+
+The VSG plane fit runs on the device, bit-identical to the CPU. Measured on
+a Windows 11 host, MinGW-w64 GCC (UCRT), Release, against an NVIDIA GeForce
+RTX 3060 Laptop GPU on the CUDA ICD (OpenCL 3.0, `fp64=1 exact_fp32=1`).
+
+| Check | Result |
+|---|---|
+| `SEMPER_OPENCL=OFF` | 71 tests pass; binary contains **zero** OpenCL loader references |
+| `SEMPER_OPENCL=ON`, RTX 3060 | 84 tests pass (`ClParity` 7/7, `ClRuntime` 7/7) |
+| **CPU/GPU parity, values** | **Exact** over all 723 points of four grid geometries, 419 of them solved — `==`, not a tolerance |
+| **CPU/GPU parity, rejections** | **Exact** — 166 of 195 points refused identically by both paths (edge clipping, sub-90% fill, rank deficiency) |
+| Run-to-run reproducibility, device | Identical bytes across repeat dispatches |
+| Cross-ABI determinism | Subset corpus still byte-identical, `x86-64` vs `x86-64-v3` |
+| Eigen removal, before → after | **Byte-identical** — see below |
+
+**Throughput does not have a single number, and that is the finding.**
+Dispatch costs a roughly fixed 0.45 ms in buffer traffic and launch latency,
+so the device loses on small grids and wins on large ones:
+
+| Grid points | CPU | GPU | |
+|---|---|---|---|
+| 2 209 (47×47) | 0.324 ms | 0.484 ms | 0.67× — **CPU wins** |
+| 3 600 (60×60) | 0.551 ms | 0.524 ms | 1.05× — break-even |
+| 6 084 (78×78) | 0.921 ms | 0.508 ms | 1.81× |
+| 9 216 (96×96) | 1.357 ms | 0.608 ms | 2.23× |
+| 36 864 (192×192) | 5.727 ms | 1.076 ms | **5.32×** |
+
+Real grids straddle that break-even: the DICe fixtures are a few hundred
+points, a full frame at a small step is six figures. So the caller
+(`src/pipeline/full_field_solver_stats.cpp`) applies a **3600-point
+threshold** and stays on the CPU below it. The threshold is the measured
+break-even, not a guess; `dic_tests Perf` re-derives it, and the constant
+moves if the kernel or the transfers change. `compute_vsg_strain_gpu` itself
+stays policy-free so the parity tests can drive it at any size.
+
+Making the six buffer transfers non-blocking around a single `clFinish` --
+rather than six separate host round-trips -- moved the break-even down from
+about 6400 points to 3600 and cut large-grid time by roughly 15%.
+
+**On dropping Eigen (step one of the phase).** The kernel had to mirror a
+CPU reference that does not use Eigen, since Eigen packs fixed-size products
+per ISA. Rewriting `compute_vsg_strain` onto `semper_inv3x3` /
+`semper_mat3_vec3` / `semper_mat3_l1_norm` turned out to produce a
+**byte-identical golden corpus** on this host, and the Eigen version was
+*also* `x86-64`/`x86-64-v3` stable here. So no golden recapture was needed
+and this is not evidence of a bug that was fixed. It is evidence that the
+hazard did not happen to manifest in this ISA pair -- which is exactly why
+the reference is pinned rather than left to a library's codegen.
 
 ### Per-phase gate
 
@@ -238,6 +288,12 @@ every time.
 Exact float equality per kernel, `==` rather than `CHECK_NEAR`. A single
 differing bit is a failure.
 
+`ClParity` drives each dispatch entry point directly, deliberately at small
+sizes the production caller would route to the CPU: the size threshold is a
+performance policy and must not become a hole in the parity coverage. The
+device-dependent cases report themselves skipped, rather than passing
+vacuously, when no suitable device is present.
+
 ---
 
 ## 5. Device results
@@ -249,6 +305,7 @@ chat log.
 |---|---|---|---|---|---|---|---|---|
 | 2026-09 | *(none — CPU only)* | loader present, no ICD | — | — | — | 3205 / 3273 (median/max) | n/a | Development container, 4-core Xeon. Phase 0 reference |
 | 2026-09 | POCL CPU device | pocl-opencl-icd 5.0 | 3.0 (CL C 1.2) | yes | yes | 2900 ON / 2910 OFF (median, back-to-back) | pass | `cpu-skylake-avx512`. Canonical reduction exact vs host at every size |
+| 2026-09 | NVIDIA GeForce RTX 3060 Laptop | CUDA ICD | 3.0 | yes | yes | strain 0.67× at 2.2k pts → 5.32× at 37k pts | pass | Windows 11 / MinGW-w64. Phase 2. Fixed ~0.45 ms dispatch cost sets a 3600-point break-even; below it the caller stays on CPU |
 |  |  |  |  |  |  |  |  |  |
 
 ---

@@ -1,5 +1,6 @@
 #include "gpu/cl_runtime.hpp"
 #include "gpu/cl_api.hpp"
+#include "gpu/cl_internal.hpp"
 #include "util/log.hpp"
 
 #include <semper/gpu/embedded_kernels.hpp>
@@ -9,6 +10,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #if defined(_WIN32)
@@ -138,11 +140,20 @@ struct Runtime {
     cl_device_id device = nullptr;
     cl_context context = nullptr;
     cl_command_queue queue = nullptr;
-    cl_program program = nullptr;
+    cl_program program = nullptr;   // the probe; built during the probe itself
     ClCaps caps;
+
+    // Programs built on demand by detail::ProgramScope, one per .cl source,
+    // keyed by the caller's literal. A null value is a remembered build
+    // FAILURE: retrying it every frame would re-run the device compiler for
+    // a result that cannot change within the process.
+    std::vector<std::pair<std::string, cl_program>> stage_programs;
 
     void release() {
         // Order matters: children before parents.
+        for (auto &e : stage_programs)
+            if (e.second) loader.api.ReleaseProgram(e.second);
+        stage_programs.clear();
         if (program) loader.api.ReleaseProgram(program), program = nullptr;
         if (queue) loader.api.ReleaseCommandQueue(queue), queue = nullptr;
         if (context) loader.api.ReleaseContext(context), context = nullptr;
@@ -181,6 +192,21 @@ bool version_at_least_1_2(const std::string &v) {
     int major = 0, minor = 0;
     if (std::sscanf(p, "%d.%d", &major, &minor) != 2) return false;
     return major > 1 || (major == 1 && minor >= 2);
+}
+
+// The device compiler's log for a failed build -- the only useful
+// diagnostic, so it is carried rather than just the error number.
+std::string build_log(const ClApi &api, cl_program prog, cl_device_id dev) {
+    std::string log;
+    size_t log_len = 0;
+    if (api.GetProgramBuildInfo(prog, dev, SEMPER_CL_PROGRAM_BUILD_LOG,
+                                0, nullptr, &log_len) == SEMPER_CL_SUCCESS && log_len) {
+        std::vector<char> buf(log_len + 1, '\0');
+        if (api.GetProgramBuildInfo(prog, dev, SEMPER_CL_PROGRAM_BUILD_LOG,
+                                    log_len, buf.data(), nullptr) == SEMPER_CL_SUCCESS)
+            log.assign(buf.data());
+    }
+    return log;
 }
 
 // Populate g_rt. Sets caps.unavailable_reason on every failure path.
@@ -278,18 +304,8 @@ void probe_locked() {
     }
     err = api.BuildProgram(g_rt->program, 1, &g_rt->device, kBuildOptions, nullptr, nullptr);
     if (err != SEMPER_CL_SUCCESS) {
-        // The device compiler's log is the only useful diagnostic here, so
-        // carry it rather than just the error number.
-        std::string log;
-        size_t log_len = 0;
-        if (api.GetProgramBuildInfo(g_rt->program, g_rt->device, SEMPER_CL_PROGRAM_BUILD_LOG,
-                                    0, nullptr, &log_len) == SEMPER_CL_SUCCESS && log_len) {
-            std::vector<char> buf(log_len + 1, '\0');
-            if (api.GetProgramBuildInfo(g_rt->program, g_rt->device, SEMPER_CL_PROGRAM_BUILD_LOG,
-                                        log_len, buf.data(), nullptr) == SEMPER_CL_SUCCESS)
-                log.assign(buf.data());
-        }
-        c.unavailable_reason = "kernel build failed (" + std::to_string(err) + "): " + log;
+        c.unavailable_reason = "kernel build failed (" + std::to_string(err) + "): " +
+                               build_log(api, g_rt->program, g_rt->device);
         return;
     }
 
@@ -326,6 +342,55 @@ void reset_for_testing() {
     }
     g_probed = false;
 }
+
+namespace detail {
+
+ProgramScope::ProgramScope(const char *key, const char *source) {
+    g_mutex.lock();
+    locked_ = true;
+
+    Runtime &rt = runtime_locked();
+    if (!rt.caps.available) return;   // ok_ stays false; caller uses the CPU
+
+    api_ = &rt.loader.api;
+    context_ = rt.context;
+    queue_ = rt.queue;
+
+    for (const auto &e : rt.stage_programs) {
+        if (e.first == key) {
+            // Includes the remembered-failure case: e.second null -> not ok.
+            program_ = e.second;
+            ok_ = program_ != nullptr;
+            return;
+        }
+    }
+
+    cl_int err = SEMPER_CL_SUCCESS;
+    const size_t len = std::strlen(source);
+    cl_program prog = api_->CreateProgramWithSource(context_, 1, &source, &len, &err);
+    if (prog && err == SEMPER_CL_SUCCESS) {
+        err = api_->BuildProgram(prog, 1, &rt.device, kBuildOptions, nullptr, nullptr);
+        if (err != SEMPER_CL_SUCCESS) {
+            LOGE("OpenCL stage '%s' failed to build (%d): %s -- this stage falls "
+                 "back to the CPU, others are unaffected",
+                 key, (int) err, build_log(*api_, prog, rt.device).c_str());
+            api_->ReleaseProgram(prog);
+            prog = nullptr;
+        }
+    } else {
+        prog = nullptr;
+    }
+
+    rt.stage_programs.emplace_back(key, prog);
+    program_ = prog;
+    ok_ = prog != nullptr;
+}
+
+ProgramScope::~ProgramScope() {
+    if (locked_) g_mutex.unlock();
+}
+
+} // namespace detail
 
 bool run_probe_reduce(const float *vals, int n, float mean, float *out) {
     std::lock_guard<std::mutex> lk(g_mutex);

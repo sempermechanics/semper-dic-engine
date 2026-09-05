@@ -81,3 +81,104 @@ TEST_CASE(Perf, SubsetSolveThroughput) {
     // Smoke-level guard only — see the header comment.
     CHECK(total_s < WALL_CLOCK_CEILING_S);
 }
+
+// ---------------------------------------------------------------------------
+// GPU Phase 2: VSG strain, CPU vs device, swept across grid sizes.
+//
+// Same caveats as above -- printed, not asserted. Two things make this one
+// worth keeping. The paths are bit-identical (tests/unit/test_cl_strain.cpp
+// checks that with ==), so the ratio is a clean measure of moving to the
+// device rather than of two algorithms trading accuracy for speed. And it is
+// swept rather than measured at one size, because the answer is not a single
+// number: dispatch costs a fixed amount in buffer traffic and launch latency,
+// so the device loses on small grids and wins on large ones. The break-even
+// printed here is what the size threshold in
+// src/pipeline/full_field_solver_stats.cpp is set from -- re-run this after
+// touching the kernel or the transfers, and move the constant if it shifts.
+//
+// Timing includes the host-side buffer traffic and the std::vector<bool>
+// unpack, because that is what the caller actually pays.
+// ---------------------------------------------------------------------------
+#if defined(SEMPER_OPENCL)
+#include "gpu/cl_runtime.hpp"
+#include "gpu/strain_dispatch.hpp"
+#include <semper/strain.hpp>
+
+namespace {
+
+Semper::DisplacementField strain_bench_field(int n, int step) {
+    Semper::DisplacementField f;
+    f.width = n; f.height = n; f.step = step;
+    f.u.resize((size_t) n * n); f.v.resize((size_t) n * n);
+    f.valid.assign((size_t) n * n, true);
+    for (int y = 0; y < n; ++y) {
+        for (int x = 0; x < n; ++x) {
+            const float X = (float) (x * step), Y = (float) (y * step);
+            const size_t i = (size_t) y * n + x;
+            f.u[i] = 0.011f * X + 0.0037f * Y + 0.00004f * X * X;
+            f.v[i] = -0.0061f * X + 0.0092f * Y - 0.00003f * Y * Y;
+        }
+    }
+    return f;
+}
+
+} // namespace
+
+TEST_CASE(Perf, StrainVsgThroughputCpuVsGpu) {
+    const int step = 11, window = 44;
+    const int sizes[] = {47, 60, 78, 96, 192};   // 2.2k .. 37k grid points
+    const int reps = 20;
+
+    using clock = std::chrono::steady_clock;
+    const auto &c = Semper::gpu::caps();
+    const bool have_device = c.available && c.fp64;
+
+    if (have_device)
+        std::printf("  Perf: strain VSG on '%s' (step %d, window %d)\n",
+                    c.device_name.c_str(), step, window);
+    else
+        std::printf("  Perf: strain VSG, CPU only -- %s\n",
+                    c.available ? "device has no cl_khr_fp64"
+                                : c.unavailable_reason.c_str());
+
+    double worst_case_s = 0.0;
+    for (int n : sizes) {
+        const Semper::DisplacementField f = strain_bench_field(n, step);
+
+        auto t0 = clock::now();
+        for (int i = 0; i < reps; ++i)
+            (void) Semper::StrainCalculator::compute_vsg_strain(f, window);
+        const double cpu_s =
+                std::chrono::duration<double>(clock::now() - t0).count() / reps;
+        if (cpu_s > worst_case_s) worst_case_s = cpu_s;
+
+        if (!have_device) {
+            std::printf("     %5d pts: CPU %7.3f ms\n", n * n, 1000.0 * cpu_s);
+            continue;
+        }
+
+        // One untimed call first: the device program is compiled lazily and
+        // cached, and charging this stage for a one-time LLVM run would say
+        // nothing about steady-state throughput.
+        Semper::StrainField warm;
+        REQUIRE(Semper::gpu::compute_vsg_strain_gpu(f, window, &warm));
+
+        t0 = clock::now();
+        for (int i = 0; i < reps; ++i) {
+            Semper::StrainField g;
+            REQUIRE(Semper::gpu::compute_vsg_strain_gpu(f, window, &g));
+        }
+        const double gpu_s =
+                std::chrono::duration<double>(clock::now() - t0).count() / reps;
+        if (gpu_s > worst_case_s) worst_case_s = gpu_s;
+
+        std::printf("     %5d pts: CPU %7.3f ms | GPU %7.3f ms | %5.2fx %s\n",
+                    n * n, 1000.0 * cpu_s, 1000.0 * gpu_s,
+                    cpu_s / (gpu_s > 0 ? gpu_s : 1.0),
+                    cpu_s > gpu_s ? "GPU" : "CPU");
+    }
+
+    // Smoke-level guard only -- see the header comment.
+    CHECK(worst_case_s < WALL_CLOCK_CEILING_S);
+}
+#endif // SEMPER_OPENCL

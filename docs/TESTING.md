@@ -327,6 +327,33 @@ degrades to the CPU, not that it is present.
 | `EnvDisableForcesCpuPath` | `SEMPER_OPENCL_DISABLE=1` forces the CPU path, for bisecting a suspected device-side difference |
 | `DeviceReproducesCanonicalReductionExactly` | **Device-gated.** A real OpenCL device returns bit-identical results to `semper_canon_sum_sq_diff` at n = 0…729, tail included. Skips with a printed reason rather than passing vacuously when no device is present |
 
+## Suite: `ClParity` — `unit/test_cl_strain.cpp`
+
+GPU Phase 2's parity gate: the VSG strain kernel against
+`StrainCalculator::compute_vsg_strain`. The claim is not that the device is
+close enough, it is that both produce the **same float**, so every comparison
+here is `==`. A failure means finding the divergence, never widening a
+tolerance — see [DETERMINISM.md](DETERMINISM.md).
+
+Same no-device contract as `ClRuntime`: this suite must pass on a machine with
+no OpenCL, and the device-dependent cases print a skip reason rather than
+passing vacuously. Under `-DSEMPER_OPENCL=OFF` the file reduces to one test.
+
+The tests drive `compute_vsg_strain_gpu` directly, at grid sizes the
+production caller would route to the CPU. That is deliberate: the size
+threshold in `full_field_solver_stats.cpp` is a performance policy, and it
+must not become a hole in the parity coverage.
+
+| Test | Proves | Failure would mean |
+|---|---|---|
+| `StrainDispatchDeclinesCleanlyWhenStageUnavailable` | With no device, or one without `cl_khr_fp64`, dispatch returns false and leaves the output **untouched** | A half-filled output would corrupt the CPU result the caller then computes into it |
+| `StrainDispatchRejectsNullOutput` | A null destination is refused, not dereferenced | Crash on a caller error instead of a return value |
+| `StrainDispatchHonoursEnvDisable` | `SEMPER_OPENCL_DISABLE=1` shuts down this stage, not merely the probe | The documented CPU-forcing escape hatch would not actually force the CPU |
+| `EmbeddedStrainKernelIsSelfContained` | The embedded source resolves its includes, keeps `FP_CONTRACT OFF`, calls the same `semper_inv3x3` / `semper_mat3_vec3` / `semper_mat3_l1_norm` as the host, and retains the `SEMPER_HAS_FP64` guard | Losing the guard would make this kernel's build failure take down the whole program on a device without fp64 — collapsing the per-stage gate into one all-or-nothing switch |
+| `StrainMatchesCpuBitExactly` | **Device-gated.** Four grid geometries, exact equality on every point. The field carries quadratic terms, so the plane fit is a genuine compromise rather than an exactly-recoverable linear field | The kernel and the CPU reference have diverged; the GPU path cannot ship |
+| `StrainRejectionCasesMatchExactly` | **Device-gated.** Both paths refuse *the same* points — edge-clipped windows, sub-90% fill from invalid neighbours, rank-deficient support — leaving the −1000 sentinel | Agreeing on values while disagreeing on which points to give up on is still a parity failure |
+| `StrainIsRunToRunReproducible` | **Device-gated.** Repeat dispatches of one input return identical bytes | A result depending on work-group scheduling would pass the parity tests only intermittently |
+
 ## Suite: `CanonicalReduce` — `unit/test_canonical_reduce.cpp`
 
 Pins the reduction **order**, not merely the value, in
@@ -566,6 +593,7 @@ on.
 | Test | Proves | Failure would mean |
 |---|---|---|
 | `SubsetSolveThroughput` | 225 subsets precompute and solve, at least one converges, and the whole grid finishes well inside 120 s | A hang, a pathological slowdown, or a regression that stops every subset converging |
+| `StrainVsgThroughputCpuVsGpu` | The VSG fit on CPU and on the device, swept across five grid sizes. Compiled only under `-DSEMPER_OPENCL=ON`; prints CPU-only figures when no fp64 device is present | The printed break-even is where the size threshold in `full_field_solver_stats.cpp` comes from, so a shift here means that constant is stale — re-run this after touching the kernel or its buffer transfers |
 
 ---
 
