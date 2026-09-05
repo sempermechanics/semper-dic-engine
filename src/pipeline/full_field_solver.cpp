@@ -12,6 +12,9 @@
 #include <semper/tuning.hpp>
 #include <semper/assert.hpp>
 #include "full_field_internal.hpp"
+#if defined(SEMPER_OPENCL)
+#include "gpu/hessian_dispatch.hpp"
+#endif
 #include "util/log.hpp"
 
 #include <atomic>
@@ -247,16 +250,85 @@ int run_full_field(
         auto t_prepass_start = std::chrono::high_resolution_clock::now();
         HessianPool hessian_pool(gridW * gridH);
 
-    #pragma omp parallel for schedule(static) num_threads(safe_cores)
-        for (int pool_idx = 0; pool_idx < gridW * gridH; ++pool_idx) {
-            // OpenMP forbids breaking out of a parallel for, so a cancel skips
-            // the remaining iterations instead — the same shape the existing
-            // exception guard in Path A uses.
-            if (cancel_requested()) continue;
-            int gx = pool_idx % gridW, gy = pool_idx / gridW;
-            if (!resultGrid[gy][gx].solved) {
-                int realX = params.rect_x + gx * params.step, realY = params.rect_y + gy * params.step;
-                hessian_pool[pool_idx] = SubsetPrecomputer::compute_hessian_only(*cache.ref_img, realX, realY, params.subset_size);
+        // Which pool entries the pre-pass owes an answer for. Points Path C or
+        // the mesh has already solved keep their default-constructed slot on
+        // both paths — precompute_subset_fast falls back to the full
+        // precompute whenever an entry is not valid, so an untouched slot is
+        // correct, not merely harmless.
+        std::vector<unsigned char> prepass_wanted(static_cast<size_t>(gridW) * gridH, 0u);
+        for (int pool_idx = 0; pool_idx < gridW * gridH; ++pool_idx)
+            if (!resultGrid[pool_idx / gridW][pool_idx % gridW].solved)
+                prepass_wanted[static_cast<size_t>(pool_idx)] = 1u;
+
+        bool prepass_on_gpu = false;
+#if defined(SEMPER_OPENCL)
+        // GPU first when the device can be trusted with this stage AND the
+        // grid is big enough to be worth shipping. Not a fast path with
+        // different answers: the kernel is a transcription of
+        // compute_hessian_only and both produce the same floats bit for bit
+        // (tests/unit/test_cl_hessian.cpp), so nothing downstream depends on
+        // which one ran.
+        //
+        // The threshold is per megapixel of REFERENCE IMAGE, not a flat point
+        // count, because the two costs scale with different things. Measured
+        // on an RTX 3060 (Perf.HessianPrepassThroughputCpuVsGpu): dispatch
+        // costs ~0.6 ms plus ~2 ms per megapixel — the three float planes of
+        // the reference image cross the bus every call — while the kernel
+        // itself runs ~0.12 us/point against ~4.5 us/point for the serial CPU
+        // routine. A large image with a coarse grid is therefore the shape
+        // that loses on the device, and a flat point count would miss it.
+        //
+        // Against a CPU pre-pass spread over 6 cores the crossover sits near
+        // 3200 points per megapixel; the constant below is ~4x that, which
+        // keeps it on the right side of the line up to a 12-core host and
+        // leaves room for a slower bus or a busier device. Re-run the sweep
+        // and move it if the hardware changes.
+        //
+        // That derivation used the SERIAL CPU number, since the perf binary
+        // does not link OpenMP. Measured through this caller instead
+        // (ClPipelineParity, 512x512 at step 7): 4.05 ms on six cores against
+        // 2.99 ms warm on the device for 5329 points, so the real crossover
+        // there is ~3700 points and the 4000-point floor clears it by about
+        // 9%. That floor is the binding constraint only below 0.33 MP; above
+        // it the per-megapixel term binds and is ~3x conservative. The worst
+        // case the thin margin buys is a sub-millisecond loss on a small
+        // image with a dense grid.
+        //
+        // Not covered by either number: the first solve in a process also
+        // pays the whole backend bring-up -- probe plus clBuildProgram, 62 ms
+        // on this host -- inside the pre-pass timing. It is one-time and not
+        // specific to this stage (Phase 2 already pays it), so the threshold
+        // does not try to model it.
+        //
+        // The policy lives here, in the caller. compute_hessian_pool_gpu stays
+        // free of it so the parity tests can drive tiny grids without having
+        // to defeat a heuristic.
+        constexpr double kGpuHessianPointsPerMegapixel = 12000.0;
+        constexpr int kGpuHessianMinPoints = 4000;
+        const double ref_megapixels =
+                static_cast<double>(cache.ref_img->width) * cache.ref_img->height / 1.0e6;
+        const int prepass_points = gridW * gridH;
+        if (!cancel_requested() && prepass_points >= kGpuHessianMinPoints &&
+            prepass_points >= kGpuHessianPointsPerMegapixel * ref_megapixels) {
+            prepass_on_gpu = gpu::compute_hessian_pool_gpu(
+                    *cache.ref_img, params.rect_x, params.rect_y, params.step,
+                    gridW, gridH, params.subset_size, prepass_wanted.data(),
+                    hessian_pool.data(), gridW * gridH);
+        }
+#endif
+
+        if (!prepass_on_gpu) {
+        #pragma omp parallel for schedule(static) num_threads(safe_cores)
+            for (int pool_idx = 0; pool_idx < gridW * gridH; ++pool_idx) {
+                // OpenMP forbids breaking out of a parallel for, so a cancel skips
+                // the remaining iterations instead — the same shape the existing
+                // exception guard in Path A uses.
+                if (cancel_requested()) continue;
+                int gx = pool_idx % gridW, gy = pool_idx / gridW;
+                if (prepass_wanted[static_cast<size_t>(pool_idx)]) {
+                    int realX = params.rect_x + gx * params.step, realY = params.rect_y + gy * params.step;
+                    hessian_pool[pool_idx] = SubsetPrecomputer::compute_hessian_only(*cache.ref_img, realX, realY, params.subset_size);
+                }
             }
         }
 

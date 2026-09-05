@@ -327,7 +327,13 @@ degrades to the CPU, not that it is present.
 | `EnvDisableForcesCpuPath` | `SEMPER_OPENCL_DISABLE=1` forces the CPU path, for bisecting a suspected device-side difference |
 | `DeviceReproducesCanonicalReductionExactly` | **Device-gated.** A real OpenCL device returns bit-identical results to `semper_canon_sum_sq_diff` at n = 0…729, tail included. Skips with a printed reason rather than passing vacuously when no device is present |
 
-## Suite: `ClParity` — `unit/test_cl_strain.cpp`
+## Suite: `ClParity` — `unit/test_cl_strain.cpp`, `unit/test_cl_hessian.cpp`
+
+One suite, one rule, two kernels: Phase 2's strain fit and Phase 3's static
+Hessian pre-pass. Both files register into `ClParity`, so `dic_tests ClParity`
+runs the whole GPU parity gate.
+
+### Phase 2 — strain VSG (`unit/test_cl_strain.cpp`)
 
 GPU Phase 2's parity gate: the VSG strain kernel against
 `StrainCalculator::compute_vsg_strain`. The claim is not that the device is
@@ -353,6 +359,64 @@ must not become a hole in the parity coverage.
 | `StrainMatchesCpuBitExactly` | **Device-gated.** Four grid geometries, exact equality on every point. The field carries quadratic terms, so the plane fit is a genuine compromise rather than an exactly-recoverable linear field | The kernel and the CPU reference have diverged; the GPU path cannot ship |
 | `StrainRejectionCasesMatchExactly` | **Device-gated.** Both paths refuse *the same* points — edge-clipped windows, sub-90% fill from invalid neighbours, rank-deficient support — leaving the −1000 sentinel | Agreeing on values while disagreeing on which points to give up on is still a parity failure |
 | `StrainIsRunToRunReproducible` | **Device-gated.** Repeat dispatches of one input return identical bytes | A result depending on work-group scheduling would pass the parity tests only intermittently |
+
+### Phase 3 — Hessian pre-pass (`unit/test_cl_hessian.cpp`)
+
+The same gate for `compute_hessian_pool_gpu` against
+`SubsetPrecomputer::compute_hessian_only`. This stage is fp32 end to end, so it
+is gated on **`exact_fp32`, not `fp64`** — a device with one and not the other
+runs whichever stage it can, which is the whole point of keeping the two flags
+separate.
+
+One asymmetry is deliberate and documented in the file: when a point never
+reaches the Hessian accumulation, the CPU returns a default-constructed
+`CachedHessianData` whose Eigen `H` and `H_inv` are **uninitialised**, while the
+GPU path leaves them zeroed. Nothing reads them — `precompute_subset_fast`
+re-runs the full precompute whenever `valid` is false — so the comparison checks
+`valid`/`mean`/`std` everywhere and the matrices exactly where the CPU wrote
+them, recomputing that condition from the image rather than inferring it.
+
+| Test | Proves | Failure would mean |
+|---|---|---|
+| `HessianDispatchDeclinesCleanlyWhenStageUnavailable` | With no device, or one without correctly-rounded fp32, dispatch returns false and leaves the caller's pool **untouched** | A half-filled pool would silently corrupt the entries the CPU pre-pass then computes |
+| `HessianDispatchRejectsBadArguments` | Null pointers, an undersized output and degenerate geometry are refused, not dereferenced or launched | A crash on a caller error instead of a return value |
+| `HessianDispatchHonoursEnvDisable` | `SEMPER_OPENCL_DISABLE=1` shuts this stage down too | The documented CPU-forcing escape hatch would not actually force the CPU |
+| `EmbeddedHessianKernelIsSelfContained` | The embedded source resolves its includes, keeps `FP_CONTRACT OFF`, calls the same `semper_mat6_add_outer` / `semper_mat6_symmetrize` / `semper_inv6x6` as the host, and contains **no `double` after the kernel entry point** | A stray double would stop this kernel building on a device without `cl_khr_fp64`, and since a build failure must not flip `caps().available`, the symptom would be a silent CPU fallback |
+| `HessianMatchesCpuBitExactly` | **Device-gated.** Four grid geometries, exact equality on `H`, `H_inv`, `mean_intensity` and `std_dev` at every point — including a grid deliberately run off the image edge | The kernel and the CPU reference have diverged; the GPU path cannot ship |
+| `HessianRejectionCasesMatchExactly` | **Device-gated.** Both paths refuse *the same* points, by both routes: a stamped −10 ghost wall (rejected before the Hessian exists) and a flat, rank-deficient patch (rejected by the `det` / `cond_2x2` thresholds after it does, so the raw `H` must still match) | Agreeing on values while disagreeing on which points to give up on is still a parity failure |
+| `HessianLeavesUnwantedPoolSlotsAlone` | **Device-gated.** Pool slots the caller did not request come back byte-for-byte as they went in | The pre-pass skips points the solver has already solved; overwriting them would discard real results |
+| `HessianIsRunToRunReproducible` | **Device-gated.** Repeat dispatches of one input return identical bytes | A result depending on work-group scheduling would pass the parity tests only intermittently |
+
+## Suite: `ClPipelineParity` — `integration/test_full_field_gpu_prepass.cpp`
+
+`ClParity` drives the GPU dispatch functions directly, at whatever geometry it
+likes. That is deliberate — the dispatch functions are policy-free, and the
+size thresholds that decide whether the device is worth using live in their
+callers in `full_field_solver.cpp` and `full_field_solver_stats.cpp`. The
+consequence is that those callers are code no other parity test executes.
+
+This suite closes that gap at the only level where it matters: the packed
+output of `run_full_field` must be identical whether its GPU stages ran or
+not. The geometry (512x512, step 7, subset 21) is picked to clear both
+thresholds — 5 329 grid points, over the 4 000-point floor and over
+12 000 x 0.262 MP — so the device branch actually fires. Needs OpenCV **and**
+`SEMPER_OPENCL=ON`; under either one alone the file compiles to a single
+placeholder case so the suite count does not change silently with the build
+flag.
+
+The comparison is `==` on every float, as everywhere else in the GPU work. It
+also runs the device twice, because the first solve in a process pays the
+whole backend bring-up and the second does not, and a difference between them
+would mean the result depended on state carried across solves.
+
+| Test | Proves | Failure would mean |
+|---|---|---|
+| `FullFieldOutputIsIdenticalWithAndWithoutGpu` | **Device-gated.** One solve with `SEMPER_OPENCL_DISABLE=1` and two with the device: identical packed output, identical valid count, identical Path A / Path B split, and cold and warm device solves identical to each other | The dispatch functions pass parity but the wired callers do not — a threshold, a buffer lifetime or the fallback decision is wrong, and the field the user gets depends on their hardware |
+| `PipelineGpuStagesCompiledOut` | The file is inert without OpenCV or without `SEMPER_OPENCL` | A build-flag combination would drop the suite with no trace in the count |
+
+A moved Path A / Path B split is asserted separately from the values because
+it means propagation changed even when every surviving point still matches —
+see [DETERMINISM.md](DETERMINISM.md).
 
 ## Suite: `CanonicalReduce` — `unit/test_canonical_reduce.cpp`
 
@@ -594,6 +658,7 @@ on.
 |---|---|---|
 | `SubsetSolveThroughput` | 225 subsets precompute and solve, at least one converges, and the whole grid finishes well inside 120 s | A hang, a pathological slowdown, or a regression that stops every subset converging |
 | `StrainVsgThroughputCpuVsGpu` | The VSG fit on CPU and on the device, swept across five grid sizes. Compiled only under `-DSEMPER_OPENCL=ON`; prints CPU-only figures when no fp64 device is present | The printed break-even is where the size threshold in `full_field_solver_stats.cpp` comes from, so a shift here means that constant is stale — re-run this after touching the kernel or its buffer transfers |
+| `HessianPrepassThroughputCpuVsGpu` | The static Hessian pre-pass on CPU and on the device, swept across five grid sizes at a fixed image size, then the fixed dispatch cost swept across three image sizes. **The CPU column is serial** — this binary does not link OpenMP, while the pipeline pre-pass does | The two sweeps are where the *points-per-megapixel* threshold in `full_field_solver.cpp` comes from. The second one exists because the dispatch floor scales with the image, not the grid, so a flat point count would send a large image with a coarse grid to the device and lose |
 
 ---
 
@@ -630,7 +695,8 @@ tests/
   c/contract.c            C ABI Frozen-contract binary (semper_c_contract)
   c/abi_symbols.txt       golden list of exported semper_* symbols
   unit/                   one component vs. an oracle / mathematical identity
-                            test_cl_runtime (OpenCL-gated), test_canonical_reduce,
+                            test_cl_runtime, test_cl_strain, test_cl_hessian
+                            (OpenCL-gated), test_canonical_reduce,
                             test_canonical_inverse, test_simd_kernels, test_image,
                             test_subset_precomputer, test_strain_calculator,
                             test_cancel_token, test_image_codec (OpenCV-gated)
@@ -638,7 +704,8 @@ tests/
                             test_optimization_engine, test_robustness,
                             test_golden_corpus, test_full_field_golden,
                             test_full_field_contracts, test_reference_cache
-                            (the last three OpenCV-gated)
+                            (the last three OpenCV-gated), test_full_field_gpu_prepass
+                            (OpenCV + OpenCL)
   dice/                   DICe golden comparisons — all OpenCV-gated
                             test_translation_synthetic, test_translation_real_image,
                             test_strain_gradients, test_strain_vsg,
@@ -649,7 +716,8 @@ tests/
 `tests/CMakeLists.txt` lists sources under `DIC_UNIT_TESTS` /
 `DIC_INTEGRATION_TESTS` / `DIC_DICE_TESTS` / `DIC_PERF_TESTS`, plus
 `DIC_PIPELINE_TESTS` for the OpenCV-gated suites (`test_full_field_contracts`,
-`test_full_field_golden`, `test_image_codec`, `test_reference_cache`) —
+`test_full_field_golden`, `test_full_field_gpu_prepass`, `test_image_codec`,
+`test_reference_cache`) —
 attached via `target_sources` only when OpenCV is present. `test_cl_runtime`
 is in the always-on unit list but compiles to nothing unless `SEMPER_OPENCL=ON`;
 see [GPU_ACCELERATION.md](GPU_ACCELERATION.md).

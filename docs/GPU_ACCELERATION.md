@@ -48,7 +48,7 @@ run the bit-exact ICGN path and is refused for that stage.
 | **0** | Make the CPU reference reproducible. Strict FP, canonical reduction order, canonical linear algebra replacing Eigen in the mirrored paths, deterministic Path B. **No GPU code.** | **Complete** |
 | **1** | OpenCL runtime + build plumbing: `SEMPER_OPENCL`, dlopen loader, device capability gate, kernel embedding. **No compute kernels.** | **Complete** |
 | **2** | Strain VSG on GPU. One work-item per grid point, fp64. Currently the only fully serial numerical stage. | **Complete** |
-| **3** | Hessian pre-pass on GPU. One work-item per grid point. | In progress — CPU reference canonical, kernel pending |
+| **3** | Hessian pre-pass on GPU. One work-item per grid point. | **Complete** |
 | **4** | Path A ICGN on GPU. **One work-item per subset**, so the reduction keeps the canonical order rather than becoming a cross-lane tree. | Pending |
 | **5** | Path B wavefront on GPU. Reuses the Phase 4 kernel; one launch per round. Only possible because Phase 0 made Path B round-based. | Pending |
 | **6** | Image prep (gradients, optional blur). AKAZE stays on CPU — randomized RANSAC, poor return. | Pending |
@@ -145,6 +145,124 @@ and this is not evidence of a bug that was fixed. It is evidence that the
 hazard did not happen to manifest in this ISA pair -- which is exactly why
 the reference is pinned rather than left to a library's codegen.
 
+### Phase 3 results (measured)
+
+The static Hessian pre-pass runs on the device, bit-identical to the CPU.
+Same host as Phase 2: Windows 11, MinGW-w64 GCC (UCRT), Release, NVIDIA
+GeForce RTX 3060 Laptop GPU on the CUDA ICD. Unlike the strain kernel this
+one is fp32 from end to end, so it is gated on **`exact_fp32`, not `fp64`**,
+and it builds on a device with no `cl_khr_fp64` at all.
+
+| Check | Result |
+|---|---|
+| `SEMPER_OPENCL=OFF` | 72 tests run, 70 pass |
+| `SEMPER_OPENCL=ON`, RTX 3060 | 93 tests run, 91 pass (`ClParity` 15/15, `ClRuntime` 7/7) |
+| `SEMPER_OPENCL=ON` + OpenCV, RTX 3060 | 127 tests run, 124 pass — the same three fail with the device disabled |
+| Linux, GCC 11.4, OpenCV, `OFF` → `ON` | 106 → 127 tests; same single pre-existing failure in both, and `ClPipelineParity` skips itself with no ICD |
+| **CPU/GPU parity, values** | **Exact** over all 547 points of four grid geometries, 442 of them accepted — `==`, not a tolerance, on `H`, `H_inv`, `mean_intensity` and `std_dev` |
+| **CPU/GPU parity, rejections** | **Exact** — 53 of 380 points refused identically on a grid stamped with a ghost wall and a flat (rank-deficient) patch, and 88 of 100 on a grid deliberately run off the image edge |
+| Unrequested pool slots | Untouched, byte for byte — the pre-pass skips points the solver has already solved |
+| Run-to-run reproducibility, device | Identical bytes across repeat dispatches |
+| Cross-ABI determinism | Subset corpus byte-identical, `x86-64` vs `x86-64-v3` |
+| CPU fallback unchanged | Full-field output identical between the `OFF` and `ON` Linux builds apart from timing lines; Path A/B split still 420/58 |
+
+The two `SEMPER_OPENCL=OFF` failures on Windows are `GoldenCorpus`, and they
+are the known MinGW-vs-glibc `libm` gap on 13 of 580 points — the fixture is
+pinned to Linux GCC Release (see [DETERMINISM.md](DETERMINISM.md)). The one
+Linux failure is `FullFieldGolden.CaptureOrCompare`, which fails identically
+on the **unmodified** baseline in that environment because the vendored
+OpenCV 4.13.0 seeds AKAZE differently from CI's packaged build.
+
+**Throughput.** Measured at a fixed 1024×1024 reference image, subset 21, ten
+repetitions, sweeping the step to vary the grid:
+
+| Grid points | CPU (serial) | GPU | |
+|---|---|---|---|
+| 2 500 (step 19) | 11.27 ms | 3.25 ms | 3.5× |
+| 5 329 (step 13) | 23.99 ms | 3.61 ms | 6.6× |
+| 11 236 (step 9) | 50.41 ms | 4.13 ms | 12.2× |
+| 25 600 (step 6) | 115.06 ms | 6.28 ms | 18.3× |
+| 57 600 (step 4) | 257.95 ms | 10.04 ms | **25.7×** |
+
+**Read that CPU column carefully: it is serial.** The test binary does not
+link OpenMP, while the pipeline pre-pass is an `#pragma omp parallel for` over
+`safe_cores`. The number the caller actually races against is this column
+divided by the core count.
+
+The other half of the cost is fixed, and it scales with the **image**, not the
+grid — the three float planes of the reference image cross the bus on every
+call:
+
+| Reference image | Dispatch floor | Per megapixel |
+|---|---|---|
+| 512×512 | 1.14 ms | 4.35 ms/MP |
+| 1024×1024 | 2.65 ms | 2.52 ms/MP |
+| 2048×2048 | 7.54 ms | 1.80 ms/MP |
+
+That is about 0.6 ms constant plus 2 ms per megapixel. So the shape that loses
+on the device is a **large image with a coarse grid**, which a flat point-count
+threshold would miss entirely. `src/pipeline/full_field_solver.cpp` therefore
+gates on points *per megapixel of reference image*: 12 000, roughly four times
+the 6-core crossover, plus a 4 000-point floor. `compute_hessian_pool_gpu`
+itself stays policy-free so the parity tests can drive tiny grids.
+
+**On dropping Eigen (step one of the phase, commit `e9f6e7a`).** Unlike
+Phase 2, this one moved the golden corpus. Eigen's `PartialPivLU` inverse and
+`semper_inv6x6`'s Gauss-Jordan are both correct and differ in the last few
+digits, which shifts the ICGN iterate path: 394 of 580 points (4×4) and 399 of
+580 (6×6) moved by roughly 1e-5, with **zero** status mismatches. The fixture
+was recaptured deliberately, on the Linux GCC Release platform it is pinned
+to, and the recapture is recorded in [DETERMINISM.md](DETERMINISM.md).
+`full_field_golden.bin` was verified unchanged and was not recaptured.
+
+**End to end, on the device.** The dispatch functions are policy-free and the
+size thresholds live in their callers, so `ClParity` — which drives the
+dispatch directly — never executes the wired caller. `ClPipelineParity`
+(`tests/integration/test_full_field_gpu_prepass.cpp`) closes that: it runs
+`run_full_field` three times on one 512x512 pair at step 7, a geometry chosen
+to clear both thresholds (5 329 grid points, over the 4 000-point floor and
+over 12 000 x 0.262 MP), once with `SEMPER_OPENCL_DISABLE=1` and twice with the
+RTX 3060 engaged. On the RTX 3060, MinGW GCC 16.1, OpenCV 4.13.0:
+
+| | Result |
+|---|---|
+| Packed output, CPU vs GPU | **0 float mismatches** of 42 632 — `==`, all 8 slots of all 5 329 points |
+| Valid points | 3 265 on both |
+| Path A / Path B split | 3 470 / 489 on both |
+| Cold vs warm device solve | Identical bytes |
+
+Running the whole suite on that host needs the OpenCV the tests link against
+to come from the same toolchain, so it was built for MinGW from the vendored
+submodule; that build is a local prerequisite, not a repo change.
+
+**The end-to-end timing is the honest half of this.** At that geometry the
+pre-pass costs **4.05 ms on the CPU and 2.99 ms on the device** — 1.35x, far
+from the 6.6x the same point count shows in the throughput table above,
+because there the CPU column is serial and here it is OpenMP across six cores.
+The first device solve in a process costs **62.14 ms** instead, all of it the
+one-time backend bring-up (`dlopen`, platform and device probe,
+`clBuildProgram` for every kernel) landing inside that frame's pre-pass
+timing. A single-frame solve therefore loses; a session amortises it over the
+first frame. That cost is not new to this phase — Phase 2 already pays it —
+but it had not been measured until now.
+
+Re-deriving the threshold from these numbers rather than the serial ones: the
+CPU costs 0.76 us/point (6 cores) and the warm device 2.33 ms fixed plus
+0.123 us/point at 512x512, so the crossover is about 3 700 points. The shipped
+4 000-point floor clears it, with about 9% of margin — thin, and it is the
+floor, not the per-megapixel term, that binds below 0.33 MP. Above that the
+12 000 pts/MP term binds and is roughly 3x conservative. The exposure is a
+sub-millisecond loss on a small image with a dense grid, which is why the
+floor is left as it is rather than tuned to the edge.
+
+**Not run, and not claimed.** Still deferred from Phase 3a: the determinism
+job's Linux cross-`-march` compare, and a `FullFieldGolden` run on CI's
+OpenCV. On the Windows host the full suite is 127 tests, 124 passing; the
+three failures are `FullFieldGolden.CaptureOrCompare` and the two
+`GoldenCorpus` cases, and **the same three fail from the same binary with
+`SEMPER_OPENCL_DISABLE=1`** — they are the vendored-OpenCV AKAZE difference
+and the MinGW `libm` gap described above, not the GPU path.
+
 ### Per-phase gate
 
 Every phase must clear all three before the next begins.
@@ -185,7 +303,7 @@ may legitimately run one and not the other:
 |---|---|---|
 | `Device Version` ≥ OpenCL 1.2 | everything | Whole backend falls back to CPU |
 | `cl_khr_fp64` in extensions | strain (Phase 2) | Strain stays on CPU |
-| `Correctly-rounded divide/sqrt` in single-precision FP config | ICGN (Phases 3–5) | ICGN stays on CPU — **cannot** be bit-exact without it |
+| `Correctly-rounded divide/sqrt` in single-precision FP config | ICGN and the Hessian pre-pass (Phases 3–5) | Those stages stay on CPU — they **cannot** be bit-exact without it |
 
 `clinfo` reporting no platforms means no ICD is registered. Note that
 `libOpenCL.so.1` being present proves nothing: it is only the loader, and
@@ -306,6 +424,7 @@ chat log.
 | 2026-09 | *(none — CPU only)* | loader present, no ICD | — | — | — | 3205 / 3273 (median/max) | n/a | Development container, 4-core Xeon. Phase 0 reference |
 | 2026-09 | POCL CPU device | pocl-opencl-icd 5.0 | 3.0 (CL C 1.2) | yes | yes | 2900 ON / 2910 OFF (median, back-to-back) | pass | `cpu-skylake-avx512`. Canonical reduction exact vs host at every size |
 | 2026-09 | NVIDIA GeForce RTX 3060 Laptop | CUDA ICD | 3.0 | yes | yes | strain 0.67× at 2.2k pts → 5.32× at 37k pts | pass | Windows 11 / MinGW-w64. Phase 2. Fixed ~0.45 ms dispatch cost sets a 3600-point break-even; below it the caller stays on CPU |
+| 2026-09 | NVIDIA GeForce RTX 3060 Laptop | CUDA ICD | 3.0 | yes | yes | Hessian pre-pass 3.5× at 2.5k pts → 25.7× at 58k pts (vs serial CPU) | pass | Windows 11 / MinGW-w64. Phase 3. fp32 only, so gated on `exact_fp32`. Dispatch floor ~0.6 ms + ~2 ms per megapixel of reference image, which is why the caller's threshold is per megapixel rather than a flat point count |
 |  |  |  |  |  |  |  |  |  |
 
 ---

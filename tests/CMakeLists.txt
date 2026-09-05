@@ -67,6 +67,7 @@ endif ()
 set(DIC_UNIT_TESTS
         unit/test_cl_runtime.cpp
         unit/test_cl_strain.cpp
+        unit/test_cl_hessian.cpp
         unit/test_canonical_reduce.cpp
         unit/test_canonical_inverse.cpp
         unit/test_simd_kernels.cpp
@@ -123,6 +124,7 @@ set(DIC_PIPELINE_SOURCES
 set(DIC_PIPELINE_TESTS
         integration/test_full_field_contracts.cpp
         integration/test_full_field_golden.cpp
+        integration/test_full_field_gpu_prepass.cpp
         unit/test_image_codec.cpp
         integration/test_reference_cache.cpp
 )
