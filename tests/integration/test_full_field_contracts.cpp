@@ -2,6 +2,8 @@
 // contract block (degenerate ROI → -2, empty def → -3, stale cancel, undersized
 // buffer). Compiled only when DIC_HAVE_OPENCV is set (same gate as DICe tests).
 #include "framework/test_framework.h"
+
+#include <cstring>
 #include "framework/synthetic.h"
 
 #include <semper/cancel.hpp>
@@ -214,3 +216,74 @@ TEST_CASE(FullField, OpenCvRequired_SkippedWithoutOpenCV) {
 }
 
 #endif // DIC_HAVE_OPENCV
+
+// ---------------------------------------------------------------------------
+// Full-field repeat determinism.
+//
+// The positive guarantee behind the sanitizer work: docs/TESTING.md promises
+// that the same binary on the same device with the same input is bit-identical.
+// A data race between the parallel workers would break exactly that, so this is
+// the property that actually guards against one, and unlike a sanitizer run it
+// needs no special toolchain.
+//
+// It covers all four concurrent regions in one solve — the Hessian pre-pass,
+// the anchor lattice and Path A (OpenMP), plus Path B's std::thread workers.
+//
+// Thread count is deliberately not varied: run_full_field pins every OpenMP
+// region with `num_threads(safe_cores)`, which overrides omp_set_num_threads
+// and OMP_NUM_THREADS, so a test cannot change it without a production hook.
+// Cross-thread-count invariance is therefore not a contract this engine makes;
+// Path B's reliability-guided propagation is order-dependent by construction.
+// ---------------------------------------------------------------------------
+TEST_CASE(FullField, RepeatSolve_BitIdenticalField) {
+    cv::Mat ref_gray, def_gray;
+    make_pair(ref_gray, def_gray);
+
+    // The default STEP/STRAIN_WIN pair puts one grid node inside the VSG window,
+    // so every point is rejected and the field is empty. Use a step and window
+    // that actually produce points, or this proves nothing.
+    FullFieldParams params = params_for(W, H);
+    params.step = 5;
+    params.strain_window = 31;
+
+    const int gridW = params.rect_w / params.step;
+    const int gridH = params.rect_h / params.step;
+    const int cap = gridW * gridH * 8;
+
+    auto solve = [&](std::vector<float> &out) {
+        ReferenceCache cache;
+        cache.set_from_gray(ref_gray, cv::Mat());
+        out.assign((size_t)cap, 0.0f);
+        float metrics[17] = {};
+        return run_full_field(cache, def_gray, cv::Mat(), params,
+                              out.data(), cap, metrics, 17, nullptr);
+    };
+
+    std::vector<float> reference;
+    const int n_ref = solve(reference);
+    REQUIRE(n_ref > 0);
+
+    for (int rep = 1; rep <= 4; ++rep) {
+        std::vector<float> field;
+        const int n = solve(field);
+        CHECK(n == n_ref);
+        if (n != n_ref) continue;
+
+        // Bit-identical, not near-equal: a race would perturb some point, and an
+        // epsilon comparison would let a small perturbation through.
+        size_t first_diff = (size_t)-1;
+        for (size_t i = 0; i < (size_t)n * 8; ++i) {
+            if (std::memcmp(&reference[i], &field[i], sizeof(float)) != 0) {
+                first_diff = i;
+                break;
+            }
+        }
+        if (first_diff != (size_t)-1) {
+            std::printf("    repeat %d: first difference at float %zu "
+                        "(point %zu, field %zu): %.9g vs %.9g\n",
+                        rep, first_diff, first_diff / 8, first_diff % 8,
+                        (double)reference[first_diff], (double)field[first_diff]);
+        }
+        CHECK(first_diff == (size_t)-1);
+    }
+}

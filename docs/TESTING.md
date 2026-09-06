@@ -7,16 +7,15 @@ and how to run everything. The engine it exercises is described in
 
 ---
 
-## Known gap: the sanitizer jobs do not cover the full-field pipeline
+## Sanitizers
 
-`.github/workflows/ci.yml`'s `sanitizers` matrix installs only ccache, not
-`libopencv-dev`, and configures without `-DDIC_REQUIRE_OPENCV=ON`. OpenCV is
-therefore not found, `_SEMPER_OPENCV_READY` stays false, and
-`DIC_PIPELINE_SOURCES` / `DIC_PIPELINE_TESTS` are never compiled. ASan, UBSan
-and TSan consequently see the math suite only — never `run_full_field`, its
-OpenMP regions, or Path B's `std::thread` workers.
+Both sanitizer jobs cover the **full-field pipeline**, not just the math suite.
+That requires `libopencv-dev` at configure time and `-DDIC_REQUIRE_OPENCV=ON`;
+without them `_SEMPER_OPENCV_READY` stays false and `run_full_field`, its three
+OpenMP regions and Path B's `std::thread` workers are silently excluded from the
+build. (They were, until this was fixed.)
 
-Running them locally with OpenCV present is therefore stricter than CI:
+### ASan + UBSan — GCC
 
 ```bash
 cmake -S tests -B build/asan -DCMAKE_BUILD_TYPE=Release \
@@ -24,21 +23,60 @@ cmake -S tests -B build/asan -DCMAKE_BUILD_TYPE=Release \
 cmake --build build/asan -j"$(nproc)" && ./build/asan/dic_tests
 ```
 
-ASan + UBSan over the full pipeline is clean (89/89, exit 0, zero findings).
+Clean: 89/89, exit 0, zero findings.
 
-**TSan over the full pipeline is not, and was not before the seeding change.**
-Measured on identical hardware: pristine `074602a` reports 363 data races and
-exits 66; the anchor-seeding branch reports 434 and also exits 66. Both pass all
-their tests. The reports land on OpenMP fork/join edges — including
-`full_field_solver.cpp`'s Hessian pre-pass, untouched by any recent work — and
-on `std::vector::operator[]` reads of read-only data. GCC's `libgomp` is not
-TSan-instrumented, so TSan cannot see the barriers that order these accesses.
+### TSan — Clang, libomp and Archer (not GCC)
 
-Treat the TSan numbers as a baseline to compare against, not a pass/fail gate,
-until either `libgomp` is replaced with an instrumented runtime or the OpenMP
-regions are annotated. Enabling OpenCV in the CI sanitizer job without doing
-that first would turn the job red.
+**GCC cannot be used for TSan here.** Its OpenMP runtime, `libgomp`, carries no
+ThreadSanitizer instrumentation, so TSan cannot see the join at the end of
+`GOMP_parallel`. libgomp then recycles the outlined function's stack frame for
+the next parallel region and TSan reports the reused slot as a race — the
+"previous write" being, for instance, `compute_hessian_only` storing an Eigen
+6x6 on the master's stack, and the "read" carrying no instrumented frame at all
+because it is performed inside libgomp itself. Measured on this suite: **576
+reports on the `FullField` tests alone, none of them involving engine data.**
 
+LLVM's `libomp` plus the [Archer](https://github.com/PRUNERS/archer) OMPT tool
+supplies those edges:
+
+```bash
+sudo apt-get install -y clang-18 libomp-18-dev libclang-rt-18-dev libopencv-dev
+
+cmake -S tests -B build/tsan -DCMAKE_BUILD_TYPE=Release \
+      -DDIC_REQUIRE_OPENCV=ON -DDIC_SANITIZER=thread \
+      -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18
+cmake --build build/tsan -j"$(nproc)"
+
+OMP_TOOL_LIBRARIES=/usr/lib/llvm-18/lib/libarcher.so \
+TSAN_OPTIONS=ignore_noninstrumented_modules=1 \
+  ./build/tsan/dic_tests
+```
+
+**Result: 0 warnings, exit 0, 89/89.** `ignore_noninstrumented_modules=1` is
+needed for one libomp-internal report — its lazy lock-pool initialisation, where
+both accesses are inside the uninstrumented runtime with no engine frames on
+either stack.
+
+| configuration | reports (`FullField`) |
+|---|---|
+| GCC + libgomp | 576 |
+| Clang + libomp + Archer | 0 |
+
+The engine has no data races; the earlier count was entirely a property of the
+toolchain. Do not re-enable a GCC TSan job — it will be red and the redness will
+mean nothing.
+
+### The guarantee that does not need a sanitizer
+
+`FullField.RepeatSolve_BitIdenticalField` solves the same field five times and
+requires the packed output to be bit-identical, which is what a race would
+break. It runs in every build, including the plain host job.
+
+Thread count is deliberately not varied: `run_full_field` pins every OpenMP
+region with `num_threads(safe_cores)`, which overrides `omp_set_num_threads` and
+`OMP_NUM_THREADS`, so a test cannot change it without adding a production hook.
+Cross-thread-count invariance is not a contract this engine makes — Path B's
+reliability-guided propagation is order-dependent by construction.
 
 ## Running the tests
 

@@ -83,8 +83,12 @@ jobs:
         include:
           - sanitizer: "address,undefined"
             id: asan-ubsan
+            cmake_extra: ""
+            omp_tool: ""
           - sanitizer: "thread"
             id: tsan
+            cmake_extra: "-DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18"
+            omp_tool: "/usr/lib/llvm-18/lib/libarcher.so"
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 500M
@@ -94,8 +98,18 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install ccache
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq ccache
+      - name: Install toolchain
+        # libopencv-dev is required or _SEMPER_OPENCV_READY stays false and the
+        # whole full-field pipeline is silently excluded from the build — the
+        # sanitizers would then only ever see the math suite.
+        # clang/libomp/compiler-rt are required for the TSan job: GCC's libgomp
+        # carries no ThreadSanitizer instrumentation, so it reports hundreds of
+        # false races on reused OpenMP stack frames. LLVM's libomp plus the
+        # Archer OMPT tool gives TSan the fork/join edges and reports none.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ccache libopencv-dev \
+            clang-18 libomp-18-dev libclang-rt-18-dev
 
       - name: Cache ccache objects
         uses: actions/cache@v4
@@ -108,7 +122,9 @@ jobs:
         run: >
           cmake -S tests -B build/tests
           -DCMAKE_BUILD_TYPE=Release
+          -DDIC_REQUIRE_OPENCV=ON
           -DDIC_SANITIZER=${{ matrix.sanitizer }}
+          ${{ matrix.cmake_extra }}
           -DCMAKE_C_COMPILER_LAUNCHER=ccache
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
@@ -116,6 +132,11 @@ jobs:
         run: cmake --build build/tests -j"$(nproc)"
 
       - name: Run dic_tests
+        env:
+          OMP_TOOL_LIBRARIES: ${{ matrix.omp_tool }}
+          # libomp's own lazy lock-pool init races with itself, entirely inside
+          # the uninstrumented runtime with no engine frames on either stack.
+          TSAN_OPTIONS: ignore_noninstrumented_modules=1
         run: ./build/tests/dic_tests
 
       - name: ccache statistics
