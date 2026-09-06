@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <opencv2/core.hpp>
 #include <vector>
 
@@ -75,6 +76,15 @@ int call_solver(ReferenceCache &cache, const cv::Mat &def_gray,
     metrics[16] = -1.f;
     return run_full_field(cache, def_gray, cv::Mat(), params,
                           out.data(), buffer_floats, metrics, 17, nullptr);
+}
+
+void set_env(const char *name, const char *value) {
+#if defined(_WIN32)
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) setenv(name, value, 1);
+    else unsetenv(name);
+#endif
 }
 
 } // namespace
@@ -204,6 +214,55 @@ TEST_CASE(FullField, NullMetrics_DoesNotCrash) {
     const int n = run_full_field(cache, def_gray, cv::Mat(), params_for(W, H),
                                  out.data(), cap, nullptr, 17, nullptr);
     CHECK(n >= 0);
+}
+
+TEST_CASE(FullField, PathBRoundTraceIsInert) {
+    // SEMPER_PATHB_ROUNDS=1 turns on the Path B round-structure diagnostic
+    // that GPU Phase 5 used to conclude Path B stays on the CPU (see the
+    // header of src/pipeline/full_field_path_b.cpp). It reads per-round
+    // counters that the solve is already maintaining, so it must not be able
+    // to move a single output float -- a diagnostic that perturbs the thing
+    // it measures is worse than no diagnostic.
+    cv::Mat ref_gray, def_gray;
+    make_pair(ref_gray, def_gray);
+    const auto p = params_for(W, H);
+    const int grid_pts = (W / STEP) * (H / STEP);
+    const int buf_floats = grid_pts * 8;
+
+    std::vector<float> quiet(buf_floats, 0.f), traced(buf_floats, 0.f);
+    float m_quiet[17] = {}, m_traced[17] = {};
+    m_quiet[16] = -1.f;
+    m_traced[16] = -1.f;
+
+    set_env("SEMPER_PATHB_ROUNDS", nullptr);
+    ReferenceCache cache_a;
+    cache_a.set_from_gray(ref_gray, cv::Mat());
+    const int rc_quiet = run_full_field(cache_a, def_gray, cv::Mat(), p,
+                                        quiet.data(), buf_floats, m_quiet, 17, nullptr);
+
+    set_env("SEMPER_PATHB_ROUNDS", "1");
+    ReferenceCache cache_b;
+    cache_b.set_from_gray(ref_gray, cv::Mat());
+    const int rc_traced = run_full_field(cache_b, def_gray, cv::Mat(), p,
+                                         traced.data(), buf_floats, m_traced, 17, nullptr);
+    set_env("SEMPER_PATHB_ROUNDS", nullptr);
+
+    REQUIRE(rc_quiet >= 0);
+    CHECK(rc_quiet == rc_traced);
+
+    int diffs = 0;
+    for (int i = 0; i < buf_floats; ++i)
+        if (quiet[(size_t) i] != traced[(size_t) i]) ++diffs;
+    CHECK(diffs == 0);
+
+    // Counts, the Path A/B split, the rescue tally and the mean iteration
+    // count too, since those are exactly what the diagnostic reads. Slots
+    // 9-14 are wall-clock timings and a throughput ratio derived from them
+    // (full_field_solver_stats.cpp), so they are not reproducible between any
+    // two solves and are excluded here rather than compared loosely.
+    for (int i = 0; i <= 8; ++i) CHECK(m_quiet[i] == m_traced[i]);
+    CHECK(m_quiet[15] == m_traced[15]);   // convergence %
+    CHECK(m_quiet[16] == m_traced[16]);   // seeding route
 }
 
 #else

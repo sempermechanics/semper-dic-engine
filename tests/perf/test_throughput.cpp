@@ -466,6 +466,46 @@ TEST_CASE(Perf, IcgnPathAThroughputCpuVsGpu) {
         }
     }
 
+    // Small-batch cost, at the sizes Path B rounds actually are. The sweep
+    // above starts at 2 500 points because that is the scale Path A works
+    // at; Path B is a wavefront, and its rounds measure in the hundreds --
+    // 347 / 599 / 950 / 1532 for the largest round at the four geometries
+    // Perf.PathAPipelineThroughputCpuVsGpu runs, with a long tail of rounds
+    // in the single digits. Whether Phase 5 can work at all is decided here,
+    // because a per-round launch pays the fixed cost above once per round.
+    if (have_device) {
+        const int batch_sizes[] = {8, 32, 64, 128, 256, 512, 1024, 2048};
+        const int gw_full = (IW - 2 * margin) / 9;
+        const int n_full = gw_full * ((IH - 2 * margin) / 9);
+        std::vector<Semper::CachedHessianData> pool((size_t) n_full);
+        std::vector<Semper::gpu::IcgnGpuPoint> pts((size_t) n_full);
+        for (int i = 0; i < n_full; ++i) {
+            const int cx = margin + (i % gw_full) * 9, cy = margin + (i / gw_full) * 9;
+            pool[(size_t) i] = SubsetPrecomputer::compute_hessian_only(ref, cx, cy, dim);
+            pts[(size_t) i].cx = cx;
+            pts[(size_t) i].cy = cy;
+            pts[(size_t) i].cached = &pool[(size_t) i];
+            const float ddx = (float) cx - d.cx, ddy = (float) cy - d.cy;
+            pts[(size_t) i].guess[0] = d.u + d.ux * ddx + d.uy * ddy - 0.35f;
+            pts[(size_t) i].guess[1] = d.v + d.vx * ddx + d.vy * ddy + 0.28f;
+        }
+        std::vector<Semper::gpu::IcgnGpuResult> out((size_t) n_full);
+        for (int nb : batch_sizes) {
+            if (nb > n_full) continue;
+            REQUIRE(Semper::gpu::solve_icgn_batch_gpu(
+                    ref, def, dim, false, Semper::tuning::kIcgnMaxIter,
+                    Semper::tuning::kLmAlpha, pts.data(), nb, out.data()));
+            const auto tb = clock::now();
+            for (int r = 0; r < reps; ++r)
+                REQUIRE(Semper::gpu::solve_icgn_batch_gpu(
+                        ref, def, dim, false, Semper::tuning::kIcgnMaxIter,
+                        Semper::tuning::kLmAlpha, pts.data(), nb, out.data()));
+            const double s_ = std::chrono::duration<double>(clock::now() - tb).count() / reps;
+            std::printf("     batch %5d pts: %8.3f ms (%8.3f us/pt)\n",
+                        nb, 1000.0 * s_, 1.0e6 * s_ / nb);
+        }
+    }
+
     // The fixed half of the cost, isolated: a one-point launch does no
     // meaningful kernel work, so what remains is launch latency plus the
     // three reference planes and the deformed image crossing the bus. This

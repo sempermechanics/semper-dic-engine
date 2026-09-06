@@ -50,7 +50,7 @@ run the bit-exact ICGN path and is refused for that stage.
 | **2** | Strain VSG on GPU. One work-item per grid point, fp64. Currently the only fully serial numerical stage. | **Complete** |
 | **3** | Hessian pre-pass on GPU. One work-item per grid point. | **Complete** |
 | **4** | Path A ICGN on GPU. **One work-item per subset**, so the reduction keeps the canonical order rather than becoming a cross-lane tree. | **Landed, off by default** — bit-exact, but slower than the threaded CPU on the measured host; gated behind `kGpuIcgnPathAEnabled = false` |
-| **5** | Path B wavefront on GPU. Reuses the Phase 4 kernel; one launch per round. Only possible because Phase 0 made Path B round-based. | Pending |
+| **5** | Path B wavefront on GPU. Reuses the Phase 4 kernel; one launch per round. Only possible because Phase 0 made Path B round-based. | **Evaluated — stays on CPU.** The one round big enough to pay for a launch is 34-47% Nelder-Mead rescues, which the device path cannot take |
 | **6** | Image prep (gradients, optional blur). AKAZE stays on CPU — randomized RANSAC, poor return. | Pending |
 
 ### Phase 0 results (measured)
@@ -432,6 +432,104 @@ not a defect.
   **the same three fail from the `SEMPER_OPENCL=OFF` binary** — vendored-OpenCV
   AKAZE and the MinGW `libm` gap, not the GPU path.
 
+### Phase 5 results (measured)
+
+**Path B stays on the CPU.** No kernel was written, and the reason is a
+measurement rather than a difficulty: the one round large enough to pay for a
+kernel launch is expensive for precisely the reason the device cannot help
+with. This is the outcome the roadmap allowed for, and it is recorded here as
+a result, not deferred.
+
+The evaluation is cheap to re-run on other hardware, and it should be, because
+the conclusion is hardware-dependent: `SEMPER_PATHB_ROUNDS=1` prints the round
+structure, and `Perf.IcgnPathAThroughputCpuVsGpu` prints the small-batch launch
+cost the round structure has to beat.
+
+**What the wavefront actually looks like.** Path B is round-serial by
+construction — round *k*+1's guesses come from round *k*'s answers, so the
+rounds cannot be merged or reordered without giving up the determinism Phase 0
+bought. Measured on the RTX 3060 host, 20 threads, at the four geometries
+`Perf.PathAPipelineThroughputCpuVsGpu` uses:
+
+| Geometry | Path B pts | Rounds | Round 0 | Round 0 share of Path B time |
+|---|---|---|---|---|
+| 512×512 step 7 | 622 | 11 | 347 pts, 17.7 ms | 72% |
+| 1024×1024 step 9 | 881 | 15 | 599 pts, 33.2 ms | 63% |
+| 1024×1024 step 7 | 1 921 | 21 | 950 pts, 49.2 ms | 63% |
+| 1024×1024 step 5 | 4 533 | 29 | 1 532 pts, 83.1 ms | 53% |
+
+Every geometry is one big round and a long tail. At step 5 the tail is 28
+rounds averaging 107 points, ending in rounds of 4, 3, 2 and 1.
+
+**Why round 0 is expensive, and why that rules the device out.** It is the
+boundary between Path A's solved region and the unsolved interior, so it
+carries almost all of the hard points:
+
+| Geometry | Round 0 rescue rate | iters/pt | Round 1 rescue rate | Round 1 iters/pt |
+|---|---|---|---|---|
+| 512×512 step 7 | **34.3%** | 17.5 | 4.5% | 6.0 |
+| 1024×1024 step 9 | **40.2%** | 18.8 | 5.6% | 6.9 |
+| 1024×1024 step 7 | **41.2%** | 19.7 | 3.8% | 6.1 |
+| 1024×1024 step 5 | **47.3%** | 22.0 | 6.1% | 6.5 |
+
+A third to a half of round 0 needs the Nelder-Mead rescue — and the Phase 4
+device path accepts a device answer **only** where it would not have tripped
+that rescue test, so those points run on the CPU whether or not a kernel is
+launched. What is left for the device is the cheap majority.
+
+The arithmetic, at 1024×1024 step 5. Round 1 is 691 points at 6.1% rescues and
+16.3 µs/pt, which is close to a pure-ICGN rate; round 0's 1 532 points at that
+rate would be about **25 ms** of its measured **83 ms**, leaving ~58 ms in the
+rescue tail. The measured device cost of a 1 532-point launch is **~24 ms**
+(interpolated on the batch sweep below). So the device would replace 25 ms of
+CPU work with a 24 ms launch, leave the other 58 ms exactly where it was, and
+add a host round-trip per round. There is no version of that which wins.
+
+**Launch cost at the sizes that matter.** The Phase 4 sweep starts at 2 500
+points because that is Path A's scale; Path B rounds are two orders of
+magnitude smaller, so `Perf.IcgnPathAThroughputCpuVsGpu` now also sweeps the
+small end (1024×1024 reference, subset 21, best of three):
+
+| Batch | Time | µs/pt |
+|---|---|---|
+| 8 | 10.53 ms | 1316 |
+| 32 | 14.38 ms | 449 |
+| 64 | 14.69 ms | 229 |
+| 128 | 15.10 ms | 118 |
+| 256 | 17.36 ms | 67.8 |
+| 512 | 18.80 ms | 36.7 |
+| 1 024 | 23.14 ms | 22.6 |
+| 2 048 | 24.84 ms | 12.1 |
+
+The floor is ~14.5 ms for anything under a few hundred points. Every Path B
+round after the first is under 700 points and already runs at 10–17 µs/pt on
+the CPU — round 2 at step 5 is 672 points in 7.0 ms, against a ~20 ms launch.
+A launch-per-round design projects to **2.5×–5.3× slower** than the CPU across
+the four geometries; restricting it to rounds of 256 or more still loses,
+because those rounds are either round 0 (rescue-bound) or already cheap.
+
+**What would change this.** Not a better kernel — the same kernel is already
+bit-exact and already fails Phase 4's throughput gate on larger, friendlier
+batches. It would take a device path for the Nelder-Mead rescue itself, which
+is a different kernel with a different reduction shape and its own
+bit-exactness problem, or a machine where the launch floor is far below
+14.5 ms. Both are out of scope here, and neither is implied by the roadmap.
+
+**Not run, and not claimed.**
+
+- No Path B kernel exists, so there is no Path B parity result. `ClParity` and
+  `ClPipelineParity` are unchanged and still cover Phases 2–4 only.
+- The conclusion above is a **projection** from two sets of measured numbers —
+  the round structure and the launch-cost curve — not an end-to-end wall-clock
+  measurement of a Path B device path, because no such path was built. The
+  projected margin is 2.5× or worse at every geometry measured, which is why
+  it was not built.
+- `FullFieldGolden.CaptureOrCompare` with the GPU forced on, which §5c of the
+  roadmap asks for from Phase 5, is moot for Path B specifically: nothing in
+  Path B changed. It still fails on this Windows host for the pre-existing
+  vendored-OpenCV AKAZE reason, identically with `SEMPER_OPENCL_DISABLE=1`.
+  `FullFieldGolden.RepeatSolve_IsDeterministic` passes.
+
 ### Per-phase gate
 
 Every phase must clear all three before the next begins.
@@ -501,6 +599,21 @@ empty reason alongside an unused GPU is itself a bug.
 # GPU-side difference.
 SEMPER_OPENCL_DISABLE=1 ./build/gpu/dic_tests
 ```
+
+Path B's round structure is what decided Phase 5, and it is hardware- and
+image-dependent, so it is worth re-measuring before concluding anything about
+Path B on a new device:
+
+```bash
+# Print per-round point counts, solve times, rescue rates and iteration
+# counts for the Path B wavefront. Off by default; costs one getenv when off.
+SEMPER_PATHB_ROUNDS=1 ./build/gpu/dic_tests ClPipelineParity
+```
+
+Compare the round sizes it prints against the small-batch launch costs from
+`Perf.IcgnPathAThroughputCpuVsGpu`. A device path for Path B only makes sense
+if some round is both large enough to clear the launch floor **and** not
+dominated by simplex rescues — on the RTX 3060 no round is both.
 
 With `SEMPER_OPENCL=OFF` (the default) no OpenCL code is compiled and the
 binary carries no OpenCL symbols:
@@ -595,6 +708,7 @@ chat log.
 | 2026-09 | NVIDIA GeForce RTX 3060 Laptop | CUDA ICD | 3.0 | yes | yes | strain 0.67× at 2.2k pts → 5.32× at 37k pts | pass | Windows 11 / MinGW-w64. Phase 2. Fixed ~0.45 ms dispatch cost sets a 3600-point break-even; below it the caller stays on CPU |
 | 2026-09 | NVIDIA GeForce RTX 3060 Laptop | CUDA ICD | 3.0 | yes | yes | Hessian pre-pass 3.5× at 2.5k pts → 25.7× at 58k pts (vs serial CPU) | pass | Windows 11 / MinGW-w64. Phase 3. fp32 only, so gated on `exact_fp32`. Dispatch floor ~0.6 ms + ~2 ms per megapixel of reference image, which is why the caller's threshold is per megapixel rather than a flat point count |
 | 2026-09 | NVIDIA GeForce RTX 3060 Laptop | CUDA ICD | 3.0 | yes | yes | **Path A ICGN 1.12×–1.44× SLOWER than 20 threads; 1.00×–1.06× at 8 and 4 threads** (4.8×–12.5× vs *serial* CPU) | pass — 3 235 points, 0 mismatches | Windows 11 / MinGW-w64. Phase 4. **Throughput gate failed, so the stage ships off** (`kGpuIcgnPathAEnabled = false`). Cause is warp divergence on iteration count: one work-item per subset makes a warp run until its slowest lane converges, and ~137 of 3 470 points hit the 50-iteration cap. Remedy is round-based launches over a compacted active list |
+| 2026-09 | NVIDIA GeForce RTX 3060 Laptop | CUDA ICD | 3.0 | yes | yes | **Path B not ported** — launch-per-round projects 2.5x-5.3x slower | n/a — no kernel written | Windows 11 / MinGW-w64. Phase 5. Path B is one big round plus a long tail; round 0 is 34-47% simplex rescues, which the Phase 4 acceptance rule sends to the CPU anyway, and every later round is under 700 points against a ~14.5 ms launch floor. Re-check with `SEMPER_PATHB_ROUNDS=1` |
 |  |  |  |  |  |  |  |  |  |
 
 ---

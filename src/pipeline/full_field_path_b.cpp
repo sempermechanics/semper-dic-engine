@@ -19,7 +19,31 @@
 // longer affect the result. The same structure is what maps onto a GPU:
 // one kernel launch per round.
 //
-// See docs/DETERMINISM.md.
+// GPU Phase 5 evaluated exactly that and concluded Path B stays on the CPU.
+// The reason is visible in the round structure, which SEMPER_PATHB_ROUNDS=1
+// prints: the wavefront is one big round followed by a long tail of small
+// ones, and the big first round is expensive for the one reason the device
+// cannot help with. Measured on a 1024x1024 pair at step 5 (RTX 3060):
+//
+//   round   points   us/pt   simplex rescue   iters/pt
+//     0       1532    54.2       47.3%          22.0
+//     1        691    16.3        6.1%           6.5
+//     2        672    10.4        3.1%           6.0
+//     ...      ...     ...         ...           ...
+//
+// Round 0 is the boundary between Path A's solved region and the unsolved
+// interior, so nearly half its points fall back to the Nelder-Mead rescue --
+// and the Phase 4 device path accepts a device answer only where it would
+// NOT have tripped that rescue test, so those points would run on the CPU
+// anyway. Round 1 is 6% rescues at 16 us/pt, which puts round 0's pure-ICGN
+// share at roughly 1532 * 16us = 25 ms of its measured 83 ms; the other
+// ~58 ms is the rescue tail. Replacing that 25 ms with a launch that costs
+// 24 ms measured (Perf.IcgnPathAThroughputCpuVsGpu, batch sweep) saves
+// nothing and adds a transfer. Every later round is under 700 points,
+// essentially rescue-free, and already runs at 10-17 us/pt -- far below the
+// ~15 ms launch floor.
+//
+// See docs/GPU_ACCELERATION.md (Phase 5) and docs/DETERMINISM.md.
 
 #include "full_field_internal.hpp"
 
@@ -34,6 +58,8 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -127,6 +153,23 @@ void run_path_b(
 
     const int cores_to_use = safe_cores;
     const int cell_count = gridW * gridH;
+
+    // Opt-in round-structure diagnostic. Off by default and read once, so a
+    // production solve pays one getenv for the whole of Path B. This is the
+    // measurement GPU Phase 5 turned on, kept so the conclusion in
+    // docs/GPU_ACCELERATION.md can be re-checked on other hardware rather
+    // than taken on trust. Same env-var convention as SEMPER_OPENCL_DISABLE:
+    // exactly "1" enables it.
+    struct RoundRow {
+        int points;
+        int accepted;
+        int rescues;
+        long long iters;
+        double solve_ms;
+    };
+    const char *rounds_env = std::getenv("SEMPER_PATHB_ROUNDS");
+    const bool trace_rounds = (rounds_env != nullptr && std::strcmp(rounds_env, "1") == 0);
+    std::vector<RoundRow> round_trace;
 
     // Per-thread solver state, reused across every round so the engines are
     // not reconstructed gridW*gridH times.
@@ -281,6 +324,14 @@ void run_path_b(
         }
 
         // 3. Solve. Every guess was fixed in step 1, so this is order-free.
+        const auto round_t0 = trace_rounds
+                ? std::chrono::high_resolution_clock::now()
+                : std::chrono::high_resolution_clock::time_point();
+        long long rescues_before = 0;
+        if (trace_rounds)
+            for (int t = 0; t < cores_to_use; ++t)
+                rescues_before += workers[(size_t) t].engine.count_simplex;
+
         std::vector<Semper::AnalysisResult> results((size_t) winners.size());
         std::vector<unsigned char> accepted((size_t) winners.size(), 0);
 
@@ -317,6 +368,24 @@ void run_path_b(
             }
         }
 
+        if (trace_rounds) {
+            RoundRow row;
+            row.points = (int) winners.size();
+            row.accepted = 0;
+            row.iters = 0;
+            row.solve_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::high_resolution_clock::now() - round_t0).count();
+            long long rescues_after = 0;
+            for (int t = 0; t < cores_to_use; ++t)
+                rescues_after += workers[(size_t) t].engine.count_simplex;
+            row.rescues = (int) (rescues_after - rescues_before);
+            for (size_t wi = 0; wi < winners.size(); ++wi) {
+                row.iters += results[wi].iters;
+                if (accepted[wi]) ++row.accepted;
+            }
+            round_trace.push_back(row);
+        }
+
         if (round_threw.load(std::memory_order_relaxed)) return;
 
         // 4. Commit in winner order, so compute_order is a deterministic
@@ -341,6 +410,29 @@ void run_path_b(
         // `next` is built from `winners`, which was sorted by flat index, so
         // it is already in the order by_flat wants.
         frontier.swap(next);
+    }
+
+    if (trace_rounds) {
+        double total_ms = 0.0;
+        int total_pts = 0, total_rescue = 0;
+        for (const RoundRow &r : round_trace) {
+            total_ms += r.solve_ms;
+            total_pts += r.points;
+            total_rescue += r.rescues;
+        }
+        LOGD("Path B round structure: %d rounds, %d points, %.2f ms, %d rescues (%.1f%%)",
+             (int) round_trace.size(), total_pts, total_ms, total_rescue,
+             total_pts ? 100.0 * total_rescue / total_pts : 0.0);
+        LOGD("  round  points  accepted   solve_ms   us/pt   rescue%%  iters/pt");
+        for (size_t i = 0; i < round_trace.size(); ++i) {
+            const RoundRow &r = round_trace[i];
+            if (r.points == 0) continue;
+            LOGD("  %5d  %6d  %8d  %9.3f  %6.1f  %7.1f  %8.1f",
+                 (int) i, r.points, r.accepted, r.solve_ms,
+                 1000.0 * r.solve_ms / r.points,
+                 100.0 * r.rescues / r.points,
+                 (double) r.iters / r.points);
+        }
     }
 
     // Flush the per-thread accounting the RAII flusher used to handle.
