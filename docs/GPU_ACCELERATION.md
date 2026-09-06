@@ -51,7 +51,7 @@ run the bit-exact ICGN path and is refused for that stage.
 | **3** | Hessian pre-pass on GPU. One work-item per grid point. | **Complete** |
 | **4** | Path A ICGN on GPU. **One work-item per subset**, so the reduction keeps the canonical order rather than becoming a cross-lane tree. | **Landed, off by default** — bit-exact, but slower than the threaded CPU on the measured host; gated behind `kGpuIcgnPathAEnabled = false` |
 | **5** | Path B wavefront on GPU. Reuses the Phase 4 kernel; one launch per round. Only possible because Phase 0 made Path B round-based. | **Evaluated — stays on CPU.** The one round big enough to pay for a launch is 34-47% Nelder-Mead rescues, which the device path cannot take |
-| **6** | Image prep (gradients, optional blur). AKAZE stays on CPU — randomized RANSAC, poor return. | Pending |
+| **6** | Image prep (gradients, optional blur). AKAZE stays on CPU — randomized RANSAC, poor return. | **Kernel written and bit-exact; not wired in.** The stencil is bus-bound at 12 bytes per pixel, so the device loses at every image size with no crossover |
 
 ### Phase 0 results (measured)
 
@@ -530,6 +530,115 @@ bit-exactness problem, or a machine where the launch floor is far below
   vendored-OpenCV AKAZE reason, identically with `SEMPER_OPENCL_DISABLE=1`.
   `FullFieldGolden.RepeatSolve_IsDeterministic` passes.
 
+### Phase 6 results (measured)
+
+**The kernel exists, is bit-exact, and the engine does not call it.** Unlike
+Phase 5 there was no doubt about the arithmetic — the stencil is three adds
+and a divide — and none about whether it could be written. The throughput
+gate failed anyway, for a reason no kernel change can address, and the
+measurement below is the reason the stage is not wired into the pipeline.
+
+**What was built.** `src/gpu/kernels/image_grad.cl`, one work-item per pixel,
+and `compute_image_gradients_gpu` in `src/gpu/image_prep_dispatch.cpp`. It
+fills `Image::grad_x` and `Image::grad_y` with exactly what
+`Image::prepare_data(false)` writes — the border band included, which is
+compared too. It does **not** apply the DICe 7-tap blur: `prepare_data`'s blur
+flag is false at every call site in the engine and true only in
+`tests/unit/test_image.cpp`, so a device blur would be a kernel with no
+production caller. AKAZE seeding was not touched and is still ruled out.
+
+**The CPU reference moved first, and was gated on its own.** The gradient
+expression left `src/math/image_processor.cpp` and became
+`SEMPER_CANON_DERIV5` in `include/semper/kernels/canonical_math.h`, so the
+host and the kernel read the same parenthesisation rather than two copies of
+it. Before any kernel was written, the refactored host path was compared
+against the literal pre-refactor expression over four geometries with the
+`-10.0f` ghost-wall and `-5.0f` void sentinels stirred in: **2 630 210
+floats, 0 bit-level mismatches**.
+
+**Parity.** `ClParity` gained seven cases (`tests/unit/test_cl_image_grad.cpp`).
+The device matched the host on every float of both planes at 64×64, 128×96,
+96×128, 257×129 and 131×67 — the last two chosen so that an odd dimension and
+a prime pixel count exercise a launch that does not divide evenly into
+work-groups, and the non-square ones so that a transposed row/column stride
+cannot pass. Images at or below the 2-pixel border in one or both dimensions
+(1×1 through 64×3) come out entirely zero on both paths. Run-to-run
+reproducible.
+
+**Throughput — the gate that failed.** `Perf.ImageGradThroughputCpuVsGpu`,
+RTX 3060 Laptop, best of 20, both columns carrying the whole cost the caller
+pays:
+
+| Image | CPU | GPU | Ratio | Effective bandwidth |
+|---|---|---|---|---|
+| 256×256 (0.07 MP) | 0.098 ms | 0.521 ms | **0.19×** | 1.51 GB/s |
+| 512×512 (0.26 MP) | 0.430 ms | 1.224 ms | **0.35×** | 2.57 GB/s |
+| 1024×1024 (1.05 MP) | 1.747 ms | 3.805 ms | **0.46×** | 3.31 GB/s |
+| 2048×2048 (4.19 MP) | 7.393 ms | 12.945 ms | **0.57×** | 3.89 GB/s |
+| 4096×4096 (16.78 MP) | 30.568 ms | 51.106 ms | **0.60×** | 3.94 GB/s |
+
+The device loses at every size, and — unlike Phases 2 and 3, where a small
+grid lost and a large one won — **there is no crossover**. The ratio
+asymptotes at 0.60× and the bandwidth column says why: from 2048² to 4096²
+the pixel count quadruples and the GPU time goes up 3.95×, while effective
+bandwidth flattens at 3.94 GB/s. The stage is pure bus traffic. Twelve bytes
+cross per pixel — four up, eight back — against four float operations, an
+arithmetic intensity of 0.33 flop/byte, so essentially none of the measured
+time is the kernel. Making the kernel faster changes nothing; there is
+nothing else on the curve.
+
+Note that this ratio, unlike the Phase 3 and Phase 4 sweeps, is **not** an
+upper bound. Those compare against a serial CPU column while the engine runs
+the stage on all cores. `Image::prepare_data` carries no OpenMP pragma — the
+gradient loops really are serial in the engine — so 0.19×–0.60× is what the
+pipeline would actually see.
+
+**What would change this, and what would not.** Not a better kernel, and not
+a different launch shape. Two things would:
+
+- **A device with no bus to cross.** On an integrated GPU or a
+  unified-memory part the 12 bytes per pixel never leave host memory, and a
+  parallel stencil against a serial CPU loop is a straightforward win. The
+  sweep above is the test; re-run it before concluding anything about this
+  stage on such a host.
+- **Device residency, which is where the real number is.** The reference
+  image's gradients are computed once per reference set, but
+  `compute_hessian_pool_gpu` re-uploads `intensities`, `grad_x` and `grad_y`
+  on **every frame** — three float planes, and the measured Phase 3 dispatch
+  floor of ~0.6 ms plus ~2 ms per megapixel is almost entirely those planes.
+  Gradients produced on the device and left there would cut that upload from
+  three planes to one, saving roughly two thirds of a fixed cost that is
+  ~5 ms per frame at 1024². That is a larger number than this whole stage is
+  worth on its own, and it is the sense in which the roadmap's "keeping the
+  image resident on the device across frames matters more than the kernel
+  itself" is correct.
+
+  It was **not built**, and the obstacles are structural rather than
+  numerical. `detail::ProgramScope` holds the runtime's global mutex for its
+  whole lifetime and the mutex is not recursive, so one stage's dispatch
+  cannot invoke another stage's program; a resident buffer also has no owner
+  today, since `ReferenceCache` lives in the public `semper/pipeline.hpp`
+  and cannot hold a `cl_mem`. Both are real work with real risk to buffer
+  lifetime, and neither belongs in a commit whose subject is a stencil.
+
+**Not run, and not claimed.**
+
+- The stage is **not wired into the pipeline**. There is no caller-side
+  constant to flip, unlike Phase 4's `kGpuIcgnPathAEnabled`: Phase 4's flag
+  guards an integration that a less divergent workload could justify turning
+  on, whereas here no geometry on the curve would justify it. Wiring
+  `reference_cache.cpp` and `full_field_solver.cpp` to a path that loses
+  everywhere would be dead code pretending to be a policy.
+- Because nothing in the pipeline calls it, the full-field golden is
+  unchanged **by construction** rather than by measurement of a device path:
+  the only production code this phase touched is the host gradient loop, and
+  that was gated bit-exactly before the kernel was written. `ClPipelineParity`
+  still covers Phases 2–4 only.
+- No POCL/Linux parity run for this kernel, for the same reason as Phases 3–5:
+  no OpenCL ICD is installable in this WSL environment without an interactive
+  `sudo`. The kernel's OFF-build behaviour (`ClParity.ImageGradKernelAbsentWithoutOpenCLBuild`)
+  is covered.
+
 ### Per-phase gate
 
 Every phase must clear all three before the next begins.
@@ -648,6 +757,21 @@ Reference on the development container (4-core Xeon @ 2.1 GHz): **median
 > **max** over the median: it is the least noise-contaminated estimate of
 > true speed.
 
+Two per-stage sweeps are worth running on their own on any new device,
+because the conclusions they produced are hardware-dependent and both ended
+in a *negative* result that a different machine could overturn:
+
+```bash
+# Phase 4/5: per-batch launch cost, from 8 points upward. A Path B device
+# path needs a round that clears this floor and is not rescue-bound.
+./build/gpu/dic_tests Perf.IcgnPathAThroughputCpuVsGpu
+
+# Phase 6: the gradient stencil, with effective bus bandwidth printed. On a
+# discrete GPU this flattens at the link rate and the ratio never reaches
+# 1.0; on an integrated or unified-memory device it should not.
+./build/gpu/dic_tests Perf.ImageGradThroughputCpuVsGpu
+```
+
 ### 4b. Cross-ABI determinism — must stay byte-identical
 
 The real bit-exactness gate. Same source, two instruction sets.
@@ -709,6 +833,7 @@ chat log.
 | 2026-09 | NVIDIA GeForce RTX 3060 Laptop | CUDA ICD | 3.0 | yes | yes | Hessian pre-pass 3.5× at 2.5k pts → 25.7× at 58k pts (vs serial CPU) | pass | Windows 11 / MinGW-w64. Phase 3. fp32 only, so gated on `exact_fp32`. Dispatch floor ~0.6 ms + ~2 ms per megapixel of reference image, which is why the caller's threshold is per megapixel rather than a flat point count |
 | 2026-09 | NVIDIA GeForce RTX 3060 Laptop | CUDA ICD | 3.0 | yes | yes | **Path A ICGN 1.12×–1.44× SLOWER than 20 threads; 1.00×–1.06× at 8 and 4 threads** (4.8×–12.5× vs *serial* CPU) | pass — 3 235 points, 0 mismatches | Windows 11 / MinGW-w64. Phase 4. **Throughput gate failed, so the stage ships off** (`kGpuIcgnPathAEnabled = false`). Cause is warp divergence on iteration count: one work-item per subset makes a warp run until its slowest lane converges, and ~137 of 3 470 points hit the 50-iteration cap. Remedy is round-based launches over a compacted active list |
 | 2026-09 | NVIDIA GeForce RTX 3060 Laptop | CUDA ICD | 3.0 | yes | yes | **Path B not ported** — launch-per-round projects 2.5x-5.3x slower | n/a — no kernel written | Windows 11 / MinGW-w64. Phase 5. Path B is one big round plus a long tail; round 0 is 34-47% simplex rescues, which the Phase 4 acceptance rule sends to the CPU anyway, and every later round is under 700 points against a ~14.5 ms launch floor. Re-check with `SEMPER_PATHB_ROUNDS=1` |
+| 2026-09 | NVIDIA GeForce RTX 3060 Laptop | CUDA ICD | 3.0 | yes | yes | **image gradients 0.19x at 0.26 MP -> 0.60x at 16.8 MP, no crossover** | pass - 5 geometries + degenerate sizes, 0 mismatches | Windows 11 / MinGW-w64. Phase 6. **Throughput gate failed, so the stage is not wired into the pipeline.** Bus-bound: 12 bytes/pixel against 4 flops/pixel, effective bandwidth flat at 3.94 GB/s. Unlike Phases 3-4 the CPU column is serial in the engine too, so this ratio is not an upper bound. Re-run `Perf.ImageGradThroughputCpuVsGpu` on an integrated or unified-memory device |
 |  |  |  |  |  |  |  |  |  |
 
 ---

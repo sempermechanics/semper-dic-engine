@@ -327,11 +327,12 @@ degrades to the CPU, not that it is present.
 | `EnvDisableForcesCpuPath` | `SEMPER_OPENCL_DISABLE=1` forces the CPU path, for bisecting a suspected device-side difference |
 | `DeviceReproducesCanonicalReductionExactly` | **Device-gated.** A real OpenCL device returns bit-identical results to `semper_canon_sum_sq_diff` at n = 0…729, tail included. Skips with a printed reason rather than passing vacuously when no device is present |
 
-## Suite: `ClParity` — `unit/test_cl_strain.cpp`, `unit/test_cl_hessian.cpp`, `unit/test_cl_icgn.cpp`
+## Suite: `ClParity` — `unit/test_cl_strain.cpp`, `unit/test_cl_hessian.cpp`, `unit/test_cl_icgn.cpp`, `unit/test_cl_image_grad.cpp`
 
-One suite, one rule, three kernels: Phase 2's strain fit, Phase 3's static
-Hessian pre-pass and Phase 4's ICGN solve. All three files register into
-`ClParity`, so `dic_tests ClParity` runs the whole GPU parity gate.
+One suite, one rule, four kernels: Phase 2's strain fit, Phase 3's static
+Hessian pre-pass, Phase 4's ICGN solve and Phase 6's image gradients. All
+four files register into `ClParity`, so `dic_tests ClParity` runs the whole GPU
+parity gate.
 
 ### Phase 2 — strain VSG (`unit/test_cl_strain.cpp`)
 
@@ -423,6 +424,41 @@ honest for Phase 5, which reuses it.
 | `IcgnTiledLaunchMatchesCpuBitExactly` | **Device-gated.** A 2 209-point batch too large for the scratch budget is split into tiles, and the answer is identical to an untiled one | Tiling is a host-side memory decision; if it were observable in the result, the field would depend on the device's available memory |
 | `IcgnIsRunToRunReproducible` | **Device-gated.** Repeat dispatches of one input return identical bytes | A result depending on work-group scheduling would pass the parity tests only intermittently |
 | `IcgnKernelAbsentWithoutOpenCLBuild` | The file reduces to one case under `-DSEMPER_OPENCL=OFF` | A build-flag combination would drop the suite with no trace in the count |
+
+### Phase 6 — image gradients (`unit/test_cl_image_grad.cpp`)
+
+GPU Phase 6's parity gate: `semper_image_gradients` against the gradient half
+of `Image::prepare_data`. Four float operations per pixel, so unlike Phases
+2–4 the risk here is not the numerics — it is indexing and coverage, and the
+geometries are chosen for that. A **non-square** image, so a transposed
+row/column stride cannot pass. An image with a **prime pixel count**
+(131×67 = 8 777), so the launch cannot be assumed to divide evenly into
+work-groups. Images at or below the 2-pixel border in one or both dimensions,
+where the CPU's interior loop body never executes. The `-10.0f` ghost-wall and
+`-5.0f` void sentinels the pipeline injects, so the stencil is exercised on
+negative operands.
+
+The **border band is compared, not skipped**. The CPU zero-fills both planes
+and overwrites only the interior; the kernel writes those zeros explicitly.
+Comparing only the interior would hide a kernel that left the band as whatever
+the device allocator handed it.
+
+The stage this exercises is **not wired into the pipeline at all** — the
+throughput gate failed with no crossover at any image size, so unlike Phase 4
+there is not even a constant to flip (see the Phase 6 block in
+[GPU_ACCELERATION.md](GPU_ACCELERATION.md)). These cases drive the dispatch
+directly, which is the only thing keeping the kernel honest.
+
+| Test | Proves | Failure would mean |
+|---|---|---|
+| `ImageGradDispatchRejectsBadArguments` | A degenerate image, and one whose `intensities` is shorter than `width*height`, are refused — and refusal leaves both gradient planes **empty**, not half-filled | A caller told "false, use the CPU" would find its `Image` already modified |
+| `ImageGradDispatchHonoursEnvDisable` | `SEMPER_OPENCL_DISABLE=1` shuts this stage down too | The documented CPU-forcing escape hatch would not actually force the CPU |
+| `EmbeddedImageGradKernelIsSelfContained` | The embedded source resolves its includes, keeps `FP_CONTRACT OFF`, calls the shared `SEMPER_CANON_DERIV5`, and contains **no `double` after the kernel entry point** | Without `FP_CONTRACT OFF` the compiler fuses `8.0f * p1 + m2` into a mad and the two paths part company in the last bit on every pixel |
+| `CanonicalGradientStencilKeepsItsShape` | The expanded macro text still reads `((-(p2) + 8.0f * (p1) - 8.0f * (m1) + (m2)) / 12.0f)` | The parenthesisation *is* the contract; `(8*(p1-m1) - (p2-m2))/12` is algebraically identical and rounds differently, and this is the only test that would catch that rewrite before the golden did |
+| `ImageGradMatchesCpuBitExactly` | **Device-gated.** Five geometries — square, wide, tall, odd in both dimensions, prime pixel count — exact equality on every float of both planes, plus `intensities` left untouched and both planes sized as `prepare_data` sizes them | The kernel and the host stencil have diverged |
+| `ImageGradHandlesImagesSmallerThanTheBorder` | **Device-gated.** 1×1 through 64×3: both planes entirely zero on both paths, reached through the kernel's bounds test rather than by reading off the end of the buffer | An out-of-bounds read on a thumbnail-sized image, which no production geometry would surface |
+| `ImageGradIsRunToRunReproducible` | **Device-gated.** Repeat dispatches of one input return identical bytes | A work-item reading a neighbour it had not synchronised on; the CPU comparison would pass on whichever answer arrived first if the race were benign that run |
+| `ImageGradKernelAbsentWithoutOpenCLBuild` | The file reduces to one case under `-DSEMPER_OPENCL=OFF` | A build-flag combination would drop the suite with no trace in the count |
 
 ## Suite: `ClPipelineParity` — `integration/test_full_field_gpu_prepass.cpp`
 
@@ -703,6 +739,7 @@ on.
 | `StrainVsgThroughputCpuVsGpu` | The VSG fit on CPU and on the device, swept across five grid sizes. Compiled only under `-DSEMPER_OPENCL=ON`; prints CPU-only figures when no fp64 device is present | The printed break-even is where the size threshold in `full_field_solver_stats.cpp` comes from, so a shift here means that constant is stale — re-run this after touching the kernel or its buffer transfers |
 | `HessianPrepassThroughputCpuVsGpu` | The static Hessian pre-pass on CPU and on the device, swept across five grid sizes at a fixed image size, then the fixed dispatch cost swept across three image sizes. **The CPU column is serial** — this binary does not link OpenMP, while the pipeline pre-pass does | The two sweeps are where the *points-per-megapixel* threshold in `full_field_solver.cpp` comes from. The second one exists because the dispatch floor scales with the image, not the grid, so a flat point count would send a large image with a coarse grid to the device and lose |
 | `IcgnPathAThroughputCpuVsGpu` | The Path A ICGN solve on CPU and on the device across five grid sizes, then an **iteration-cap sweep** at a fixed 11 236 points, then a **small-batch sweep** from 8 to 2 048 points, then the fixed dispatch cost across three image sizes. **The CPU column is serial**, and the two largest grids are extrapolated from the measured flat serial rate rather than timed | The iteration-cap sweep is the diagnostic, not the headline: it separates the fixed per-point setup from the per-iteration work, and it is what identified warp divergence on iteration count as the reason Phase 4 fails its throughput gate. The small-batch sweep is what settled Phase 5: it puts the launch floor at ~14.5 ms for anything under a few hundred points, which is the number a Path B round has to beat. A change in either slope means the corresponding cost moved |
+| `ImageGradThroughputCpuVsGpu` | The image gradient stencil on CPU and on the device across five image sizes, printing effective bus bandwidth alongside the ratio. **The CPU column is serial and so is the engine's** — `Image::prepare_data` carries no OpenMP pragma — so this ratio, unlike the Hessian and ICGN rows, is not an upper bound | The bandwidth column is the point: it is flat at ~3.9 GB/s from 2048x2048 up, which is what establishes that the stage is bus-bound at 12 bytes per pixel and that no kernel change can move it. A ratio that crossed 1.0 would mean the host is no longer paying for a bus — an integrated or unified-memory device — and Phase 6 should be revisited there |
 | `PathAPipelineThroughputCpuVsGpu` | The **whole-solve wall clock** of the real `run_full_field` with and without the device, at four geometries, best of three after a warm-up, asserting both arms find the same number of valid points | This is the number the throughput gate actually turns on — every other row in this table races the device against one core. As shipped it measures Phases 2 and 3 only, because Phase 4's stage is off; the header says how to reproduce the Phase 4 table by flipping `kGpuIcgnPathAEnabled` and restricting the process affinity mask |
 
 ---

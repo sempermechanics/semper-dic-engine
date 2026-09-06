@@ -208,6 +208,43 @@ SEMPER_INLINE void semper_keys4_weights(float s, float w[4]) {
 #endif
 
 /* ---------------------------------------------------------------------
+ * IMAGE GRADIENT STENCIL
+ *
+ * The 5-point central difference Image::prepare_data applies to every
+ * interior pixel, in both x and y. Written as a macro rather than a
+ * function because the four samples come from a __global pointer in the
+ * kernel and a std::vector in the host, and this is the one piece of
+ * arithmetic small enough that an address-space duplication would cost
+ * more than it explains.
+ *
+ * The parenthesisation IS the contract. It expands to
+ *
+ *     (((-p2 + 8*p1) - 8*m1) + m2) / 12
+ *
+ * left to right, exactly as the host expression in
+ * src/math/image_processor.cpp parses. Rewriting it as
+ * (8*(p1-m1) - (p2-m2))/12 is algebraically identical and numerically
+ * is not: it changes which intermediate is rounded first. The
+ * multiplications by 8 are exact (a power of two, and the operands are
+ * bounded intensities), so the only rounding is the three adds and the
+ * divide -- and the divide is why the OpenCL build asks for
+ * -cl-fp32-correctly-rounded-divide-sqrt.
+ *
+ * All four arguments must be float. Offsets are named for their position
+ * relative to the centre pixel: m2 = idx-2, p1 = idx+1, and so on. The
+ * centre pixel itself does not appear -- a central difference does not
+ * read it.
+ * ------------------------------------------------------------------- */
+#define SEMPER_CANON_DERIV5(m2, m1, p1, p2)     ((-(p2) + 8.0f * (p1) - 8.0f * (m1) + (m2)) / 12.0f)
+
+/* Width of the band at each edge of the image where the stencil would
+ * read out of bounds. Those pixels keep the 0.0f the CPU path zero-fills
+ * them with, and the kernel writes the same zero rather than skipping
+ * them, so the two buffers agree everywhere and not merely in the
+ * interior. */
+#define SEMPER_GRAD_BORDER 2
+
+/* ---------------------------------------------------------------------
  * MATRIX INVERSES
  *
  * These replace Eigen's Matrix3d/Matrix<float,6,6> inverse() on the host

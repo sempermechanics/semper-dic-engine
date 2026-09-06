@@ -301,6 +301,89 @@ TEST_CASE(Perf, HessianPrepassThroughputCpuVsGpu) {
 
 
 // ---------------------------------------------------------------------------
+// Phase 6 throughput: the image gradient stencil, CPU vs device.
+//
+// Unlike Phases 2-4 this stage is not compute-bound and never could be. Each
+// pixel is five loads, four float operations and two stores; the kernel is
+// pure bus traffic, and the sweep below is really a measurement of the bus
+// rather than of the GPU.
+//
+// It is swept across image sizes because that is the only axis there is --
+// there is no grid, no subset and no iteration count. Both columns are the
+// whole cost the caller pays: the CPU column is the gradient half of
+// Image::prepare_data, the GPU column includes uploading the intensity plane
+// and reading both gradient planes back.
+//
+// The CPU side is serial, but so is Image::prepare_data in the engine: the
+// gradient loops carry no OpenMP pragma, so unlike the Hessian and ICGN
+// sweeps this ratio is not an upper bound -- it is what the pipeline
+// actually sees.
+// ---------------------------------------------------------------------------
+#if defined(SEMPER_OPENCL)
+#include "gpu/image_prep_dispatch.hpp"
+
+TEST_CASE(Perf, ImageGradThroughputCpuVsGpu) {
+    const int sizes[] = {256, 512, 1024, 2048, 4096};
+    const int reps = 20;
+
+    using clock = std::chrono::steady_clock;
+    const auto &c = Semper::gpu::caps();
+    const bool have_device = c.available && c.exact_fp32;
+
+    if (have_device)
+        std::printf("  Perf: image gradients on '%s'\n", c.device_name.c_str());
+    else
+        std::printf("  Perf: image gradients, CPU only -- %s\n",
+                    c.available ? "device lacks correctly-rounded fp32"
+                                : c.unavailable_reason.c_str());
+
+    double worst_case_s = 0.0;
+    for (int s : sizes) {
+        dictest::SpeckleField field(/*seed=*/23, s, s);
+        Image img = dictest::make_reference_image(field, s, s);
+        const double mp = (double) s * s / 1.0e6;
+
+        auto t0 = clock::now();
+        for (int r = 0; r < reps; ++r) img.prepare_data(false);
+        const double cpu_s =
+                std::chrono::duration<double>(clock::now() - t0).count() / reps;
+        if (cpu_s > worst_case_s) worst_case_s = cpu_s;
+
+        if (!have_device) {
+            std::printf("     %4dx%-4d (%5.2f MP): CPU %8.3f ms\n",
+                        s, s, mp, 1000.0 * cpu_s);
+            continue;
+        }
+
+        // One untimed call first: the device program is built lazily and
+        // cached, and charging this stage for a one-time compile would say
+        // nothing about steady-state throughput.
+        REQUIRE(Semper::gpu::compute_image_gradients_gpu(img));
+        t0 = clock::now();
+        for (int r = 0; r < reps; ++r)
+            REQUIRE(Semper::gpu::compute_image_gradients_gpu(img));
+        const double gpu_s =
+                std::chrono::duration<double>(clock::now() - t0).count() / reps;
+        if (gpu_s > worst_case_s) worst_case_s = gpu_s;
+
+        // 12 bytes per pixel cross the bus: 4 up, 8 back. Printing the
+        // implied bandwidth is what makes the result interpretable -- if it
+        // is already near the link rate, no kernel change can help.
+        const double gb = 12.0 * (double) s * (double) s / 1.0e9;
+        std::printf("     %4dx%-4d (%5.2f MP): CPU %8.3f ms | GPU %8.3f ms | %6.2fx"
+                    " | %5.2f GB/s effective\n",
+                    s, s, mp, 1000.0 * cpu_s, 1000.0 * gpu_s,
+                    cpu_s / (gpu_s > 0 ? gpu_s : 1.0),
+                    gb / (gpu_s > 0 ? gpu_s : 1.0));
+    }
+
+    // Smoke-level guard only -- see the header comment.
+    CHECK(worst_case_s < WALL_CLOCK_CEILING_S);
+}
+#endif // SEMPER_OPENCL
+
+
+// ---------------------------------------------------------------------------
 // Phase 4 throughput: Path A ICGN, CPU vs device.
 //
 // Same shape as the pre-pass case above, and the same caveats -- the CPU side

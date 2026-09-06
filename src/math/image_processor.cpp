@@ -39,14 +39,29 @@ namespace Semper {
             }
         }
 
+        // The border band keeps this zero; only the interior is overwritten
+        // below. The GPU kernel writes the same zeros explicitly rather than
+        // skipping those pixels, so the two buffers can be compared with ==
+        // across the whole image and not just the interior.
         grad_x.assign(width * height, 0.0f);
         grad_y.assign(width * height, 0.0f);
 
-        for (int y = 2; y < height - 2; ++y) {
-            for (int x = 2; x < width - 2; ++x) {
+        const int b = SEMPER_GRAD_BORDER;
+        for (int y = b; y < height - b; ++y) {
+            for (int x = b; x < width - b; ++x) {
                 int idx = y * width + x;
-                grad_x[idx] = (-intensities[idx+2] + 8.0f*intensities[idx+1] - 8.0f*intensities[idx-1] + intensities[idx-2]) / 12.0f;
-                grad_y[idx] = (-intensities[idx+2*width] + 8.0f*intensities[idx+width] - 8.0f*intensities[idx-width] + intensities[idx-2*width]) / 12.0f;
+                // SEMPER_CANON_DERIV5 is the same expression this line used
+                // to spell out, moved to canonical_math.h so
+                // src/gpu/kernels/image_grad.cl cannot drift from it. The
+                // arguments are the four samples in m2, m1, p1, p2 order.
+                grad_x[idx] = SEMPER_CANON_DERIV5(intensities[idx - 2],
+                                                  intensities[idx - 1],
+                                                  intensities[idx + 1],
+                                                  intensities[idx + 2]);
+                grad_y[idx] = SEMPER_CANON_DERIV5(intensities[idx - 2 * width],
+                                                  intensities[idx - width],
+                                                  intensities[idx + width],
+                                                  intensities[idx + 2 * width]);
             }
         }
     }
