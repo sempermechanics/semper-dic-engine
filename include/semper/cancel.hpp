@@ -10,6 +10,18 @@ namespace pipeline {
 constexpr int kCancelled = -99;
 
 /**
+ * Returned by run_full_field when `strain_window` is too small for `step` for
+ * the VSG plane fit to have 3 grid nodes to work with. Added in 0.3.0; before
+ * that this configuration returned 0 points and a success code, which no
+ * caller could tell apart from a genuinely empty ROI.
+ *
+ * Added rather than folded into -2 so a caller can distinguish "your ROI is
+ * wrong" from "your strain window is wrong" — they have different fixes.
+ * Existing `if (n < 0)` error handling needs no change.
+ */
+constexpr int kBadStrainWindow = -4;
+
+/**
  * A cancellation flag scoped to one solve — thread-safe, so a caller on any
  * thread can stop an in-flight run while the solver's workers poll it.
  *

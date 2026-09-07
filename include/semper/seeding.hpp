@@ -2,7 +2,6 @@
 #define SEMPER_SEEDING_HPP
 
 #include <opencv2/core.hpp>
-#include <string>
 
 namespace Semper {
 namespace seeding {
@@ -24,9 +23,6 @@ namespace seeding {
 bool phase_correlate_roi(const cv::Mat& ref, const cv::Mat& def,
                          const cv::Rect& roi, double& out_u, double& out_v,
                          double& out_response);
-
-void draw_outlined_text(cv::Mat& img, const std::string& text, cv::Point pt,
-                        double scale = 0.5);
 
 } // namespace seeding
 } // namespace Semper

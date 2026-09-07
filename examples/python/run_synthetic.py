@@ -47,7 +47,7 @@ def main() -> int:
     print(f"semper {semper.__version__} — synthetic +{dx} px X shift")
     eng = semper.Engine()
     eng.set_reference(ref)
-    res = eng.run(deformed, rect=(40, 40, 176, 176), step=20, subset=31, strain_window=5)
+    res = eng.run(deformed, rect=(40, 40, 176, 176), step=20, subset=31, strain_window=41)
 
     if res.count <= 0:
         print("FAIL: no points", file=sys.stderr)

@@ -82,6 +82,7 @@ PackedFieldResult pack_full_field_output(
 SolveSummary aggregate_thread_stats(
         const std::vector<ThreadStats>& stats_pathA,
         const std::vector<ThreadStats>& stats_pathB,
+        const std::vector<ThreadStats>& stats_anchors,
         int safe_cores) {
     SolveSummary s;
 
@@ -100,6 +101,13 @@ SolveSummary aggregate_thread_stats(
 
         s.b_simp_crash += stats_pathB[i].simplex_from_crash;
         s.b_simp_timeout += stats_pathB[i].simplex_from_timeout;
+
+        s.n_icgn += stats_anchors[i].icgn_time_ms; s.n_simp += stats_anchors[i].simplex_time_ms;
+        s.anchor_pts += stats_anchors[i].points_solved; s.total_hessian += stats_anchors[i].hessian_time_ms;
+        s.total_icgn_iters += stats_anchors[i].icgn_iters;
+        s.n_simp_calls += stats_anchors[i].simplex_calls; s.n_simp_saved += stats_anchors[i].simplex_saved; s.n_simp_dead += stats_anchors[i].simplex_dead;
+        s.n_simp_crash += stats_anchors[i].simplex_from_crash;
+        s.n_simp_timeout += stats_anchors[i].simplex_from_timeout;
     }
 
     return s;
@@ -108,10 +116,20 @@ SolveSummary aggregate_thread_stats(
 void log_profiling_summary(
         const PhaseTimings& t,
         const SolveSummary& s,
+        const MeshSeedResult& seeds,
         int valid_count) {
     LOGD("=== ⏱️ ADVANCED PERFORMANCE PROFILING ===");
     LOGD("Image Prep & Masking: %.2f ms", t.img_prep);
     LOGD("Seeding (phase+anchors): %.2f ms", t.phase_corr + t.anchors);
+    LOGD("  ↳ Phase lock: %s | Mesh coverage: %.1f%% of ROI | anchors %d/%d accepted, %d kept",
+         seeds.phase_locked ? "YES" : "NO", seeds.coverage * 100.0f,
+         seeds.accepted, seeds.attempted, seeds.solved);
+    if (s.anchor_pts > 0 || s.n_simp_calls > 0) {
+        LOGD("  ↳ Anchor ICGN Math: %.2f ms | Simplex: %.2f ms (%d pts kept as results)",
+             s.n_icgn, s.n_simp, s.anchor_pts);
+        LOGD("      ↳ %d Calls (%d Crashes, %d Timeouts) -> %d Saved, %d Dead",
+             s.n_simp_calls, s.n_simp_crash, s.n_simp_timeout, s.n_simp_saved, s.n_simp_dead);
+    }
     LOGD("Hessian Pre-pass:     %.2f ms (One-time Global Math)", t.prepass);
 
     LOGD("Delaunay Mesh Setup:  %.2f ms", t.delaunay);
@@ -136,13 +154,14 @@ void log_profiling_summary(
     LOGD("Strain Calculation:   %.2f ms", t.strain);
     LOGD("Total JNI Execution:  %.2f ms", t.total);
     LOGD("--- ENGINE MATH & HARDWARE EFFICIENCY ---");
-    LOGD("Total Points Solved:  %d (A: %d, B: %d)", valid_count, s.pathA_pts, s.pathB_pts);
+    LOGD("Total Points Solved:  %d (Anchors: %d, A: %d, B: %d)",
+         valid_count, s.anchor_pts, s.pathA_pts, s.pathB_pts);
     LOGD("Hessian Precompute:   %.2f ms (both paths)", s.total_hessian);
     LOGD("Average ICGN Speed:   %.4f iterations / point", (valid_count > 0) ? (float)s.total_icgn_iters / valid_count : 0.0f);
-    int tot_simp_calls = s.a_simp_calls + s.b_simp_calls;
-    int tot_simp_saved = s.a_simp_saved + s.b_simp_saved;
-    int tot_simp_dead = s.a_simp_dead + s.b_simp_dead;
-    LOGD("Total Simplex Rescue: %.2f ms (%d calls -> %d saved, %d dead)", (s.a_simp + s.b_simp), tot_simp_calls, tot_simp_saved, tot_simp_dead);
+    int tot_simp_calls = s.a_simp_calls + s.b_simp_calls + s.n_simp_calls;
+    int tot_simp_saved = s.a_simp_saved + s.b_simp_saved + s.n_simp_saved;
+    int tot_simp_dead = s.a_simp_dead + s.b_simp_dead + s.n_simp_dead;
+    LOGD("Total Simplex Rescue: %.2f ms (%d calls -> %d saved, %d dead)", (s.a_simp + s.b_simp + s.n_simp), tot_simp_calls, tot_simp_saved, tot_simp_dead);
     LOGD("=======================================");
 }
 
@@ -153,6 +172,8 @@ void fill_engine_metrics(
         const SolveSummary& s,
         int total_valid_points,
         int valid_count,
+        int dropped_by_post_filter,
+        const MeshSeedResult& seeds,
         MeshQuality mesh_quality) {
     float avg_iters = 0.0f;
     if (valid_count > 0) {
@@ -160,11 +181,11 @@ void fill_engine_metrics(
     }
 
     if (metrics != nullptr && metrics_len >= 16) {
-        const int tot_simp_calls = s.a_simp_calls + s.b_simp_calls;
-        const int tot_simp_saved = s.a_simp_saved + s.b_simp_saved;
-        const int tot_simp_dead = s.a_simp_dead + s.b_simp_dead;
+        const int tot_simp_calls = s.a_simp_calls + s.b_simp_calls + s.n_simp_calls;
+        const int tot_simp_saved = s.a_simp_saved + s.b_simp_saved + s.n_simp_saved;
+        const int tot_simp_dead = s.a_simp_dead + s.b_simp_dead + s.n_simp_dead;
 
-        float metrics_data[19];
+        float metrics_data[23];
 
             // 0-4: Point Counts
             metrics_data[0] = (float)total_valid_points;      // Total Attempted
@@ -205,10 +226,34 @@ void fill_engine_metrics(
             // the same s.a_simp+s.b_simp / s.a_icgn+s.b_icgn via LOGD) but never
             // reached the app before this — these two slots are the only change,
             // no solve behaviour is touched.
-            metrics_data[17] = (float)(s.a_simp + s.b_simp);  // Total simplex-rescue time (ms)
-            metrics_data[18] = (float)(s.a_icgn + s.b_icgn);  // Total ICGN time (ms) — the main solve
+            metrics_data[17] = (float)(s.a_simp + s.b_simp + s.n_simp);  // Total simplex-rescue time (ms)
+            metrics_data[18] = (float)(s.a_icgn + s.b_icgn + s.n_icgn);  // Total ICGN time (ms) — the main solve
 
-            int ncopy = (metrics_len >= 19) ? 19 : (metrics_len >= 17) ? 17 : 16;
+            // 19: points the anchor lattice solved outright. Slots 3 and 4 are
+            // Frozen as "via mesh" (Path A) and "via flood fill" (Path B), and
+            // neither describes an anchor — so the third bucket is appended
+            // rather than folded into one of them. 3 + 4 + 19 == slot 1.
+            metrics_data[19] = (float)s.anchor_pts;           // Solved via Anchor Lattice
+
+            // 20: points that converged and were then discarded because their
+            // VSG strain fit was rank-deficient. Logged since forever, never
+            // reported: a caller seeing slot 1 fall short of slots 3+4+19 had
+            // no way to tell a dropped point from one that never solved. With
+            // this slot the accounting closes exactly:
+            //   slot 3 + slot 4 + slot 19 == slot 1 + slot 20
+            metrics_data[20] = (float)dropped_by_post_filter;  // Dropped by strain post-filter
+
+            // 21/22: the two seeding health signals. The anchor lattice is a
+            // translation-only front end -- past roughly 5 degrees of rotation
+            // the phase lock fails and mesh coverage collapses (0.45 at 5 deg,
+            // 0.15 at 15 deg; docs/SEEDING_BENCHMARK.md 4.5), and without these
+            // slots that field is reported exactly like a healthy one.
+            metrics_data[21] = seeds.phase_locked ? 1.0f : 0.0f;  // Phase-correlation lock
+            metrics_data[22] = seeds.coverage;                    // Mesh hull / ROI area, 0..1
+
+            int ncopy = (metrics_len >= 23) ? 23 : (metrics_len >= 22) ? 22
+                      : (metrics_len >= 21) ? 21 : (metrics_len >= 20) ? 20
+                      : (metrics_len >= 19) ? 19 : (metrics_len >= 17) ? 17 : 16;
         for (int mi = 0; mi < ncopy; ++mi) metrics[mi] = metrics_data[mi];
     }
 }

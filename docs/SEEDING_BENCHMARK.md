@@ -252,11 +252,55 @@ Seeding in isolation is more expensive for the lattice (13.5 ms vs 2.2 ms wall,
 57.6 ms vs 5.8 ms CPU on the DICe pair). The solve returns it with interest:
 mean ICGN iterations fall from 2.56 to 2.21 there, and from 2.89 to 2.01 on
 Sample 5. Isolated seeding cost is therefore the wrong figure of merit; total
-CPU is the right one.
+CPU is the right one. (Every number in this paragraph is the original
+measurement, kept because the AKAZE column cannot be re-measured — that code is
+gone. The lattice half has since improved: 5.1.)
 
-One inefficiency is visible in the data: serial anchor seeding costs 39.2 ms of
-CPU but the 4-thread run costs 57.6 ms, so `schedule(dynamic, 4)` over ~300
-anchors has poor granularity. Worth revisiting.
+One inefficiency was visible in the data as first measured: serial anchor
+seeding cost 39.2 ms of CPU but the 4-thread run cost 57.6 ms — a 47% overhead
+— which was attributed to `schedule(dynamic, 4)` over ~300 anchors having poor
+granularity. **That was measured, and the attribution was wrong.** See 5.1.
+
+### 5.1 The anchor loop's OpenMP schedule, measured
+
+Re-run on the DICe pair after the 0.3.0 anchor-phase refactor, on Ubuntu 22.04
+/ GCC 11.4, with `SEMPER_SEEDBENCH_REPEATS=21` (medians, not single shots — one
+shot moves by ~10% here) and `taskset` fixing the core count, since
+`std::thread::hardware_concurrency()` reads the affinity mask and
+`OMP_NUM_THREADS` does not reach `num_threads(safe_cores)`. Seeding phase only:
+
+| schedule | 1 core CPU | 4 cores wall / CPU | 8 cores wall / CPU |
+|---|---|---|---|
+| `dynamic, 4` (shipping) | 27.2 ms | **11.0** / 29.7 ms | **8.8** / 33.6 ms |
+| `dynamic, 16` | 26.4 ms | 11.7 / 29.8 ms | 9.1 / 33.8 ms |
+| `static` | 26.7 ms | 12.6 / 30.5 ms | 10.0 / 32.6 ms |
+
+Run-to-run spread on the serial column across these three builds is 26.4–27.2 ms,
+so treat anything under ~3% as noise. Two things follow, and neither is what
+the paragraph above predicted:
+
+- **`schedule(static)` is worse, not better** — 14% more wall at both 4 and 8
+  cores, which is outside the noise floor, for no CPU saving. `dynamic, 16` is
+  indistinguishable from `dynamic, 4` on CPU and slightly worse on wall. The
+  shipping choice is the best of the three; **no change was made.**
+- **The 47% overhead does not reproduce.** It is now 9% at 4 cores
+  (29.7 vs 27.2) and 23% at 8. The residual is ~0.9 ms of CPU per additional
+  thread and is flat in the chunk size, which is the signature of fixed
+  per-thread cost (each thread constructs its own `OptimizationEngine` and
+  `SubsetData`, and first-touches ~100 KB of buffers) plus memory pressure —
+  not of scheduling granularity, which would move when the chunk moves.
+
+The likeliest reason the original figure was so much larger is that it predates
+the 0.3.0 refactor: the anchor loop then wrote `resultGrid` and incremented two
+atomics per accepted point *inside* the parallel region, and now writes only its
+own `anchors[idx]` slot (publishing moved behind the median test). A different
+host is the other candidate and cannot be ruled out from here — but a 47%
+overhead becoming 9% is not a machine-speed scale factor, since the serial
+column moved by only 1.4x.
+
+`OMP_WAIT_POLICY` was checked as a possible confounder and is not one: `passive`
+saves 2.7 ms of CPU at 4 cores against an explicit `active`, and the default is
+already within 0.5 ms of `passive`.
 
 ## 6. Space
 
@@ -313,6 +357,13 @@ Both reduced libraries were verified working, not merely linked:
 `qemu-aarch64-static`, in both cases with the anchor lattice accepting 121/121
 anchors and routing `FULL` through the C ABI.
 
+**No CI job runs the cross-build**, and that is deliberate rather than an
+oversight: cross-compiling the vendored OpenCV submodule for aarch64 costs
+more CI minutes than a per-commit size readout is worth. The trade is that
+the toolchain file can rot unnoticed, so the header of
+`cmake/toolchains/aarch64-linux-gnu.cmake` now says so and carries the recipe
+that produced the table above.
+
 ### 6.2 What the aarch64 measurement does not reproduce
 
 The Android NDK could not be obtained here — `dl.google.com` does not respond
@@ -360,10 +411,38 @@ number.
 - At σ=5 additive noise, convergence collapses to ~13.8% for **every** candidate.
   That is `kCorrAccept = 0.15` being too strict for noisy input, not a seeding
   problem.
-- `run_full_field` returns `0`, not an error code, when the VSG strain window is
-  too small for the step: every strain fit is rank-deficient, the sentinel fires,
-  and the post-filter drops the whole field. At step 10 a 15 px window spans one
-  grid node. A caller gets an empty field with no diagnostic.
+- ~~`run_full_field` returns `0`, not an error code, when the VSG strain window
+  is too small for the step.~~ **Fixed in 0.3.0.** Every strain fit was
+  rank-deficient, the sentinel fired, and the post-filter dropped the whole
+  field, so a caller got an empty field with no diagnostic — at step 10 a
+  15 px window spans one grid node. `run_full_field` now rejects the pair up
+  front with `SEMPER_ERR_STRAIN_WINDOW` (`-4`) and logs the smallest window
+  that would work. Pinned by `FullField.StrainWindowTooSmallForStep_IsRejected`.
+  Every in-repo call site had been on the broken side of it, including the C
+  and Python smokes, which is why nothing caught it.
+- ~~Anchor results were published inside the parallel solve loop, before the
+  universal median test ran.~~ **Fixed in 0.3.0.** A node could be a rejected
+  blunder for the mesh and an accepted output point in the field at the same
+  time, and Path B would then flood fill from it — which is exactly the
+  periodic-speckle failure the median test exists to catch. The lattice now
+  records outcomes and `publish_anchor_results` applies them afterwards. On the
+  golden fixtures every output-gated anchor also survives the median test, so
+  the recorded field did not move; the fix removes a failure mode rather than
+  correcting a number.
+- ~~A phase-correlation lock alone suppressed Path C.~~ **Fixed in 0.3.0.**
+  Phase correlation can lock on a strong global shift while every anchor fails
+  the result gate; `have_seed` was true, Path C was skipped, and Path B fell
+  through to a blind grid-centre seed that may be textureless. `have_seed` now
+  requires an actual point, the global shift is passed to Path C as its IC-GN
+  guess instead of replacing it, and a Path C failure under a lock falls
+  through to Path B rather than aborting the solve — so the change can only
+  add fallbacks, never remove one.
+- ~~The anchor stride was clamped from the shorter grid axis.~~ **Fixed in
+  0.3.0.** On a 1000×6 grid the 3-node floor for the short axis forced stride 2
+  on both, giving a lattice several times `kAnchorTarget` on a geometry — a
+  beam, a weld seam — this engine plausibly sees. The floor is now applied per
+  axis and the pair coarsened back inside the isotropic budget, which makes it
+  a no-op on square-ish ROIs.
 
 ## 9. Gate scorecard
 
@@ -385,3 +464,35 @@ level where the field result is identical across all candidates, and criterion 2
 falls short of 5× on the synthetic scenarios while clearing it on all three
 real-speckle sets. Both shortfalls are on the accuracy axis where the lattice is
 already an order of magnitude ahead everywhere else; neither indicates a cost.
+
+## 10. What of this is defended in CI (added 0.3.0)
+
+Everything above is a measurement. Until 0.3.0 none of it was a gate: every
+sweep in `tests/integration/test_seeding_bench.cpp` early-returns unless
+
+    SEMPER_RUN_SEEDBENCH=1
+
+is set, and three of them additionally need `SEMPER_DICE_REPO` pointed at an
+external checkout, so CI ran exactly one assertion-bearing case from the file.
+Four gates now run unconditionally:
+
+- `SeedBench.AnchorSeedingQualityGate` promotes three of the seven synthetic
+  scenarios — 0.4 px translation, 0.5° rotation, 12 px translation — to
+  always-on assertions: phase lock held, `MeshQuality::FULL`, coverage ≥ 0.90,
+  and vertex- and gradient-error bounds set at 3–5× the medians
+  CandidateSweep reports for those rows, each annotated in-file. Loose
+  by design: it fires when seeding stops working, not when a host is slower.
+- `FullFieldGolden` pins the whole orchestration layer — seeding, mesh,
+  Path A, Path B, strain — against a committed binary baseline, including
+  metrics slots 19–22, so a change that merely moves work between the three
+  solving paths is caught rather than averaging out.
+- `SeedBench.PublishAnchorResultsRespectsMedianTest` pins the publish gate
+  fixed in 0.3.0 (§8): an anchor reaches the field only if it cleared
+  `kCorrAccept` *and* survived the median test.
+- `SeedBench.AnchorLatticeSizing` pins the per-axis stride, including the
+  1000×6 ROI that motivated it. No fixture in this repo has that geometry, so
+  the planner is tested directly rather than through a solve.
+
+Verified by perturbing the anchor stride by one in
+`src/pipeline/full_field_anchors.cpp`: the golden reports slots 3, 8, 19 and 22
+moved and fails. See `docs/TESTING.md` for both suites.

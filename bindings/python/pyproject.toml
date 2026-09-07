@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "semper-dic"
-version = "0.2.2"                      # keep in sync with include/semper/version.hpp
+version = "0.3.0"                      # keep in sync with include/semper/version.hpp
 description = "Semper hybrid Delaunay Digital Image Correlation engine — Python bindings"
 requires-python = ">=3.9"
 dependencies = ["numpy>=1.21"]

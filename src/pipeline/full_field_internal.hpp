@@ -32,7 +32,6 @@ struct ThreadStats {
     double icgn_time_ms = 0.0;
     int icgn_iters = 0;
     double simplex_time_ms = 0.0;
-    int simplex_iters = 0;
     double hessian_time_ms = 0.0;
     double queue_wait_time_ms = 0.0;
     int points_solved = 0;
@@ -59,9 +58,7 @@ struct EngineStatFlusher {
 
     ~EngineStatFlusher() {
         bucket.icgn_time_ms += engine.time_icgn_ms;
-        //bucket.icgn_iters += engine.count_icgn;
         bucket.simplex_time_ms += engine.time_simplex_ms;
-        bucket.simplex_iters += engine.count_simplex;
         bucket.points_solved += local_points;
         bucket.hessian_time_ms += local_hessian;
         bucket.queue_wait_time_ms += local_wait;
@@ -96,14 +93,29 @@ inline constexpr bool ALLOW_SIMPLEX_RESCUE = true;
 //   0:x 1:y 2:u 3:v 4:ux 5:uy 6:vx 7:vy 8:corr 9:solved 10:thread_id
 //   11:compute_order 12:mesh_assignment_type 13:used_simplex 14:icgn_iters
 // (guess_* default to 0). Keep that order in sync with those sites.
-// PointState (see point_state.hpp) documents skip/mesh/solved semantics;
-// the hot GridPoint keeps a bool `solved` so layout/throughput stay stable.
+// How a node got its guess. Unscoped and int-typed on purpose: the value is
+// stored in GridPoint's aggregate initializers and exported verbatim to the
+// debug CSV, both of which want a plain int.
+//
+// There is no separate code for "anchor that is also a mesh vertex": the result
+// gate is tighter than the vertex gate, so every kMeshAnchor is one. kMeshAnchor
+// is written before the mesh runs and the mesh's assignment loop skips solved
+// nodes, so it is never overwritten.
+enum MeshAssign : int {
+    kMeshNone         = 0,  // nothing assigned it: Path B propagation, or never reached
+    kMeshInTriangle   = 1,
+    kMeshExtrapolated = 2,  // just outside a triangle
+    kMeshAnchor       = 3,
+};
+
+// GridPoint keeps a bare bool `solved` rather than a richer state enum so the
+// layout stays compact and the hot loops stay branch-cheap.
 struct GridPoint {
     float x = 0, y = 0, u = 0, v = 0, ux = 0, uy = 0, vx = 0, vy = 0, corr = 0;
     bool solved = false;
     int thread_id = 0;
     int compute_order = 0;
-    int mesh_assignment_type = 0;
+    int mesh_assignment_type = kMeshNone;   // one of MeshAssign
     bool used_simplex = false;
     int icgn_iters = 0;
     float guess_u = 0, guess_v = 0, guess_ux = 0, guess_uy = 0, guess_vx = 0, guess_vy = 0;
@@ -183,26 +195,72 @@ inline void record_simplex_outcome(ThreadStats &bucket, const AnalysisResult &re
 // (full_field_anchors.cpp, full_field_mesh.cpp, full_field_path_a.cpp)
 // ---------------------------------------------------------------------------
 
+// One lattice node that converged, carried out of the anchor phase rather
+// than written straight into the field.
+//
+// The anchor phase used to publish into resultGrid from inside its parallel
+// loop, which put the write BEFORE the universal median test that rejects
+// blunders: a node could be a rejected blunder for the mesh and an accepted
+// output point in the field at the same time, and Path B would then flood
+// fill from it. Returning the outcomes instead lets run_full_field apply them
+// after the median pass, which is the whole point of having a median pass.
+// It also makes compute_order deterministic, since the numbering now happens
+// in one serial loop over the lattice instead of racing between threads.
+struct AnchorResult {
+    int gx = 0, gy = 0;             // lattice node's position in the grid
+    float rx = 0, ry = 0;           // and in image pixels
+    float u = 0, v = 0, ux = 0, uy = 0, vx = 0, vy = 0;
+    float corr = 0;
+    int thread_id = 0;              // who solved it, for the debug thread map
+    int icgn_iters = 0;
+    bool used_simplex = false;
+    bool vertex = false;   // cleared kAnchorAcceptScore: a candidate vertex
+    bool output = false;   // also cleared kCorrAccept: publishable as a result
+    bool kept = false;     // and survived the median test
+};
+
 // Outcome of the anchor lattice: the mesh vertices it produced, how well they
 // cover the ROI, and the median rigid shift.
 //
-// The anchors are grid nodes, so they reuse the Hessian pool and their solved
-// results are final for those nodes — Path A skips them and Path B picks them
-// up as boundary seeds. Vertices are kept on a looser ZNSSD gate than results:
-// a seed only has to be approximately right, an output point has to be right.
+// The anchors are grid nodes, so they reuse the Hessian pool and the ones that
+// clear the strict gate are final for those nodes — Path A skips them and Path B
+// picks them up as boundary seeds. Vertices are kept on a looser ZNSSD gate
+// than results: a seed only has to be approximately right, an output point has
+// to be right. Nothing here is applied to the field until
+// publish_anchor_results runs.
 struct MeshSeedResult {
     std::vector<cv::Point2f> ref_pts;
     std::vector<cv::Point2f> def_pts;
+    // One slot per lattice node, in lattice order, so the results are
+    // independent of which thread reached which node. Nodes that were skipped
+    // or failed to converge keep the default AnchorResult, whose `output` is
+    // false -- that, not the vector length, is what publish_anchor_results
+    // filters on.
+    std::vector<AnchorResult> anchors;
     MeshQuality quality = MeshQuality::NONE;
     float globalU = 0.0f;
     float globalV = 0.0f;
     float coverage = 0.0f;
     int attempted = 0;
     int accepted = 0;      // kept as mesh vertices
-    int solved = 0;        // also good enough to keep as output points
+    int solved = 0;        // also good enough to publish as output points
     bool phase_locked = false;
 };
 
+// Per-axis sizing of the anchor lattice. Exposed rather than kept private in
+// full_field_anchors.cpp because it is pure integer arithmetic over the grid
+// dimensions and the case worth testing — a long thin ROI, a beam or a weld
+// seam — needs a very wide image to reach through an actual solve.
+struct AnchorLattice {
+    int stride_x = 1, stride_y = 1;
+    int nx = 0, ny = 0;    // lattice indices per axis, last index included
+    int count() const { return nx * ny; }
+};
+
+AnchorLattice plan_anchor_lattice(int gridW, int gridH);
+
+// Solves the lattice. Takes resultGrid as const: it reads the pre-set `solved`
+// flags to skip masked and boundary-rejected nodes, and writes nothing.
 MeshSeedResult solve_anchor_seeds(
         ReferenceCache &cache,
         const cv::Mat &defMat,
@@ -212,11 +270,20 @@ MeshSeedResult solve_anchor_seeds(
         int gridH,
         int safe_cores,
         const HessianPool &hessian_pool,
+        const ResultGrid &resultGrid,
+        std::vector<ThreadStats> &stats,
+        PhaseTimings &timings);
+
+// Applies the anchors that cleared the strict gate AND survived the median
+// test. Returns how many were published. Serial by design — compute_order
+// is assigned here, and a deterministic field is worth more than the
+// microseconds this costs.
+int publish_anchor_results(
+        const MeshSeedResult &seeds,
         std::atomic<int> &global_points_solved,
         std::atomic<int> &compute_order_counter,
         ResultGrid &resultGrid,
-        std::vector<ThreadStats> &stats,
-        PhaseTimings &timings);
+        std::vector<ThreadStats> &stats);
 
 // Per-grid-point 6-DOF initial guess produced by the Delaunay mesh.
 struct MeshGuessField {
@@ -227,8 +294,8 @@ struct MeshGuessField {
 MeshGuessField build_mesh_guess_field(
         const ReferenceCache &cache,
         const FullFieldParams &params,
-        const std::vector<cv::Point2f> &akaze_ref_pts,
-        const std::vector<cv::Point2f> &akaze_def_pts,
+        const std::vector<cv::Point2f> &seed_ref_pts,
+        const std::vector<cv::Point2f> &seed_def_pts,
         MeshQuality mesh_quality,
         float globalU,
         float globalV,
@@ -251,8 +318,8 @@ void run_path_a(
 
 void run_path_b(
         const SolveContext &ctx,
-        const std::vector<cv::Point2f> &akaze_ref_pts,
-        const std::vector<cv::Point2f> &akaze_def_pts,
+        const std::vector<cv::Point2f> &seed_ref_pts,
+        const std::vector<cv::Point2f> &seed_def_pts,
         float globalU,
         float globalV,
         int path_c_seed_x,
@@ -268,7 +335,7 @@ void run_path_b(
 // the negative error code run_full_field should return to its caller.
 int run_path_c(
         const SolveContext &ctx,
-        const std::vector<cv::Point2f> &akaze_ref_pts,
+        const std::vector<cv::Point2f> &seed_ref_pts,
         ResultGrid &resultGrid,
         int &path_c_seed_x,
         int &path_c_seed_y,
@@ -299,23 +366,31 @@ PackedFieldResult pack_full_field_output(
 
 struct SolveSummary {
     double a_icgn = 0, a_simp = 0, b_icgn = 0, b_simp = 0, b_wait = 0;
+    // The anchor lattice runs a full IC-GN phase of its own and solves grid
+    // points outright. Its bucket is aggregated with the other two: leaving it
+    // out understates every "total" below, and silently, because the points it
+    // solves still count towards valid_count.
+    double n_icgn = 0, n_simp = 0;
     int total_icgn_iters = 0;
 
     int a_simp_calls = 0, a_simp_saved = 0, a_simp_dead = 0, a_simp_crash = 0, a_simp_timeout = 0;
     int b_simp_calls = 0, b_simp_saved = 0, b_simp_dead = 0, b_simp_crash = 0, b_simp_timeout = 0;
+    int n_simp_calls = 0, n_simp_saved = 0, n_simp_dead = 0, n_simp_crash = 0, n_simp_timeout = 0;
 
     double total_hessian = 0;
-    int pathA_pts = 0, pathB_pts = 0;
+    int pathA_pts = 0, pathB_pts = 0, anchor_pts = 0;
 };
 
 SolveSummary aggregate_thread_stats(
         const std::vector<ThreadStats> &stats_pathA,
         const std::vector<ThreadStats> &stats_pathB,
+        const std::vector<ThreadStats> &stats_anchors,
         int safe_cores);
 
 void log_profiling_summary(
         const PhaseTimings &timings,
         const SolveSummary &summary,
+        const MeshSeedResult &seeds,
         int valid_count);
 
 void fill_engine_metrics(
@@ -325,6 +400,8 @@ void fill_engine_metrics(
         const SolveSummary &summary,
         int total_valid_points,
         int valid_count,
+        int dropped_by_post_filter,
+        const MeshSeedResult &seeds,
         MeshQuality mesh_quality);
 
 // ---------------------------------------------------------------------------
@@ -344,6 +421,13 @@ void export_full_field_debug_suite(
         const ResultGrid &resultGrid,
         const StrainField &strainField,
         const std::vector<AffineTriangle> &affTriangles);
+
+// Caption helper for the debug maps: black stroke under white fill so the
+// text stays legible over any colormap. Only ever called from the two debug
+// export blocks, which are skipped when debug_dir is empty. It was in the
+// public seeding header until 0.3.0; it draws text, it does not seed.
+void draw_outlined_text(cv::Mat &img, const std::string &text, cv::Point pt,
+                        double scale = 0.5);
 
 } // namespace internal
 } // namespace pipeline

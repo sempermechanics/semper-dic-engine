@@ -457,6 +457,14 @@ the anchors coincide with grid nodes they reuse the pooled Hessians of §6, and 
 node whose ZNSSD clears the result gate is retained as a **final** measurement
 rather than being re-solved.
 
+The two axes then part company. An axis carrying fewer than three lattice
+indices leaves the mesh with no interior edge along it, so each axis relaxes
+its own stride until it holds at least three; the pair is then coarsened again
+until the product is back within the budget $s$ implied, so a long thin ROI
+(a beam, a weld seam) keeps its short-axis floor without paying for it with a
+lattice several times $N_{\text{target}}$. On a square ROI both axes keep $s$
+and nothing moves.
+
 Two thresholds apply, because a seed and a result are held to different
 standards:
 
@@ -464,6 +472,14 @@ standards:
 |---|---|
 | mesh vertex | $C_{\text{ZNSSD}} \le k_{\text{AnchorAcceptScore}}$ (loose — the median test rejects blunders) |
 | output point | $C_{\text{ZNSSD}} \le k_{\text{CorrAccept}}$ (the same bar Path A applies) |
+
+Neither gate publishes on its own. Both are recorded during the lattice solve
+and applied only after the median test of §8.3 has run over the whole
+lattice, so a node that clears the result gate but fails the median test is
+dropped from the field as well as from the mesh. The classic periodic-speckle
+blunder is exactly that combination: a confident ZNSSD on the wrong speckle
+blob, whose displacement disagrees with its neighbours. Publishing it would
+also hand Path B a boundary seed to flood fill from.
 
 ### 8.3 Outlier Rejection — Universal Median Test
 
@@ -476,6 +492,8 @@ in preference to a global homography or affine fit because a deforming specimen
 does not have an affine displacement field — a global model rejects signal, not
 just blunders — whereas the median test assumes no field shape at all. The
 lattice makes the neighbourhood lookup $O(1)$.
+
+A rejected anchor is neither a mesh vertex nor an output point.
 
 ### 8.4 Mesh Guess Field
 

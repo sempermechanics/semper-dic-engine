@@ -100,7 +100,7 @@ set(DIC_PIPELINE_SOURCES
         ${NATIVE_ROOT}/src/pipeline/full_field_solver_stats.cpp
         ${NATIVE_ROOT}/src/pipeline/full_field_debug_export.cpp
         ${NATIVE_ROOT}/src/pipeline/reference_cache.cpp
-        ${NATIVE_ROOT}/src/seeding/anchor_seed.cpp
+        ${NATIVE_ROOT}/src/pipeline/phase_correlate.cpp
 )
 
 # OpenCV-gated tests. test_image_codec / test_reference_cache exercise the image
@@ -109,6 +109,7 @@ set(DIC_PIPELINE_SOURCES
 # always-on DIC_UNIT_TESTS / DIC_INTEGRATION_TESTS lists.
 set(DIC_PIPELINE_TESTS
         integration/test_full_field_contracts.cpp
+        integration/test_full_field_golden.cpp
         integration/test_seeding_bench.cpp
         unit/test_image_codec.cpp
         integration/test_reference_cache.cpp

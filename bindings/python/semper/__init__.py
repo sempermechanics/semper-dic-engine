@@ -9,7 +9,7 @@ Example
 >>> eng = semper.Engine()
 >>> eng.set_reference(ref_u8)                     # 2-D uint8 array or encoded bytes
 >>> res = eng.run(def_u8, rect=(0, 0, 512, 512),
-...               step=10, subset=21, strain_window=5)
+...               step=10, subset=21, strain_window=21)
 >>> res.points.shape          # (N, 8): x, y, u, v, exx, eyy, exy, corr
 (2401, 8)
 """
@@ -28,6 +28,7 @@ __all__ = [
     "DicError",
     "ERR_ROI",
     "ERR_INIT",
+    "ERR_STRAIN_WINDOW",
     "ERR_CANCELLED",
     "__version__",
 ]
@@ -35,11 +36,13 @@ __all__ = [
 # Frozen error codes (see the contract doc). >= 0 is a valid point count.
 ERR_ROI = -2
 ERR_INIT = -3
+ERR_STRAIN_WINDOW = -4
 ERR_CANCELLED = -99
 
 _MESSAGES = {
     ERR_ROI: "invalid ROI",
     ERR_INIT: "init/argument failure (was set_reference called?)",
+    ERR_STRAIN_WINDOW: "strain_window too small for step (need >= 2 * step)",
     ERR_CANCELLED: "cancelled",
 }
 
@@ -57,7 +60,7 @@ class Result:
     """One solve's output.
 
     ``points`` is an ``(N, 8)`` float32 array with columns
-    ``[x, y, u, v, exx, eyy, exy, corr]``; ``metrics`` is the ``(17,)`` telemetry.
+    ``[x, y, u, v, exx, eyy, exy, corr]``; ``metrics`` is the ``(23,)`` telemetry.
     """
 
     count: int

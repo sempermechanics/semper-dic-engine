@@ -27,7 +27,7 @@ usual. Respect the surface described here, and declare your change's
 | **Frozen** | Binary/data formats: output packing, metrics layout, error codes, and the *meaning* of existing `FullFieldParams` fields | Never change in place. A change here is a **major** version bump and requires a coordinated change in the downstream app. |
 | **Stable** | Public function **signatures** in `include/semper/{pipeline,io,cancel,version}.hpp` and `include/semper/semper_c.h` | May be **extended additively** (new overloads / new functions). Existing signatures, parameter order, defaults, and semantics must not change without a **major** bump. |
 | **Additive-only** | Deliberate growth points: trailing `FullFieldParams` fields, unused metrics slots | Append only, each with a default that reproduces prior behavior. Never reorder or repurpose an existing entry. |
-| **Internal** | Everything in `src/`, `tuning.hpp` constants, `PointState`, `types.hpp`, algorithm internals, private headers | Change freely. Behavior is guarded by the golden test, not by this contract. |
+| **Internal** | Everything in `src/`, `tuning.hpp` constants, `types.hpp`, `seeding.hpp`, algorithm internals, private headers. Living under `include/semper/` does **not** make a header Stable — only the four named above and `semper_c.h` are. | Change freely. Behavior is guarded by the golden test, not by this contract. |
 
 **Semantic versioning** (`include/semper/version.hpp` / `SEMPER_VERSION`):
 
@@ -77,7 +77,7 @@ int run_full_field(..., CancelToken& token, ProgressCallback on_progress = nullp
   [A.4](#a4-frozen-data-formats)). Points beyond capacity are **dropped, never
   overflow**.
 - **Metrics** *(Frozen layout)*: when `metrics != nullptr && metrics_len >= 16`,
-  fill telemetry; 17 slots preferred. Slot indices are frozen.
+  fill telemetry; 23 slots preferred. Slot indices are frozen.
 - **Cancellation**: the legacy overload clears the process-global cancel flag on
   entry and polls it inside point loops. The `CancelToken&` overload binds that
   token for the duration of the solve.
@@ -189,10 +189,12 @@ index:  0   1   2   3     4     5     6      7
 field:  x   y   u   v    exx   eyy   exy   corr
 ```
 
-### Metrics buffer — **17 × `float32`**
+### Metrics buffer — **23 × `float32`**
 
 Slot indices are Frozen; new telemetry appends. `metrics_len == 16` is the
-minimum honored; 17 preferred.
+minimum honored; **23 preferred**. The writer copies the largest prefix the
+caller's buffer can hold (16, 17, 19, 20, 21, 22 or 23 slots), so an existing
+caller that still passes 17 keeps working unchanged.
 
 **Slot 10 semantic change (v0.2.2).** The index, type and layout are unchanged
 and remain Frozen. Its *meaning* changed from "AKAZE + RANSAC time (ms)" to
@@ -201,13 +203,80 @@ descriptor seeding front-end was replaced. Callers that display this value
 should relabel it; nothing about the buffer's shape moved. Slot 16 keeps
 `2 = full mesh / 1 = sparse mesh / 0 = Path C fallback`.
 
+**Slots 3 and 4 narrowed (v0.3.0).** Their labels — "Solved via Mesh" (Path A)
+and "Solved via Flood Fill" (Path B) — are unchanged and still Frozen, but they
+no longer account for every solved point. The anchor lattice introduced in
+v0.2.2 is a third solving path, and from v0.2.2 to v0.3.0 the points it solved
+reached slot 1 ("Total Solved") without appearing in slot 3 or slot 4. Rather
+than repurpose either Frozen slot, v0.3.0 **appends** the missing terms:
+
+| Slot | Meaning | Added |
+|---|---|---|
+| 17 | Total simplex-rescue time (ms), all paths | v0.2.2 |
+| 18 | Total IC-GN time (ms), all paths | v0.2.2 |
+| 19 | Solved via the anchor lattice | v0.3.0 |
+| 20 | Converged, then discarded by the VSG strain post-filter | v0.3.0 |
+| 21 | Phase-correlation lock: `1` = locked, `0` = no lock | v0.3.0 |
+| 22 | Mesh coverage: convex hull of the accepted anchors / ROI area, `0..1` | v0.3.0 |
+
+With slot 19 and slot 20 present the point accounting closes exactly, as
+long as the output buffer was large enough to hold the whole field:
+
+```
+metrics[3] + metrics[4] + metrics[19] == metrics[1] + metrics[20]
+```
+
+That is, every point some path solved is either in the output buffer or was
+dropped by the strain post-filter. Slot 20 was previously invisible: a caller
+seeing slot 1 fall short of slots 3 + 4 had no way to distinguish a point that
+never converged from one that converged and was then discarded because its
+strain fit was rank-deficient.
+`FullField.MetricsPointCountsAccountForEverySolvedPoint` asserts the identity
+above.
+
+**The identity does not survive truncation, by design.** Under the capacity
+rule (§A.2) packing stops as soon as the next point would not fit, and the
+points never reached were already counted by their solving path into slots 3,
+4 and 19 while landing in neither slot 1 nor slot 20 — so the left side
+exceeds the right by exactly the number left unpacked. The caller's test for
+that case is `(metrics[1] + 1) * 8 > output_capacity`, i.e. the buffer had no
+room for one more point; the identity is only guaranteed when that is false.
+`FullField.MetricsPointCountsAccountForEverySolvedPoint` passes a full-size
+buffer for that reason.
+
+**Slots 21 and 22 are the seeding health signals.** The anchor lattice estimates
+translation only, so past roughly 5° of rotation the phase lock fails and mesh
+coverage collapses — 0.45 at 5° and 0.15 at 15° against the old descriptor
+front-end's 0.96 (`docs/SEEDING_BENCHMARK.md` §4.5). Both numbers were already
+computed inside the seeder and then discarded, so a field solved off a
+15%-coverage mesh was reported exactly like a healthy one. Treat a `0` in slot
+21, or a slot 22 below roughly 0.5, as "these displacements are probably fine
+near the anchors and unreliable away from them" rather than as an error.
+
+Slots 17 and 18 also changed value in v0.3.0 without changing meaning: the
+anchor lattice runs a full IC-GN phase of its own, and its time was being
+dropped on the floor rather than added to these totals. Slot 8 ("Mean ICGN
+Iterations") was understated for the same reason — it divided a sum that
+excluded the anchor phase by a count that included it.
+
 ### Return / error codes — Frozen
+
+Existing values never change. `-4` was **appended** in v0.3.0, which is an
+additive (minor) change: callers that branch on `n < 0` need no edit, and no
+previously-returned value moved. What did change is the *behaviour* of one
+input: a `strain_window` too small for `step` used to return `0` points with a
+success code — the VSG plane fit needs 3 grid nodes inside the window, and
+below that every point is discarded by the strain post-filter no matter how
+well it correlated. The rule is `strain_window >= 2 * step`
+(`StrainCalculator::vsg_window_node_count` is the exact test). Every example
+and smoke test in this repo was on the wrong side of it before v0.3.0.
 
 | Value | Meaning |
 |---|---|
 | `>= 0` | number of valid output points |
 | `-2` | invalid ROI |
 | `-3` | init / argument failure |
+| `-4` | `strain_window` too small for `step` (**added v0.3.0**) |
 | `-99` (`kCancelled`) | cancelled mid-solve |
 
 ---
@@ -215,7 +284,9 @@ should relabel it; nothing about the buffer's shape moved. Slot 16 keeps
 ## A.5 Change checklist
 
 - **Free to change (patch):** correlation math, ICGN, seeding, SIMD, threading,
-  `tuning.hpp`, anything under `src/` — golden test must still pass.
+  `tuning.hpp`, anything under `src/` — golden test must still pass. Note that
+  `GoldenCorpus` covers the engine, not `run_full_field`; a seeding change can
+  move the full field without moving that golden. See docs/TESTING.md.
 - **Additive only (minor):** trailing `FullFieldParams` field, new metrics slot,
   new overload/function, new SDK entry point.
 - **Do not without major + app coordination:** change any §A.2 signature; change

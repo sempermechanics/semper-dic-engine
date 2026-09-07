@@ -1,16 +1,9 @@
-// Anchor-lattice seeding — a seeder with no detector and no descriptor.
+// L0 of anchor-lattice seeding: the global rigid shift, from every pixel in
+// the ROI rather than from the median of sparse keypoint matches.
 //
-// Two layers:
-//   L0  cv::phaseCorrelate over the ROI gives the global rigid shift from every
-//       pixel, rather than from the median of sparse keypoint matches.
-//   L1  a regular lattice of ROI grid nodes is solved with the engine's own
-//       IC-GN, seeded from L0. The converged nodes become the Delaunay vertices.
-//
-// The point of the lattice is the guess *gradients*. build_mesh_guess_field
-// derives (ux, uy, vx, vy) from cv::getAffineTransform over triangle vertices,
-// so a vertex position error e over a triangle edge of length L produces a
-// gradient error of order e/L. Keypoints give e ~ 1 px on short, clustered
-// edges; IC-GN anchors give e ~ 0.01 px on edges fixed at stride * step.
+// The L0/L1 design is documented at the top of full_field_anchors.cpp, which is
+// this function's only caller, and the evidence for it in
+// docs/SEEDING_BENCHMARK.md.
 
 #include <semper/seeding.hpp>
 #include <semper/tuning.hpp>
@@ -18,15 +11,9 @@
 #include <opencv2/imgproc.hpp>
 
 #include <cmath>
-#include <string>
 
 namespace Semper {
 namespace seeding {
-
-void draw_outlined_text(cv::Mat &img, const std::string &text, cv::Point pt, double scale) {
-    cv::putText(img, text, pt, cv::FONT_HERSHEY_SIMPLEX, scale, cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
-    cv::putText(img, text, pt, cv::FONT_HERSHEY_SIMPLEX, scale, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
-}
 
 bool phase_correlate_roi(const cv::Mat &ref, const cv::Mat &def,
                          const cv::Rect &roi, double &out_u, double &out_v,
@@ -56,7 +43,6 @@ bool phase_correlate_roi(const cv::Mat &ref, const cv::Mat &def,
     out_v = shift.y;
     return true;
 }
-
 
 } // namespace seeding
 } // namespace Semper

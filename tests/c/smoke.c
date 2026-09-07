@@ -125,7 +125,9 @@ int main(void) {
     params.rect_h = 176;
     params.step = 16;
     params.subset_size = 31;
-    params.strain_window = 5;
+    /* >= 2 * step: below that the VSG plane fit has one grid node and
+       semper_run returns SEMPER_ERR_STRAIN_WINDOW. */
+    params.strain_window = 33;
     params.use_6x6_interpolator = 0;
 
     float out[SEMPER_FLOATS_PER_POINT * MAX_PTS];

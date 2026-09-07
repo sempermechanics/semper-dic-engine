@@ -6,6 +6,21 @@
 
 namespace Semper {
 
+    int StrainCalculator::vsg_window_node_count(int step, int window_pixels) {
+        if (step <= 0) return 0;
+        const float radius = window_pixels / 2.0f;
+        const int grid_rad = (int)std::ceil(radius / (float)step);
+        const double d_radius_sq = (double)(radius * radius) + tuning::kVsgRadiusTiny;
+        int count = 0;
+        for (int dy = -grid_rad; dy <= grid_rad; ++dy) {
+            for (int dx = -grid_rad; dx <= grid_rad; ++dx) {
+                const double px = (double)(dx * step), py = (double)(dy * step);
+                if (px * px + py * py <= d_radius_sq) count++;
+            }
+        }
+        return count;
+    }
+
     StrainField StrainCalculator::compute_vsg_strain(const DisplacementField& disp, int window_pixels) {
         StrainField strain;
         int total_pts = disp.width * disp.height;
@@ -27,20 +42,13 @@ namespace Semper {
         // === 🚀 100% STRICT RULE: CALCULATE PERFECT CIRCLE ===
         // Before we process any pixels, calculate EXACTLY how many points
         // belong in a 100% mathematically full circular window.
-        const double tiny = tuning::kVsgRadiusTiny;
-        double d_radius_sq = static_cast<double>(radius_sq) + tiny;
-        int expected_full_window_pts = 0;
-
-        for (int dy = -grid_rad; dy <= grid_rad; ++dy) {
-            for (int dx = -grid_rad; dx <= grid_rad; ++dx) {
-                double d_phys_dx = static_cast<double>(dx * disp.step);
-                double d_phys_dy = static_cast<double>(dy * disp.step);
-                if ((d_phys_dx * d_phys_dx + d_phys_dy * d_phys_dy) <= d_radius_sq) {
-                    expected_full_window_pts++;
-                }
-            }
-        }
+        const int expected_full_window_pts =
+                vsg_window_node_count(disp.step, window_pixels);
         // =====================================================
+
+        // 🚀 DICe PARITY: Floating-point truncation buffer (tiny)
+        const double tiny = tuning::kVsgRadiusTiny;
+        const double d_radius_sq = static_cast<double>(radius_sq) + tiny;
 
         for (int y = 0; y < disp.height; ++y) {
             for (int x = 0; x < disp.width; ++x) {
@@ -52,10 +60,6 @@ namespace Semper {
                 Eigen::Vector3d AtU = Eigen::Vector3d::Zero();
                 Eigen::Vector3d AtV = Eigen::Vector3d::Zero();
                 int valid_pts = 0;
-
-                // 🚀 DICe PARITY: Floating-point truncation buffer (tiny)
-                const double tiny = tuning::kVsgRadiusTiny;
-                double d_radius_sq = static_cast<double>(radius_sq) + tiny;
 
                 for (int dy = -grid_rad; dy <= grid_rad; ++dy) {
                     for (int dx = -grid_rad; dx <= grid_rad; ++dx) {

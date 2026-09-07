@@ -23,7 +23,23 @@ cmake -S tests -B build/asan -DCMAKE_BUILD_TYPE=Release \
 cmake --build build/asan -j"$(nproc)" && ./build/asan/dic_tests
 ```
 
-Clean: 89/89, exit 0, zero findings.
+Clean: **97/97, exit 0, zero findings** (re-run on Ubuntu 22.04, GCC 11.4,
+`ASAN_OPTIONS=detect_leaks=1`, `UBSAN_OPTIONS=print_stacktrace=1`). Three of
+those 97 are the numeric goldens, which skip themselves under
+`SEMPER_SANITIZER_BUILD` and pass without comparing anything.
+
+`cmake -S tests` needs `libopencv-dev` installed. Without it, configure from the
+repo root instead and the vendored OpenCV submodule is built and picked up
+automatically — same sanitizer flags, since `dic_tests` compiles the engine
+sources directly into the test binary rather than linking a separately built
+library:
+
+```bash
+cmake -S . -B build/asan -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DSEMPER_BUILD_TESTS=ON -DDIC_REQUIRE_OPENCV=ON \
+      -DDIC_SANITIZER=address,undefined
+cmake --build build/asan -j"$(nproc)" && ./build/asan/bin/dic_tests
+```
 
 ### TSan — Clang, libomp and Archer (not GCC)
 
@@ -52,7 +68,11 @@ TSAN_OPTIONS=ignore_noninstrumented_modules=1 \
   ./build/tsan/dic_tests
 ```
 
-**Result: 0 warnings, exit 0, 89/89.** `ignore_noninstrumented_modules=1` is
+**Result: 97/97, exit 0, zero ThreadSanitizer warnings** (Ubuntu 22.04,
+clang 18.1.8, `OMP_NUM_THREADS=4`). Three of the 97 are the numeric goldens,
+which skip themselves under `SEMPER_SANITIZER_BUILD`. This run covers the
+0.3.0 anchor-phase refactor, which changed what the parallel region writes.
+`ignore_noninstrumented_modules=1` is
 needed for one libomp-internal report — its lazy lock-pool initialisation, where
 both accesses are inside the uninstrumented runtime with no engine frames on
 either stack.
@@ -65,6 +85,47 @@ either stack.
 The engine has no data races; the earlier count was entirely a property of the
 toolchain. Do not re-enable a GCC TSan job — it will be red and the redness will
 mean nothing.
+
+**Check that Archer actually registered.** Set `OMP_TOOL_VERBOSE_INIT=stdout`
+and require the line `Tool was started and is using the OMPT interface.`
+Anything else — `Found but not using the OMPT interface.`, or
+`Archer detected OpenMP application without TSan` — means the run is the GCC
+row of the table above wearing a Clang badge. A failed registration shows up
+as hundreds of reports rather than as an error message, so the symptom you see
+is "TSan found races" and the cause is that the tool never loaded.
+
+**Without root, and under WSL.** Two obstacles, both worth writing down
+because neither is obvious from the failure:
+
+- CI's packages (`clang-18 libomp-18-dev libclang-rt-18-dev`, with
+  `/usr/lib/llvm-18/lib/libarcher.so`) are the supported path. Jammy has no
+  clang-18 without adding the LLVM apt repo, and its **clang-14** `libarcher.so`
+  would not register for us (`Found but not using the OMPT interface`, with or
+  without `-rdynamic`, and with `RunningOnValgrind` exported `T`). The upstream
+  LLVM release tarball
+  (`clang+llvm-18.1.8-x86_64-linux-gnu-ubuntu-18.04.tar.xz`) registers first
+  try, needs no root, and matches the compiler CI uses. Point
+  `CMAKE_C_COMPILER`/`CMAKE_CXX_COMPILER` and `OMP_TOOL_LIBRARIES` at it. That
+  build wants `libtinfo.so.5`, which jammy does not ship; the `libtinfo5` deb
+  unpacked with `dpkg -x` onto `LD_LIBRARY_PATH` is enough, and symlinking
+  `libtinfo.so.6` is *not* (versioned symbols).
+- TSan's shadow mapping collides with WSL's ASLR layout and the process dies
+  before `main`. Run it as `setarch "$(uname -m)" -R <exe>`.
+
+### Windows: run the tests with the right MinGW runtime first
+
+Git for Windows ships its own `libstdc++-6.dll` under its own
+`mingw64\bin`, and Git Bash puts that directory on `PATH`. A `dic_tests.exe`
+built with a different MinGW-w64 (a UCRT WinLibs toolchain, say) then loads
+*that* libstdc++ and crashes — for us, reproducibly inside
+`ImageCodec.EncodedPng_RoundTripsExactly`, with the fault landing in
+`cv::WebPDecoder::WebPDecoder()` constructing a `std::string`. It looks
+exactly like a broken image codec and is not: the same binary passes 97/97
+once the build toolchain's `mingw64/bin` is ahead of Git's on `PATH`.
+
+So: prepend your toolchain's `mingw64/bin`, and add
+`build/<dir>/adapters/c` as well for the C SDK binaries, which look for
+`libsemper_c.dll` there rather than beside the executable.
 
 ### The guarantee that does not need a sanitizer
 
@@ -367,18 +428,160 @@ Compile-time `static_assert`s pin `ReferenceCache` as non-copyable/non-movable
 ## Suite: `FullField` — `integration/test_full_field_contracts.cpp`
 
 Host characterization of `run_full_field` — the Frozen return codes, the
-capacity-drop rule, and the 17-float metrics layout — without depending on solve
+capacity-drop rule, and the 23-float metrics layout — without depending on solve
 quality. OpenCV-gated.
 
 | Test | Proves | Failure would mean |
 |---|---|---|
 | `DegenerateRoi_ReturnsRoiError` | `rect_w < step` → `-2` | ROI validation regressed |
 | `EmptyDeformed_ReturnsInitError` | Empty deformed image → `-3` | Init-guard regressed |
+| `StrainWindowTooSmallForStep_IsRejected` | A `strain_window` spanning fewer than 3 grid nodes → `-4`, with the corrective value logged | The VSG plane fit is rank-deficient at every point, the strain post-filter discards the whole field, and the caller gets zero points and a success code — the silent-empty-field defect |
 | `StaleCancelDoesNotAbortNextSolve` | A leftover cancel is cleared on entry | A prior cancel poisons the next solve |
 | `UndersizedBuffer_TruncatesWithoutOverflow` | Small `out_capacity` drops points, never overflows, returns `≤ capacity/8` | Buffer overflow on a caller-sized buffer |
 | `MetricsLayout_Contract` | attempted ≥ solved ≥ 0; `rejected == attempted − solved`; convergence % ∈ [0,100]; seed flag ∈ {0,1,2} | A downstream telemetry reader mis-parses the Frozen slots |
 | `MetricsLen16_LeavesSlot16Untouched` | `metrics_len == 16` fills 0..15 and never writes slot 16 | Write past a 16-float caller buffer |
 | `NullMetrics_DoesNotCrash` | `metrics == nullptr` is legal | Null-deref when a caller wants points only |
+| `MetricsPointCountsAccountForEverySolvedPoint` | `metrics[3] + metrics[4] + metrics[19] == metrics[1] + metrics[20]`, anchors > 0, mean ICGN iters ≥ 1, slot 18 > 0 | A solving path or a post-filter drop stops being counted — the failure mode that hid the anchor lattice from slots 3/4 and the strain post-filter from everything |
+
+## Suite: `GoldenCorpus` — `integration/test_golden_corpus.cpp`
+
+Relative equivalence for the **subset** solver: an 18×18 grid over two
+scenarios (pure translation and affine) is solved with `INIT_NO_SIMPLEX` from a
+zero guess, once per interpolator. 578 of the 648 nodes survive
+`precompute_subset` and are recorded; they are compared against
+`tests/fixtures/golden_corpus.bin.bicubic` and `.keys6x6`.
+
+| Test | Proves | Failure would mean |
+|---|---|---|
+| `CaptureOrCompare_4x4Bicubic` | Every point's convergence status and converged u/v/strains match the capture | The bicubic path moved |
+| `CaptureOrCompare_6x6Keys` | The same for the Keys 4th-order path | The 6×6 path moved |
+
+**The fixtures are captured on Ubuntu GCC Release** (`244231e`), and host tests
+build with `-ffast-math`, so bit-exact reproduction is not on offer even for an
+identical binary rerun. Values get tolerances (`1e-2` px, `1e-3` strain). Status
+gets one specific, bounded excuse:
+
+`solve_icgn` returns status 1 for two unrelated things. A **hard reject** —
+the 90%-valid-pixel guard, the deactivation check, the minimum-gradient check
+— returns the sentinel score `2.0f`. **Exhausting the iteration budget**
+returns the real final ZNSSD. A point still creeping when the budget runs out
+lands on either side of `delta_p.norm() < 0.001f` on last-bit arithmetic alone,
+so it reports "budget exhausted" on one host and "converged" on another while
+producing the same answer. Both hosts measured show it: Ubuntu GCC 11.4 flips
+`(368,192)` and `(170,434)` in *opposite* directions, Windows MinGW flips
+`(258,126)`, and every one of those agrees with the fixture on all six values.
+
+A flip is excused only when **neither side carries the reject sentinel and all
+six values still agree**. What is then gated is not the count but the
+**imbalance**, `flips_to_exhausted − flips_to_converged`:
+
+> Host arithmetic pushes a point across `delta_p.norm() < 1e-3` in whichever
+> direction its last bits fall, so it flips both ways with no bias. A shrunken
+> iteration budget can only ever move a point from converged to exhausted.
+> The signed difference separates the two; the raw count does not.
+
+| configuration | 4×4 flips (net) | 6×6 flips (net) |
+|---|---|---|
+| Ubuntu GCC 11.4 | 0 (0) | 2 (0) |
+| Windows MinGW GCC | 0 (0) | 1 (+1) |
+| Ubuntu, `kIcgnMaxIter` − 2 | 2 (+2) | 3 (+3) |
+| Windows, `kIcgnMaxIter` − 2 | 2 (+2) | 4 (+4) |
+| either host, `kIcgnMaxIter` − 8 | 3 hard mismatches | 6 hard mismatches |
+
+`MAX_FLIP_IMBALANCE` is 2 — one clear of the worst clean host, and still
+failing the −2 perturbation through the 6×6 case on both. A raw cap
+cannot do both jobs: Ubuntu already sits at 2 clean and goes to 3 perturbed.
+`MAX_SLOW_CONVERGENCE_FLIPS` (6) remains as a backstop against churn in both
+directions at once. Every perturbed flip measured was `0 -> 1`, on both hosts.
+
+Sanitizer and coverage builds skip this suite — instrumentation and `-O0`
+change which subsets initialize.
+
+```bash
+# recapture both fixtures, on Ubuntu GCC Release only
+SEMPER_GOLDEN_CAPTURE=1 ./build/full/bin/dic_tests GoldenCorpus
+```
+
+## Suite: `FullFieldGolden` — `integration/test_full_field_golden.cpp`
+
+`GoldenCorpus` pins the **subset** solver; it calls `precompute_subset` /
+`calculate_deformation` directly and never enters `run_full_field`. This suite
+pins the **orchestration layer** — anchor-lattice seeding, the Delaunay mesh
+guess field, Path A, Path B's propagation order, and the strain stage —
+against a committed binary baseline, `tests/fixtures/full_field_golden.bin`.
+
+| Test | Proves | Failure would mean |
+|---|---|---|
+| `CaptureOrCompare` | Two synthetic scenarios (translate, affine) reproduce the recorded point count, the recorded counting metrics exactly, and every point value within a portable tolerance | Any stage of the pipeline changed its output — intended or not |
+| `RepeatSolve_IsDeterministic` | Five solves of the same field agree bit-for-bit | A data race or an order-dependent reduction entered the parallel region |
+
+Fourteen metrics slots are recorded alongside the field: `0..8`, `16`, and this
+branch's `19..22` (anchor points, post-filter drops, phase lock, mesh coverage).
+The timing slots (`9..14`, `17`, `18`) are excluded — they differ every run by
+construction. Twelve of the fourteen are integer counts or a 0/1 flag and are
+compared **exactly**; that exactness is what makes this suite a gate. The two
+exceptions are averages: slot 8 (mean IC-GN iterations) gets `0.1` and slot 22
+(mesh coverage, a convex-hull area ratio) gets `1e-4`.
+
+**Point values carry toolchain-portable tolerances**, not bit-tight ones:
+`5e-3` px displacement, `1e-4` strain and correlation, and exactly `0` for the
+grid coordinates. That is deliberate and measured. IC-GN is a fixed-point
+iteration stopped at `||delta_p|| < 1e-3`, so two toolchains differing only in
+FMA contraction take slightly different paths into the same basin and stop one
+step apart: the disagreement is the size of a final IC-GN step, not of a
+rounding error. Between the Windows MinGW capture and Ubuntu GCC 11.4, over 772
+points in two scenarios, the worst were `|du|` 9.7e-4 px, `|dv|` 1.5e-3 px,
+strain 1.8e-5, corr 1.9e-5 — and slot 8 moved 7.96579 to 7.94737. The bounds
+sit at roughly 3× that. `synthetic.h` also builds its images from several
+hundred `std::exp` terms per pixel, so even the *input* depends on the host
+libm. **There is no exact cross-ABI gate on this branch** — these tolerances
+are it. The GPU branch
+(`claude/gpu-parallelization-displacement-strain-asx9w1`) adds a
+`determinism` CI job and a `docs/DETERMINISM.md`; point this paragraph at them
+when that lands.
+
+The comparison prints the worst deviation it saw per slot on every run, passing
+or failing, so the headroom is visible rather than assumed. Perturbing the
+anchor stride by one still fails 14 assertions on Ubuntu — metrics slots 3, 8,
+19 and 22 on the translate scenario and 3 through 8, 19 and 22 on the affine
+one, plus 6 and 52 value mismatches whose worst `dv` is 0.101 px, 67×
+the tolerance.
+
+```bash
+# recapture the baseline after a deliberate output change
+SEMPER_FF_GOLDEN_CAPTURE=1 ./build/full/bin/dic_tests FullFieldGolden
+```
+
+`SEMPER_FF_GOLDEN_FILE` overrides the fixture path. **Recapturing is a
+deliberate act**: the diff to the `.bin` belongs in a commit whose message says
+why the field moved. The file originated on the GPU branch; the two branches'
+fixtures are not interchangeable, because their seeding front-ends differ.
+
+## Suite: `SeedBench` — `integration/test_seeding_bench.cpp`
+
+Mostly a **measurement harness**, not a gate: `CandidateSweep`,
+`RealSpeckleSweep`, `Challenge5`, `Challenge14Sinusoid` and `LargeMotionSweep`
+all early-return unless `SEMPER_RUN_SEEDBENCH=1`, and the last three also need
+`SEMPER_DICE_REPO` pointed at a `dicengine/dice` checkout. They produce the
+tables in `docs/SEEDING_BENCHMARK.md`. Four cases are always on:
+
+| Test | Proves | Failure would mean |
+|---|---|---|
+| `PhaseCorrelateSignConvention` | `phase_correlate_roi` returns `(u, v)` such that reference point `p` appears at `p + (u, v)` | Every anchor is seeded with the sign of the motion inverted |
+| `AnchorSeedingQualityGate` | Three of the seven sweep scenarios — 0.4 px translation, 0.5° rotation, 12 px translation — hold a phase lock, route `FULL`, cover ≥ 90% of the ROI, and stay inside loose vertex- and gradient-error bounds | Seeding stopped working, rather than merely got slower |
+| `PublishAnchorResultsRespectsMedianTest` | `publish_anchor_results` writes only anchors that cleared the result gate *and* survived the universal median test, consumes one compute-order number per published point, and credits the thread that ran the IC-GN | A periodic-speckle blunder reaches the field and Path B floods from it — the failure the median test exists to prevent |
+| `AnchorLatticeSizing` | `plan_anchor_lattice` keeps the isotropic stride on a square ROI (64×64 → 289 anchors, the count the sweep reports), holds a 3-node floor on the short axis of a 1000×6 ROI without exceeding 2×`kAnchorTarget`, is symmetric under transpose, and returns an empty lattice for a degenerate grid | A long thin ROI — a beam, a weld seam — silently costs several times the intended seeding budget |
+
+The gate's bounds are 3–5× the measured medians, each annotated in-file
+with the value it was set from. It is deliberately not a benchmark: it should
+fire when the lattice stops locking or stops converging, and stay silent when a
+host is 20% slower or noisier. Read exact numbers from the sweep.
+
+```bash
+SEMPER_RUN_SEEDBENCH=1 ./build/full/bin/dic_tests SeedBench
+SEMPER_RUN_SEEDBENCH=1 SEMPER_SEEDBENCH_REPEATS=5 \
+  SEMPER_SEEDBENCH_CSV=sweep.csv ./build/full/bin/dic_tests SeedBench.CandidateSweep
+```
 
 ### C ABI contract — `tests/c/contract.c` (built with `SEMPER_BUILD_C_SDK`)
 
@@ -434,8 +637,10 @@ tests/
                             test_cancel_token, test_image_codec (OpenCV-gated)
   integration/            the assembled engine end-to-end + robustness
                             test_optimization_engine, test_robustness,
-                            test_full_field_contracts, test_reference_cache
-                            (the last two OpenCV-gated)
+                            test_full_field_contracts,
+                            test_full_field_golden, test_seeding_bench,
+                            test_reference_cache
+                            (the last four OpenCV-gated)
   dice/                   DICe golden comparisons
   perf/                   throughput gates
 ```
@@ -443,7 +648,8 @@ tests/
 `tests/CMakeLists.txt` lists sources under `DIC_UNIT_TESTS` /
 `DIC_INTEGRATION_TESTS` / `DIC_DICE_TESTS` / `DIC_PERF_TESTS`, plus
 `DIC_PIPELINE_TESTS` for the OpenCV-gated suites (`test_full_field_contracts`,
-`test_image_codec`, `test_reference_cache`) — attached only when OpenCV is present.
+`test_full_field_golden`, `test_seeding_bench`, `test_image_codec`,
+`test_reference_cache`) — attached only when OpenCV is present.
 
 ## Adding a new test
 

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.22)
 # Version tracks include/semper/version.hpp (keep the two in sync).
 # C is required: vendored OpenCV and the C ABI smoke binary compile C sources.
-project(semper VERSION 0.2.2 LANGUAGES C CXX)
+project(semper VERSION 0.3.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -15,7 +15,7 @@ set(EIGEN_SRC_DIR "${SEMPER_ROOT}/third_party/eigen")
 
 if(SEMPER_ANDROID AND SEMPER_FORCE_RELEASE)
     # AGP passes -DCMAKE_BUILD_TYPE=Debug for debug APKs, which would compile
-    # OpenCV at -O0 (~10x slower AKAZE). Force Release like the prebuilt SDK.
+    # OpenCV at -O0. Force Release like the prebuilt SDK.
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
@@ -71,7 +71,7 @@ endif()
 # ---------------------------------------------------------------------------
 add_library(semper_pipeline STATIC
         src/io/image_codec.cpp
-        src/seeding/anchor_seed.cpp
+        src/pipeline/phase_correlate.cpp
         src/pipeline/reference_cache.cpp
         src/pipeline/cancel.cpp
         src/pipeline/full_field_solver.cpp

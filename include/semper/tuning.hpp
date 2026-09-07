@@ -49,6 +49,14 @@ inline constexpr float kAnchorMedianTol = 1.0f;
 /** Anchor-lattice seeding: accepted/attempted fraction for a FULL mesh. */
 inline constexpr float kAnchorFullFraction = 0.60f;
 
+/** Anchor-lattice seeding: accepted vertices needed for a FULL mesh. Three is
+ *  enough for one Delaunay triangle; ten is the point past which the mesh is
+ *  dense enough to guide Path A over the whole ROI rather than a corner of it. */
+inline constexpr int kAnchorFullMinVertices = 10;
+
+/** Anchor-lattice seeding: convex-hull coverage of the ROI for a FULL mesh. */
+inline constexpr float kAnchorFullCoverage = 0.30f;
+
 /** Phase-correlation peak response below which the global shift is not trusted. */
 inline constexpr float kPhaseCorrMinResponse = 0.05f;
 

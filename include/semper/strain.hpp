@@ -20,6 +20,18 @@ namespace Semper {
     public:
         // Implements DICe's Standard VSG (Linear Least Squares Plane Fit)
         static StrainField compute_vsg_strain(const DisplacementField& disp, int window_pixels);
+
+        /**
+         * How many grid nodes a full VSG window covers at this step — the count of
+         * (dx, dy) offsets whose physical distance falls inside the window radius.
+         *
+         * compute_vsg_strain needs at least 3 to fit a plane, so a (step,
+         * window_pixels) pair scoring below 3 rejects *every* point no matter how
+         * well the correlation went. It depends only on these two numbers, which is
+         * why run_full_field can check it before solving anything. Exposed rather
+         * than duplicated so the guard and the calculator cannot drift apart.
+         */
+        static int vsg_window_node_count(int step, int window_pixels);
     };
 
 }

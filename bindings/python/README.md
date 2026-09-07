@@ -25,13 +25,13 @@ eng.set_reference(ref_u8)                 # 2-D uint8 array, or encoded PNG/JPEG
 res = eng.run(
     deformed_u8,
     rect=(0, 0, 512, 512),                # ROI: x, y, w, h
-    step=10, subset=21, strain_window=5,
+    step=10, subset=21, strain_window=21,
     progress=lambda pct: print(pct),      # optional
 )
 
 res.count            # number of solved points
 res.points           # (N, 8) float32: x, y, u, v, exx, eyy, exy, corr
-res.metrics          # (17,) float32 telemetry
+res.metrics          # (23,) float32 telemetry
 ```
 
 Call `eng.cancel()` from another thread to stop a run in flight.

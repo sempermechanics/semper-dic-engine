@@ -161,6 +161,51 @@ namespace {
     constexpr float TOL_DISPLACEMENT_PX = 1e-2f;
     constexpr float TOL_STRAIN = 1e-3f;
 
+    // solve_icgn returns status 1 for two different things, and the fixture
+    // records enough to tell them apart. A hard reject -- the 90%-valid-pixel
+    // guard, the deactivation check, the minimum-gradient check -- returns the
+    // sentinel score 2.0f. Exhausting the iteration budget returns the real
+    // final ZNSSD, which for a nearly-converged point is tiny. Anything below
+    // the sentinel therefore carries a real measurement.
+    constexpr float REJECT_SENTINEL_SCORE = 2.0f;
+
+    // A status flip that survives the value check is excused, but only up to a
+    // point, and the useful quantity is the *imbalance*, not the count.
+    //
+    // Host arithmetic noise pushes a point across `delta_p.norm() < 1e-3` in
+    // whichever direction its last bits happen to fall, so it produces flips in
+    // both directions with no bias. A shrunken iteration budget can only ever
+    // move a point from "converged" to "budget exhausted" -- never the reverse.
+    // The signed difference therefore separates the two causes where a raw
+    // count does not.
+    //
+    // Measured, by perturbing `kIcgnMaxIter` and rerunning both suites:
+    //
+    //   configuration           4x4 flips (net)   6x6 flips (net)
+    //   Ubuntu GCC 11.4              0 (0)             2 (0)
+    //   Windows MinGW GCC            0 (0)             1 (+1)
+    //   Ubuntu, kIcgnMaxIter-2       2 (+2)            3 (+3)
+    //   Windows, kIcgnMaxIter-2      2 (+2)            4 (+4)
+    //   either host, kIcgnMaxIter-8   3 and 6 HARD mismatches -- fails loudly
+    //
+    // A net cap of 2 leaves a point of headroom over the worst clean host and
+    // still fails the -2 perturbation through the 6x6 case on both hosts. A raw
+    // count cannot do both: Ubuntu is already at 2 clean and goes to 3 perturbed.
+    // The total cap is a backstop for churn in both directions at once. Every
+    // perturbed flip measured was 0 -> 1, on both hosts, which is the
+    // directional argument above holding up rather than being assumed.
+    constexpr int MAX_FLIP_IMBALANCE = 2;
+    constexpr int MAX_SLOW_CONVERGENCE_FLIPS = 6;
+
+    bool values_agree(const GoldenPoint &g, const GoldenPoint &c) {
+        return std::fabs(g.u - c.u) <= TOL_DISPLACEMENT_PX &&
+               std::fabs(g.v - c.v) <= TOL_DISPLACEMENT_PX &&
+               std::fabs(g.ux - c.ux) <= TOL_STRAIN &&
+               std::fabs(g.uy - c.uy) <= TOL_STRAIN &&
+               std::fabs(g.vx - c.vx) <= TOL_STRAIN &&
+               std::fabs(g.vy - c.vy) <= TOL_STRAIN;
+    }
+
     void compare_against_golden(bool use_6x6, const char *label, const std::string &suffix) {
         const auto path = golden_file_path() + suffix;
         const auto golden = read_golden(path);
@@ -170,6 +215,8 @@ namespace {
 
         int status_mismatches = 0;
         int value_mismatches = 0;
+        int flips_to_exhausted = 0; // converged -> budget exhausted
+        int flips_to_converged = 0; // the reverse
         for (size_t i = 0; i < current.size(); ++i) {
             const auto &g = golden[i];
             const auto &c = current[i];
@@ -180,19 +227,41 @@ namespace {
                 REQUIRE(false);
             }
             if (g.status != c.status) {
+                // A point whose IC-GN is still creeping when the iteration
+                // budget runs out lands on either side of
+                // `delta_p.norm() < 0.001f` purely on the host's last-bit
+                // arithmetic, and then reports "budget exhausted" instead of
+                // "converged" while arriving at the same answer. Both hosts
+                // measured so far show it: Ubuntu GCC 11.4 flips (368,192) and
+                // (170,434) in opposite directions, Windows MinGW flips
+                // (258,126), and in every case the two runs agree on all six
+                // values to within 4e-3 px.
+                //
+                // A flip is therefore excused only when neither side is a hard
+                // reject and the six values still agree. A flip into or out of
+                // a hard reject, or one that moves the answer, is a real change
+                // and still fails. The excused ones are counted by direction and
+                // gated below.
+                const bool both_measured =
+                        g.correlation_score < REJECT_SENTINEL_SCORE &&
+                        c.correlation_score < REJECT_SENTINEL_SCORE;
+                if (both_measured && values_agree(g, c)) {
+                    if (c.status != 0) ++flips_to_exhausted;
+                    else ++flips_to_converged;
+                    std::printf("  [%s] (%d,%d): status %d -> %d at unchanged values "
+                                "(slow convergence at the iteration cap, corr %.2e -> %.2e)\n",
+                                label, g.x, g.y, g.status, c.status,
+                                (double) g.correlation_score, (double) c.correlation_score);
+                    continue;
+                }
                 ++status_mismatches;
-                std::printf("  [%s] (%d,%d): status changed %d -> %d\n", label, g.x, g.y, g.status, c.status);
+                std::printf("  [%s] (%d,%d): status changed %d -> %d (corr %.2e -> %.2e)\n",
+                            label, g.x, g.y, g.status, c.status,
+                            (double) g.correlation_score, (double) c.correlation_score);
                 continue;
             }
             if (g.status != 0) continue; // only compare values where both sides converged
-            const bool ok =
-                std::fabs(g.u - c.u) <= TOL_DISPLACEMENT_PX &&
-                std::fabs(g.v - c.v) <= TOL_DISPLACEMENT_PX &&
-                std::fabs(g.ux - c.ux) <= TOL_STRAIN &&
-                std::fabs(g.uy - c.uy) <= TOL_STRAIN &&
-                std::fabs(g.vx - c.vx) <= TOL_STRAIN &&
-                std::fabs(g.vy - c.vy) <= TOL_STRAIN;
-            if (!ok) {
+            if (!values_agree(g, c)) {
                 ++value_mismatches;
                 std::printf("  [%s] (%d,%d): u %.6f->%.6f v %.6f->%.6f ux %.7f->%.7f "
                             "uy %.7f->%.7f vx %.7f->%.7f vy %.7f->%.7f\n",
@@ -200,11 +269,18 @@ namespace {
             }
         }
 
-        std::printf("  [%s] %zu points: %d status mismatches, %d value mismatches (tol u/v=%.1e px, strain=%.1e)\n",
+        const int flips = flips_to_exhausted + flips_to_converged;
+        const int imbalance = flips_to_exhausted - flips_to_converged;
+        std::printf("  [%s] %zu points: %d status mismatches, %d value mismatches, "
+                    "%d slow-convergence flips (%+d net, %d to exhausted, %d to "
+                    "converged) (tol u/v=%.1e px, strain=%.1e)\n",
                     label, current.size(), status_mismatches, value_mismatches,
+                    flips, imbalance, flips_to_exhausted, flips_to_converged,
                     (double) TOL_DISPLACEMENT_PX, (double) TOL_STRAIN);
         CHECK(status_mismatches == 0);
         CHECK(value_mismatches == 0);
+        CHECK(std::abs(imbalance) <= MAX_FLIP_IMBALANCE);
+        CHECK(flips <= MAX_SLOW_CONVERGENCE_FLIPS);
     }
 
 } // namespace

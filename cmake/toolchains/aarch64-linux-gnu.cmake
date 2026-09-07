@@ -11,6 +11,18 @@
 #         -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/aarch64-linux-gnu.cmake
 #
 # Needs: apt install crossbuild-essential-arm64 (and qemu-user-static to run it).
+#
+# NO CI JOB RUNS THIS. It is manual-only, deliberately: a cross-build of the
+# vendored OpenCV submodule for aarch64 costs far more CI minutes than a
+# size measurement nobody reads per-commit is worth. The consequence is that
+# this file can rot without anything failing, so if it stops working, fix it
+# here rather than assuming the measurement it produced was wrong.
+#
+# The measurement it exists for is recorded in docs/SEEDING_BENCHMARK.md
+# 6.1 (stripped .so 9.475 MB -> 6.720 MB, -29.1%, from dropping features2d /
+# flann / calib3d) and its limits in 6.2. To reproduce, build the C SDK once
+# per OpenCV module list and compare `aarch64-linux-gnu-strip`ped sizes; the
+# smoke test runs under `qemu-aarch64-static`.
 
 set(CMAKE_SYSTEM_NAME Linux)
 set(CMAKE_SYSTEM_PROCESSOR aarch64)

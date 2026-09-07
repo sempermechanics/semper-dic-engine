@@ -37,11 +37,11 @@ def test_recovers_rigid_translation():
 
     eng = semper.Engine()
     eng.set_reference(ref)
-    res = eng.run(deformed, rect=(40, 40, 176, 176), step=20, subset=31, strain_window=5)
+    res = eng.run(deformed, rect=(40, 40, 176, 176), step=20, subset=31, strain_window=41)
 
     assert res.count > 0
     assert res.points.shape[1] == 8
-    assert res.metrics.shape == (17,)
+    assert res.metrics.shape == (23,)
     # Column 2 is u (x-displacement). Recovered median should match the shift.
     u = res.points[:, 2]
     assert np.median(u) == pytest.approx(dx, abs=0.5)
@@ -50,7 +50,7 @@ def test_recovers_rigid_translation():
 def test_missing_reference_errors():
     eng = semper.Engine()
     with pytest.raises(semper.DicError) as excinfo:
-        eng.run(_speckle(), rect=(0, 0, 128, 128), step=20, subset=31, strain_window=5)
+        eng.run(_speckle(), rect=(0, 0, 128, 128), step=20, subset=31, strain_window=41)
     # Tighten: the code must be the documented INIT sentinel, not just "some error".
     assert excinfo.value.code == semper.ERR_INIT
 
@@ -61,7 +61,7 @@ def test_degenerate_roi_raises_with_roi_code():
     eng.set_reference(ref)
     # rect_w < step ⇒ empty grid ⇒ ROI error.
     with pytest.raises(semper.DicError) as excinfo:
-        eng.run(ref, rect=(0, 0, 10, 10), step=20, subset=31, strain_window=5)
+        eng.run(ref, rect=(0, 0, 10, 10), step=20, subset=31, strain_window=41)
     assert excinfo.value.code == semper.ERR_ROI
 
 
@@ -70,14 +70,14 @@ def test_degenerate_roi_no_raise_returns_negative_result():
     eng = semper.Engine()
     eng.set_reference(ref)
     res = eng.run(
-        ref, rect=(0, 0, 10, 10), step=20, subset=31, strain_window=5,
+        ref, rect=(0, 0, 10, 10), step=20, subset=31, strain_window=41,
         raise_on_error=False,
     )
     # code < 0 branch in __init__.py: count carries the code, points is empty,
     # metrics is still the full (17,) array.
     assert res.count == semper.ERR_ROI
     assert res.points.shape == (0, 8)
-    assert res.metrics.shape == (17,)
+    assert res.metrics.shape == (23,)
 
 
 def test_set_reference_rejects_non_2d():
@@ -95,15 +95,28 @@ def test_set_reference_float_array_is_cast_not_rejected():
     ref_f64 = _speckle().astype(np.float64)
     eng.set_reference(ref_f64)  # must NOT raise
     res = eng.run(
-        ref_f64, rect=(0, 0, 128, 128), step=20, subset=31, strain_window=5,
+        ref_f64, rect=(0, 0, 128, 128), step=20, subset=31, strain_window=41,
         raise_on_error=False,
     )
-    assert res.metrics.shape == (17,)
+    assert res.metrics.shape == (23,)
+
+
+def test_strain_window_too_small_raises():
+    # The VSG plane fit needs 3 grid nodes in the strain window. Below that no
+    # point can survive the strain post-filter, so the engine rejects the pair
+    # up front instead of returning an empty field with a success code.
+    ref = _speckle()
+    eng = semper.Engine()
+    eng.set_reference(ref)
+    with pytest.raises(semper.DicError) as excinfo:
+        eng.run(ref, rect=(40, 40, 176, 176), step=20, subset=31, strain_window=5)
+    assert excinfo.value.code == semper.ERR_STRAIN_WINDOW
 
 
 def test_error_codes_and_messages():
     assert semper.ERR_ROI == -2
     assert semper.ERR_INIT == -3
+    assert semper.ERR_STRAIN_WINDOW == -4
     assert semper.ERR_CANCELLED == -99
     # DicError carries the code and maps to the documented human message.
     err = semper.DicError(semper.ERR_ROI)

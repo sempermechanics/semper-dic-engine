@@ -31,6 +31,7 @@
 #if DIC_HAVE_OPENCV
 
 #include "framework/synthetic.h"
+#include "framework/synthetic_cv.h"
 #include "framework/image_io.h"
 #include "pipeline/full_field_internal.hpp"
 
@@ -39,8 +40,24 @@
 
 #include <opencv2/imgproc.hpp>
 
-#include <sys/resource.h>
-#include <unistd.h>
+// Cost accounting below needs process CPU time and resident set size, which
+// have no portable spelling. CI and every published measurement in
+// docs/SEEDING_BENCHMARK.md are Linux; Windows is a developer host, so it gets
+// working equivalents rather than a stub -- an unbuildable test file takes the
+// whole dic_tests binary down with it, benchmark or not.
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX          // else the min/max macros shadow std::min/std::max
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#  include <psapi.h>
+#else
+#  include <sys/resource.h>
+#  include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -51,7 +68,6 @@
 #include <fstream>
 #include <sstream>
 #include <functional>
-#include <random>
 #include <thread>
 #include <string>
 #include <vector>
@@ -71,11 +87,26 @@ namespace {
 struct CpuClock {
     double user_ms = 0.0, sys_ms = 0.0;
     static CpuClock now() {
+        CpuClock c;
+#ifdef _WIN32
+        // GetProcessTimes reports both in 100 ns units and, like getrusage,
+        // sums across all threads of the process -- which is the property the
+        // OpenMP-vs-serial comparison depends on.
+        FILETIME created{}, exited{}, kernel{}, user{};
+        if (GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) {
+            const auto to_ms = [](const FILETIME &ft) {
+                return (double)(((unsigned long long)ft.dwHighDateTime << 32) |
+                                ft.dwLowDateTime) / 1e4;
+            };
+            c.user_ms = to_ms(user);
+            c.sys_ms  = to_ms(kernel);
+        }
+#else
         rusage ru{};
         getrusage(RUSAGE_SELF, &ru);
-        CpuClock c;
         c.user_ms = ru.ru_utime.tv_sec * 1e3 + ru.ru_utime.tv_usec / 1e3;
         c.sys_ms  = ru.ru_stime.tv_sec * 1e3 + ru.ru_stime.tv_usec / 1e3;
+#endif
         return c;
     }
     double total_ms() const { return user_ms + sys_ms; }
@@ -88,21 +119,37 @@ struct CpuClock {
 // comparable quantity. For a true per-candidate peak, run one method per
 // process via SEMPER_SEEDBENCH_ONLY and read the peak printed at the end.
 double current_rss_mb() {
+#ifdef _WIN32
+    // WorkingSetSize is the Windows analogue of the statm resident count:
+    // pages currently backed by physical memory, and it can be differenced.
+    PROCESS_MEMORY_COUNTERS pmc{};
+    pmc.cb = sizeof(pmc);
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) return -1.0;
+    return (double)pmc.WorkingSetSize / (1024.0 * 1024.0);
+#else
     std::ifstream f("/proc/self/statm");
     if (!f) return -1.0;
     long total_pages = 0, rss_pages = 0;
     f >> total_pages >> rss_pages;
     if (!f) return -1.0;
     return (double)rss_pages * (double)sysconf(_SC_PAGESIZE) / (1024.0 * 1024.0);
+#endif
 }
 
 double process_peak_rss_mb() {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS pmc{};
+    pmc.cb = sizeof(pmc);
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) return -1.0;
+    return (double)pmc.PeakWorkingSetSize / (1024.0 * 1024.0);
+#else
     rusage ru{};
     getrusage(RUSAGE_SELF, &ru);
-#ifdef __APPLE__
+#  ifdef __APPLE__
     return (double)ru.ru_maxrss / (1024.0 * 1024.0);
-#else
+#  else
     return (double)ru.ru_maxrss / 1024.0;
+#  endif
 #endif
 }
 
@@ -130,7 +177,7 @@ TruthFn affine_truth(const dictest::AffineDeformation &d) {
 constexpr int W = 640;
 constexpr int H = 640;
 constexpr int BLOBS = 1600;          // ~11% blob coverage, DIC-representative
-constexpr int RECT = 480;
+constexpr int ROI_SIZE = 480;   // not RECT: windows.h typedefs that
 constexpr int RECT_ORIGIN = 80;
 constexpr int STEP = 5;
 constexpr int SUBSET = 41;
@@ -167,22 +214,6 @@ std::vector<Scenario> scenarios() {
     s.push_back({"S5_trans_12px",    affine(12.0f, -7.0f), 0.0f});
     s.push_back({"S6_trans_noise5",  affine(0.4f, 0.0f),  5.0f});
     return s;
-}
-
-cv::Mat gray8(const Image &img, float noise_sigma, unsigned noise_seed) {
-    cv::Mat m(img.height, img.width, CV_8UC1);
-    std::mt19937 rng(noise_seed);
-    std::normal_distribution<float> gauss(0.0f, noise_sigma);
-    for (int y = 0; y < img.height; ++y) {
-        for (int x = 0; x < img.width; ++x) {
-            float v = img.intensities[(size_t)y * img.width + x];
-            if (noise_sigma > 0.0f) v += gauss(rng);
-            if (v < 0.f) v = 0.f;
-            if (v > 255.f) v = 255.f;
-            m.at<uchar>(y, x) = static_cast<uchar>(v + 0.5f);
-        }
-    }
-    return m;
 }
 
 double percentile(std::vector<double> v, double p) {
@@ -238,8 +269,8 @@ FullFieldParams bench_params() {
     FullFieldParams p;
     p.rect_x = RECT_ORIGIN;
     p.rect_y = RECT_ORIGIN;
-    p.rect_w = RECT;
-    p.rect_h = RECT;
+    p.rect_w = ROI_SIZE;
+    p.rect_h = ROI_SIZE;
     p.step = STEP;
     p.subset_size = SUBSET;
     p.strain_window = STRAIN_WIN;
@@ -331,7 +362,11 @@ void measure_seed(Row &row, const TruthFn &truth,
         auto t0 = std::chrono::high_resolution_clock::now();
         const CpuClock c0 = CpuClock::now();
         seeds = solve_anchor_seeds(cache, def_gray, def_img, params, gridW, gridH,
-                                   cores, pool, sc, od, g, st, t);
+                                   cores, pool, g, st, t);
+        // Publishing is a separate step in the pipeline now, but it is still
+        // part of what the seeding phase costs, and `grid` below is expected to
+        // carry the published anchors -- so time it here too.
+        publish_anchor_results(seeds, sc, od, g, st);
         seed_cpus.push_back(CpuClock::now().total_ms() - c0.total_ms());
         seed_walls.push_back(std::chrono::duration<double, std::milli>(
                 std::chrono::high_resolution_clock::now() - t0).count());
@@ -621,12 +656,12 @@ TEST_CASE(SeedBench, PhaseCorrelateSignConvention) {
     const Image ref = dictest::make_reference_image(field, W, H);
     const Image def = dictest::make_deformed_image(field, W, H, affine(U, V));
 
-    const cv::Mat ref_gray = gray8(ref, 0.0f, 0);
-    const cv::Mat def_gray = gray8(def, 0.0f, 0);
+    const cv::Mat ref_gray = dictest::gray8(ref, 0.0f, 0);
+    const cv::Mat def_gray = dictest::gray8(def, 0.0f, 0);
 
     double u = 0.0, v = 0.0, resp = 0.0;
     const bool ok = Semper::seeding::phase_correlate_roi(
-            ref_gray, def_gray, cv::Rect(RECT_ORIGIN, RECT_ORIGIN, RECT, RECT),
+            ref_gray, def_gray, cv::Rect(RECT_ORIGIN, RECT_ORIGIN, ROI_SIZE, ROI_SIZE),
             u, v, resp);
 
     REQUIRE(ok);
@@ -635,6 +670,220 @@ TEST_CASE(SeedBench, PhaseCorrelateSignConvention) {
     CHECK_NEAR(v, V, 0.05);
     std::printf("    phaseCorrelate -> (%.4f, %.4f), truth (%.1f, %.1f), response %.4f\n",
                 u, v, (double)U, (double)V, resp);
+}
+
+// ---------------------------------------------------------------------------
+// The always-on half of this file.
+//
+// Every sweep in this file is gated behind SEMPER_RUN_SEEDBENCH, and three of
+// them additionally behind an external DICe checkout, which meant that before
+// this case the largest behavioural change in the repo's history was defended
+// in CI by exactly one assertion -- the sign convention above.
+//
+// This case promotes three of the seven CandidateSweep scenarios to always-on
+// assertions. They are chosen to cover the three regimes the anchor lattice
+// is claimed to handle, not to re-measure the sweep:
+//
+//   S1b_trans_0.4px  the sub-pixel regime the engine actually ships for
+//   S4_rot_0.5deg    small rotation -- docs/SEEDING_BENCHMARK.md 4.5 records
+//                    that the lattice degrades above ~5 deg, so the lower end
+//                    of that range is the boundary worth pinning
+//   S5_trans_12px    motion far outside IC-GN's own capture range, which only
+//                    succeeds if the L0 phase-correlation lock is real
+//
+// The bounds are deliberately loose -- 3x to 5x the measured value, listed
+// per row below. This is a regression gate, not a benchmark: it should fire
+// when seeding stops working, and stay silent when it merely gets 20% worse
+// on one host. The sweep remains the place to read exact numbers.
+//
+// Reference values are the medians reported by CandidateSweep and the
+// criteria in docs/SEEDING_BENCHMARK.md section 9. For scale, the AKAZE
+// front-end this replaced measured 0.157 px vertex error and 9.39e-3 gradient
+// error at 0.446 mesh coverage on the DICe pair (section 4.1), so every bound
+// here is still far tighter than the behaviour that shipped before it.
+// ---------------------------------------------------------------------------
+TEST_CASE(SeedBench, AnchorSeedingQualityGate) {
+    struct Gate {
+        const char *name;
+        dictest::AffineDeformation def;
+        double max_vtx_med_du;   // px, median vertex displacement error
+        double max_mesh_med_dux; // guess displacement-gradient error
+        double max_mesh_med_du;  // px, median guess displacement error
+    };
+
+    const Gate gates[] = {
+        // measured: 0.0103 px / 5.52e-4 / 0.0083 px
+        {"S1b_trans_0.4px", affine(0.4f, 0.0f), 0.05, 2.0e-3, 0.04},
+        // measured: 0.0106 px / 5.41e-4 / 0.0083 px
+        {"S4_rot_0.5deg", rotation(0.5), 0.05, 2.0e-3, 0.04},
+        // measured: 0.0000 px / 1.31e-6 / 0.0000 px. Bounded well above the
+        // measurement because what is being asserted is that the phase lock
+        // carried a 12 px motion at all, not the last digit of an exact hit.
+        {"S5_trans_12px", affine(12.0f, -7.0f), 0.02, 5.0e-5, 0.02},
+    };
+
+    dictest::SpeckleField field(/*seed=*/11, W, H, BLOBS);
+    const Image ref = dictest::make_reference_image(field, W, H);
+    const cv::Mat ref_gray = dictest::gray8(ref, 0.0f, 101);
+
+    for (const Gate &g : gates) {
+        const Image def = dictest::make_deformed_image(field, W, H, g.def);
+        const cv::Mat def_gray = dictest::gray8(def, 0.0f, 202);
+
+        Row row;
+        row.scenario = g.name;
+        measure_seed(row, affine_truth(g.def), ref_gray, def_gray,
+                     bench_params());
+
+        std::printf("    %-16s lock=%s q=%d cov=%.3f vtx=%.4f px "
+                    "dP=%.3e du=%.4f px meshfr=%.3f\n",
+                    g.name, row.phase_locked ? "yes" : "NO", row.quality,
+                    (double) row.coverage, row.vtx_med_du, row.mesh_med_dux,
+                    row.mesh_med_du, row.mesh_frac);
+
+        // A lost phase lock is the single failure that explains most of the
+        // others, so check it first and by itself.
+        CHECK(row.phase_locked);
+        // MeshQuality::FULL. SPARSE means the hull did not cover the ROI and
+        // Path B is doing work the mesh was supposed to do.
+        CHECK(row.quality == 2);
+        CHECK(row.coverage >= 0.90f);
+        CHECK(row.mesh_frac >= 0.95);
+        // percentile() returns -1 for an empty sample; the bounds below would
+        // then pass vacuously.
+        REQUIRE(row.vtx_med_du >= 0.0);
+        REQUIRE(row.mesh_med_dux >= 0.0);
+        CHECK(row.vtx_med_du <= g.max_vtx_med_du);
+        CHECK(row.mesh_med_dux <= g.max_mesh_med_dux);
+        CHECK(row.mesh_med_du <= g.max_mesh_med_du);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The publish gate. solve_anchor_seeds records outcomes and publishes nothing;
+// publish_anchor_results applies them once the universal median test has run.
+// Nothing in the fixtures below produces a blunder that clears kCorrAccept and
+// then fails the median test -- that is a periodic-speckle failure and it is
+// hard to stage deterministically -- so the gate itself is checked directly.
+// ---------------------------------------------------------------------------
+TEST_CASE(SeedBench, PublishAnchorResultsRespectsMedianTest) {
+    using Semper::pipeline::internal::AnchorResult;
+    using Semper::pipeline::internal::GridPoint;
+    using Semper::pipeline::internal::MeshSeedResult;
+    using Semper::pipeline::internal::ResultGrid;
+    using Semper::pipeline::internal::ThreadStats;
+    using Semper::pipeline::internal::publish_anchor_results;
+
+    auto make = [](int gx, int gy, bool output, bool kept, int tid) {
+        AnchorResult a;
+        a.gx = gx; a.gy = gy;
+        a.rx = (float)gx; a.ry = (float)gy;
+        a.u = 1.0f + (float)gx; a.v = 2.0f;
+        a.corr = 0.05f;
+        a.thread_id = tid;
+        a.output = output;
+        a.kept = kept;
+        return a;
+    };
+
+    MeshSeedResult seeds;
+    seeds.anchors = {
+            make(1, 1, true,  true,  0),   // published
+            make(2, 1, true,  false, 1),   // the blunder: cleared kCorrAccept,
+                                           // rejected by the median test
+            make(3, 1, false, true,  1),   // a vertex, but too loose to publish
+            make(0, 0, false, false, 0),   // never converged: default slot
+            make(9, 9, true,  true,  0),   // outside the grid entirely
+    };
+
+    ResultGrid grid(4, std::vector<GridPoint>(4));
+    std::atomic<int> solved(0), order(0);
+    std::vector<ThreadStats> stats(2);
+
+    const int published = publish_anchor_results(seeds, solved, order, grid, stats);
+
+    CHECK(published == 1);
+    CHECK(solved.load() == 1);
+    CHECK(order.load() == 1);   // one order number consumed, not five
+
+    CHECK(grid[1][1].solved);
+    CHECK_NEAR(grid[1][1].u, 2.0f, 1e-6f);
+    CHECK(grid[1][1].mesh_assignment_type == Semper::pipeline::internal::kMeshAnchor);
+
+    // The blunder must not reach the field: Path B would take it as a boundary
+    // seed and flood fill from a wrong displacement.
+    CHECK(!grid[1][2].solved);
+    CHECK(!grid[1][3].solved);
+    CHECK(!grid[0][0].solved);
+
+    // Credit lands on the thread that ran the ICGN, not on whoever published.
+    CHECK(stats[0].points_solved == 1);
+    CHECK(stats[1].points_solved == 0);
+}
+
+// ---------------------------------------------------------------------------
+// Lattice sizing. No image, no solve -- plan_anchor_lattice is exposed so the
+// stride arithmetic can be checked directly, because the failure it guards
+// against is a cost blow-up on a geometry no fixture in this repo has.
+// ---------------------------------------------------------------------------
+TEST_CASE(SeedBench, AnchorLatticeSizing) {
+    using Semper::pipeline::internal::AnchorLattice;
+    using Semper::pipeline::internal::plan_anchor_lattice;
+    namespace tuning = Semper::tuning;
+
+    // Square ROI: the stride is the isotropic sqrt(nodes / target) and both
+    // axes keep it. 64 x 64 = 4096 nodes, 4096 / 256 = 16, sqrt = 4. Each axis
+    // carries indices 0, 4, ... 60 plus the appended last index 63 = 17, so
+    // 289 anchors -- which is exactly the vertex count CandidateSweep reports.
+    // This case pins the per-axis clamp as a no-op on square-ish ROIs.
+    {
+        const AnchorLattice lat = plan_anchor_lattice(64, 64);
+        CHECK(lat.stride_x == 4);
+        CHECK(lat.stride_y == 4);
+        CHECK(lat.nx == 17);
+        CHECK(lat.ny == 17);
+        CHECK(lat.count() == 289);
+    }
+
+    // The regression this test exists for. A long thin ROI -- a beam, a weld
+    // seam -- used to have the stride clamped from the *shorter* axis: 6 / 3 = 2
+    // forced on both, giving a lattice of ~2000 nodes against a target of 256.
+    // Clamping per axis keeps the short axis at its 3-node floor and pays for
+    // it by coarsening the long one.
+    {
+        const AnchorLattice lat = plan_anchor_lattice(1000, 6);
+        CHECK(lat.ny >= 3);   // the floor the old clamp was protecting
+        CHECK(lat.nx >= 3);
+        // Not 256 exactly: the short axis cannot go below 3, so the product
+        // overshoots. It must stay the same order as the target, not 8x it.
+        CHECK(lat.count() <= 2 * tuning::kAnchorTarget);
+        CHECK(lat.stride_x > lat.stride_y);
+    }
+
+    // Same ROI on its side. Nothing in the planner should prefer an axis.
+    {
+        const AnchorLattice a = plan_anchor_lattice(1000, 6);
+        const AnchorLattice b = plan_anchor_lattice(6, 1000);
+        CHECK(b.stride_x == a.stride_y);
+        CHECK(b.stride_y == a.stride_x);
+        CHECK(b.count() == a.count());
+    }
+
+    // A grid too small to hold 3 lattice nodes per axis: the floor cannot be
+    // met, and asking for it must not loop or return an empty lattice.
+    {
+        const AnchorLattice lat = plan_anchor_lattice(2, 2);
+        CHECK(lat.stride_x == 1);
+        CHECK(lat.stride_y == 1);
+        CHECK(lat.count() == 4);
+    }
+
+    // Degenerate input: no grid, no lattice, no arithmetic on it.
+    {
+        CHECK(plan_anchor_lattice(0, 10).count() == 0);
+        CHECK(plan_anchor_lattice(10, 0).count() == 0);
+        CHECK(plan_anchor_lattice(-1, -1).count() == 0);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -651,8 +900,8 @@ TEST_CASE(SeedBench, CandidateSweep) {
         dictest::SpeckleField field(/*seed=*/11, W, H, BLOBS);
         const Image ref = dictest::make_reference_image(field, W, H);
         const Image def = dictest::make_deformed_image(field, W, H, sc.def);
-        const cv::Mat ref_gray = gray8(ref, sc.noise_sigma, 101);
-        const cv::Mat def_gray = gray8(def, sc.noise_sigma, 202);
+        const cv::Mat ref_gray = dictest::gray8(ref, sc.noise_sigma, 101);
+        const cv::Mat def_gray = dictest::gray8(def, sc.noise_sigma, 202);
 
         run_scenario(sc.name, affine_truth(sc.def), ref_gray, def_gray,
                        bench_params(), rows);
@@ -826,8 +1075,8 @@ TEST_CASE(SeedBench, LargeMotionSweep) {
         dictest::SpeckleField field(/*seed=*/11, W, H, BLOBS);
         const Image ref = dictest::make_reference_image(field, W, H);
         const Image def = dictest::make_deformed_image(field, W, H, sc.def);
-        const cv::Mat ref_gray = gray8(ref, sc.noise_sigma, 101);
-        const cv::Mat def_gray = gray8(def, sc.noise_sigma, 202);
+        const cv::Mat ref_gray = dictest::gray8(ref, sc.noise_sigma, 101);
+        const cv::Mat def_gray = dictest::gray8(def, sc.noise_sigma, 202);
         run_scenario(sc.name, affine_truth(sc.def), ref_gray, def_gray, params, rows);
     }
 

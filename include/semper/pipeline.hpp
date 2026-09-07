@@ -52,11 +52,12 @@ struct FullFieldParams {
 /**
  * Run the hybrid full-field DIC pipeline.
  * @return number of valid output points, or negative error code
- *   (-2 ROI, -3 init, [kCancelled] if cancelled mid-solve).
+ *   (-2 ROI, -3 init, [kBadStrainWindow] if strain_window is too small for
+ *   step, [kCancelled] if cancelled mid-solve).
  * Writes packed points to output_ptr (8 floats each: x,y,u,v,exx,eyy,exy,corr).
  * output_capacity is the number of floats output_ptr can hold; the solver never
  * writes past it (points beyond the capacity are dropped rather than overflowing).
- * If metrics != nullptr and metrics_len >= 16, fills engine telemetry (17 floats preferred).
+ * If metrics != nullptr and metrics_len >= 16, fills engine telemetry (23 floats preferred).
  */
 int run_full_field(
     ReferenceCache& cache,

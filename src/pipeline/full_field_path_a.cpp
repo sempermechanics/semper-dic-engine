@@ -4,7 +4,6 @@
 
 #include "full_field_internal.hpp"
 
-#include <semper/seeding.hpp>
 #include <semper/solver.hpp>
 #include <semper/subset.hpp>
 #include <semper/tuning.hpp>

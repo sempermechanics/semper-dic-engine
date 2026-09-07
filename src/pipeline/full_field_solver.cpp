@@ -110,6 +110,30 @@ int run_full_field(
         int gridH = params.rect_h / params.step;
         if (gridW <= 0 || gridH <= 0) return -2; // 🚀 PRIORITY 3: Return -2 for ROI Errors
 
+        // The VSG strain fit needs 3 grid nodes inside the strain window to
+        // solve for a plane. That count is fixed by (step, strain_window)
+        // alone, so when it is short every point is rejected by the strain
+        // post-filter no matter how well the correlation went, and the caller
+        // gets an empty field. Until 0.3.0 that came back as a *success* with
+        // zero points, which is indistinguishable from a genuinely blank ROI
+        // and left the caller nothing to debug from. Check it before solving.
+        const int vsg_nodes = StrainCalculator::vsg_window_node_count(
+                params.step, params.strain_window);
+        if (vsg_nodes < 3) {
+            // Derive the remedy from the function the gate itself calls, so the
+            // advice cannot drift from the rule. strain_window == 2 * step always
+            // clears it (radius == step puts 5 nodes in the window), which bounds
+            // the search; this runs only on the error path.
+            int min_window = 1;
+            while (StrainCalculator::vsg_window_node_count(params.step, min_window) < 3)
+                ++min_window;
+            LOGE("strain_window=%d spans only %d grid node(s) at step=%d; the VSG "
+                 "plane fit needs 3, so every point would be discarded. Raise "
+                 "strain_window to at least %d, or lower step.",
+                 params.strain_window, vsg_nodes, params.step, min_window);
+            return kBadStrainWindow;
+        }
+
         // Now that gridW and gridH exist, we can set their default fallbacks
         int path_c_seed_x = gridW / 2;
         int path_c_seed_y = gridH / 2;
@@ -247,14 +271,21 @@ int run_full_field(
         timings.prepass = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_prepass_start).count();
 
         // Anchor-lattice seeding: phase correlation for the global rigid shift,
-        // then IC-GN on a lattice of grid nodes. Nodes that clear the result
-        // gate are marked solved here, so Path A skips them and Path B takes
-        // them as boundary seeds.
+        // then IC-GN on a lattice of grid nodes. It records but publishes
+        // nothing; see AnchorResult for why that has to be a separate step.
         std::vector<ThreadStats> stats_anchors(safe_cores);
         MeshSeedResult seeds = solve_anchor_seeds(
                 cache, defMat, defImg, params, gridW, gridH, safe_cores,
-                hessian_pool, global_points_solved, compute_order_counter,
-                resultGrid, stats_anchors, timings);
+                hessian_pool, resultGrid, stats_anchors, timings);
+
+        // Now apply them. Nodes that clear the result gate *and* survive the
+        // median test are marked solved, so Path A skips them and Path B takes
+        // them as boundary seeds.
+        const int anchor_published = publish_anchor_results(
+                seeds, global_points_solved, compute_order_counter,
+                resultGrid, stats_anchors);
+        LOGD("Anchor lattice published %d of %d lattice nodes (%d converged)",
+             anchor_published, (int)seeds.anchors.size(), seeds.attempted);
 
         const std::vector<cv::Point2f>& anchor_ref_pts = seeds.ref_pts;
         const std::vector<cv::Point2f>& anchor_def_pts = seeds.def_pts;
@@ -267,7 +298,13 @@ int run_full_field(
         // phase-correlation lock and often some solved nodes, so a mesh too
         // sparse to guide Path A is not the same as having no seed: Path B can
         // flood-fill from what the lattice already found.
-        const bool have_seed = seeds.phase_locked || seeds.solved > 0 || seeds.accepted >= 3;
+        //
+        // A lock on its own is not a seed, though. Phase correlation can lock
+        // on a strong global shift while every anchor fails the result gate:
+        // then solved == 0, accepted == 0, and Path B has nothing to flood
+        // fill from but the blind grid-centre node. Require an actual point,
+        // and let the lock inform Path C's search rather than replace it.
+        const bool have_seed = seeds.solved > 0 || seeds.accepted >= 3;
         bool execute_path_c = (mesh_quality == MeshQuality::NONE) && !have_seed;
 
         if (cancel_requested()) return kCancelled;
@@ -282,8 +319,18 @@ int run_full_field(
                                hessian_pool, global_points_solved, compute_order_counter};
 
         if (execute_path_c) {
+            // Path C now runs in cases a bare phase lock used to suppress (see
+            // have_seed above), so its failure can no longer abort the solve:
+            // that would turn fields the old code delivered via Path B into an
+            // error return. When the lattice locked, fall through instead --
+            // Path B still has the global shift and the grid-centre seed, which
+            // is exactly what the old code handed it. Without a lock there is
+            // nothing left to try, so the abort stands.
             int rc = run_path_c(ctx, anchor_ref_pts, resultGrid, path_c_seed_x, path_c_seed_y, globalU, globalV);
-            if (rc != 0) return rc;
+            if (rc != 0) {
+                if (!seeds.phase_locked) return rc;
+                LOGE("Path C failed (%d); phase correlation locked, continuing to Path B with the global shift", rc);
+            }
         }
 
         {
@@ -327,9 +374,9 @@ int run_full_field(
         // ==========================================
         // ⏱️ AGGREGATE PROFILING METRICS
         // ==========================================
-        SolveSummary summary = aggregate_thread_stats(stats_pathA, stats_pathB, safe_cores);
+        SolveSummary summary = aggregate_thread_stats(stats_pathA, stats_pathB, stats_anchors, safe_cores);
         timings.total = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_total_start).count();
-        log_profiling_summary(timings, summary, valid_count);
+        log_profiling_summary(timings, summary, seeds, valid_count);
 
         // =========================================================
         // 🐛 EXPORT FULL DEBUG SUITE (extracted — behaviour unchanged)
@@ -345,7 +392,8 @@ int run_full_field(
         // 🚀 NEW: FULL ENGINE TELEMETRY EXPORT TO KOTLIN
         // ==========================================
         fill_engine_metrics(metrics, metrics_len, timings, summary,
-                            total_valid_points, valid_count, mesh_quality);
+                            total_valid_points, valid_count,
+                            packed.dropped_by_post_filter, seeds, mesh_quality);
 
         defMat.release(); roiMask.release();
         return valid_count;

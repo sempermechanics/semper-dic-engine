@@ -25,7 +25,6 @@ namespace Semper {
             AnalysisResult r = solve_icgn(subset, def_img, start_u, start_v, start_ux, start_uy, start_vx, start_vy);
             auto t2 = std::chrono::high_resolution_clock::now();
             time_icgn_ms += std::chrono::duration<double, std::milli>(t2 - t1).count();
-            count_icgn++;
             return r;
         };
 

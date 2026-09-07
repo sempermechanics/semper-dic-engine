@@ -50,6 +50,9 @@ typedef struct semper_params {
 /* Return codes (Frozen), shared with run_full_field. */
 #define SEMPER_ERR_ROI       (-2)  /* invalid ROI */
 #define SEMPER_ERR_INIT      (-3)  /* init / argument failure (incl. no reference set) */
+/* strain_window too small for step: the VSG plane fit would reject every point.
+   Added in v0.3.0; this case previously returned 0 points with a success code. */
+#define SEMPER_ERR_STRAIN_WINDOW (-4)
 #define SEMPER_ERR_CANCELLED (-99) /* cancelled mid-solve */
 /* >= 0 is the number of valid output points written. */
 
@@ -58,8 +61,14 @@ typedef void (*semper_progress_cb)(int percentage, void* user);
 
 /* Number of floats per output point in the packed result buffer (Frozen = 8). */
 #define SEMPER_FLOATS_PER_POINT 8
-/* Preferred metrics buffer length (Frozen slot layout; 16 is the minimum honored). */
-#define SEMPER_METRICS_LEN 17
+/*
+ * Preferred metrics buffer length. The slot *layout* is Frozen; this constant is
+ * the Additive-only growth point and rises as telemetry is appended (17 -> 23 in
+ * v0.3.0, which added slots 19-22). 16 is still the minimum honored, and the
+ * engine writes only the prefix the caller's metrics_len allows, so a caller
+ * compiled against an older value keeps working without a recompile.
+ */
+#define SEMPER_METRICS_LEN 23
 
 /* Create / destroy an engine instance. Returns NULL on allocation failure. */
 SEMPER_C_API semper_engine* semper_create(void);

@@ -3,10 +3,13 @@
 // buffer). Compiled only when DIC_HAVE_OPENCV is set (same gate as DICe tests).
 #include "framework/test_framework.h"
 
+#include <cstdio>
 #include <cstring>
 #include "framework/synthetic.h"
+#include "framework/synthetic_cv.h"
 
 #include <semper/cancel.hpp>
+#include <semper/strain.hpp>
 #include <semper/pipeline.hpp>
 
 #include <algorithm>
@@ -29,20 +32,12 @@ constexpr int W = 256;
 constexpr int H = 256;
 constexpr int STEP = 15;
 constexpr int SUBSET = 21;
-constexpr int STRAIN_WIN = 15;
-
-cv::Mat gray8_from_image(const Semper::Image &img) {
-    cv::Mat m(img.height, img.width, CV_8UC1);
-    for (int y = 0; y < img.height; ++y) {
-        for (int x = 0; x < img.width; ++x) {
-            float v = img.intensities[(size_t)y * img.width + x];
-            if (v < 0.f) v = 0.f;
-            if (v > 255.f) v = 255.f;
-            m.at<uchar>(y, x) = static_cast<uchar>(v + 0.5f);
-        }
-    }
-    return m;
-}
+// 2 * STEP + 1 is the smallest window that puts more than one grid node inside
+// the VSG circle. At the old value of 15 the window spanned exactly one node,
+// the strain fit was rank-deficient everywhere, and every test below solved an
+// empty field without noticing. run_full_field now rejects that pair outright
+// (kBadStrainWindow), which is what turned the silent version into a failure.
+constexpr int STRAIN_WIN = 2 * STEP + 1;
 
 void make_pair(cv::Mat &ref_gray, cv::Mat &def_gray) {
     dictest::SpeckleField field(/*seed=*/11, W, H, /*blob_count=*/600);
@@ -53,8 +48,8 @@ void make_pair(cv::Mat &ref_gray, cv::Mat &def_gray) {
     def.cy = H / 2.0f;
     const Semper::Image ref = dictest::make_reference_image(field, W, H);
     const Semper::Image deformed = dictest::make_deformed_image(field, W, H, def);
-    ref_gray = gray8_from_image(ref);
-    def_gray = gray8_from_image(deformed);
+    ref_gray = dictest::gray8(ref);
+    def_gray = dictest::gray8(deformed);
 }
 
 FullFieldParams params_for(int rect_w, int rect_h) {
@@ -90,6 +85,35 @@ TEST_CASE(FullField, DegenerateRoi_ReturnsRoiError) {
     const int code = call_solver(cache, def_gray, params_for(STEP - 1, STEP - 1),
                                  8 * 4);
     CHECK(code == -2);
+}
+
+TEST_CASE(FullField, StrainWindowTooSmallForStep_IsRejected) {
+    // The VSG plane fit needs 3 grid nodes inside the strain window. When the
+    // window spans fewer, no point can ever survive the strain post-filter --
+    // and until 0.3.0 that came back as 0 points with a *success* code, which a
+    // caller cannot tell apart from a genuinely blank ROI. It is now -4.
+    cv::Mat ref_gray, def_gray;
+    make_pair(ref_gray, def_gray);
+    ReferenceCache cache;
+    cache.set_from_gray(ref_gray, cv::Mat());
+
+    FullFieldParams params = params_for(W, H);
+    params.strain_window = STEP;   // one node: the centre and nothing else
+    REQUIRE(Semper::StrainCalculator::vsg_window_node_count(params.step,
+                                                            params.strain_window) < 3);
+    const int cap = 8 * ((W / STEP) * (H / STEP) + 8);
+    std::vector<float> out((size_t)cap, 0.0f);
+    float metrics[23] = {};
+    CHECK(run_full_field(cache, def_gray, cv::Mat(), params, out.data(), cap,
+                         metrics, 23, nullptr) == Semper::pipeline::kBadStrainWindow);
+
+    // The guard must not be so eager that it rejects a working pair: the
+    // smallest window the error message tells the caller to use has to pass.
+    params.strain_window = 2 * params.step + 1;
+    REQUIRE(Semper::StrainCalculator::vsg_window_node_count(params.step,
+                                                            params.strain_window) >= 3);
+    CHECK(run_full_field(cache, def_gray, cv::Mat(), params, out.data(), cap,
+                         metrics, 23, nullptr) > 0);
 }
 
 TEST_CASE(FullField, DegenerateStep_ReturnsRoiError) {
@@ -143,7 +167,7 @@ TEST_CASE(FullField, UndersizedBuffer_TruncatesWithoutOverflow) {
 }
 
 TEST_CASE(FullField, MetricsLayout_Contract) {
-    // The 17-float metrics array is Frozen (docs/CONTRACT.md §A.4) but only
+    // The metrics array's slot layout is Frozen (docs/CONTRACT.md §A.4) but only
     // metrics[0] was ever checked. Pin the slot invariants a downstream telemetry
     // reader relies on. Runs a real solve on the 256x256 speckle pair.
     cv::Mat ref_gray, def_gray;
@@ -153,11 +177,11 @@ TEST_CASE(FullField, MetricsLayout_Contract) {
 
     const int cap = 8 * ((W / STEP) * (H / STEP) + 8);
     std::vector<float> out(cap, 0.f);
-    float metrics[17];
-    for (int i = 0; i < 17; ++i) metrics[i] = -12345.f;
+    float metrics[23];
+    for (int i = 0; i < 23; ++i) metrics[i] = -12345.f;
 
     const int n = run_full_field(cache, def_gray, cv::Mat(), params_for(W, H),
-                                 out.data(), cap, metrics, 17, nullptr);
+                                 out.data(), cap, metrics, 23, nullptr);
     REQUIRE(n >= 0);
 
     // Counts: attempted >= solved >= 0, rejected is the exact complement.
@@ -169,6 +193,14 @@ TEST_CASE(FullField, MetricsLayout_Contract) {
     CHECK(metrics[15] <= 100.f);
     // Seed-quality flag is one of the three documented values.
     CHECK((metrics[16] == 0.f || metrics[16] == 1.f || metrics[16] == 2.f));
+    // Seeding health (slots 21/22): the phase lock is a flag, coverage is a
+    // fraction of the ROI. On this synthetic pure-translation pair both should
+    // be healthy -- if the lock ever fails here, the seeder broke.
+    CHECK((metrics[21] == 0.f || metrics[21] == 1.f));
+    CHECK(metrics[22] >= 0.f);
+    CHECK(metrics[22] <= 1.f);
+    CHECK(metrics[21] == 1.f);
+    CHECK(metrics[22] > 0.25f);
 }
 
 TEST_CASE(FullField, MetricsLen16_LeavesSlot16Untouched) {
@@ -208,15 +240,6 @@ TEST_CASE(FullField, NullMetrics_DoesNotCrash) {
     CHECK(n >= 0);
 }
 
-#else
-
-TEST_CASE(FullField, OpenCvRequired_SkippedWithoutOpenCV) {
-    // Suite still registers when OpenCV is absent so the filter surface is stable.
-    CHECK(true);
-}
-
-#endif // DIC_HAVE_OPENCV
-
 // ---------------------------------------------------------------------------
 // Full-field repeat determinism.
 //
@@ -239,9 +262,8 @@ TEST_CASE(FullField, RepeatSolve_BitIdenticalField) {
     cv::Mat ref_gray, def_gray;
     make_pair(ref_gray, def_gray);
 
-    // The default STEP/STRAIN_WIN pair puts one grid node inside the VSG window,
-    // so every point is rejected and the field is empty. Use a step and window
-    // that actually produce points, or this proves nothing.
+    // A finer step than the shared default, to get a denser field under test.
+    // strain_window must stay >= 2 * step or run_full_field rejects the pair.
     FullFieldParams params = params_for(W, H);
     params.step = 5;
     params.strain_window = 31;
@@ -287,3 +309,72 @@ TEST_CASE(FullField, RepeatSolve_BitIdenticalField) {
         CHECK(first_diff == (size_t)-1);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Point-accounting contract for the metrics array.
+//
+// docs/CONTRACT.md freezes slot 3 as "solved via mesh" (Path A) and slot 4 as
+// "solved via flood fill" (Path B). The anchor lattice added a third producer
+// of solved points, so those two no longer account for slot 1 on their own and
+// slot 19 carries the remainder. The failure this guards against is not a crash
+// but a quiet one: the anchor phase filled a ThreadStats vector that was never
+// passed to aggregate_thread_stats, so its points, iterations and rescue counts
+// were dropped and every "total" in the report was short by a whole IC-GN phase.
+// ---------------------------------------------------------------------------
+TEST_CASE(FullField, MetricsPointCountsAccountForEverySolvedPoint) {
+    cv::Mat ref_gray, def_gray;
+    make_pair(ref_gray, def_gray);
+
+    FullFieldParams params = params_for(W, H);
+    params.step = 5;
+    params.strain_window = 31;
+
+    const int gridW = params.rect_w / params.step;
+    const int gridH = params.rect_h / params.step;
+    const int cap = gridW * gridH * 8;
+
+    ReferenceCache cache;
+    cache.set_from_gray(ref_gray, cv::Mat());
+    std::vector<float> out((size_t)cap, 0.0f);
+    float metrics[23] = {};
+    const int n = run_full_field(cache, def_gray, cv::Mat(), params,
+                                 out.data(), cap, metrics, 23, nullptr);
+    REQUIRE(n > 0);
+
+    const int total_solved = (int)metrics[1];
+    const int via_mesh     = (int)metrics[3];
+    const int via_flood    = (int)metrics[4];
+    const int via_anchors  = (int)metrics[19];
+    const int post_dropped = (int)metrics[20];
+
+    std::printf("    anchors=%d + pathA=%d + pathB=%d = %d  vs  solved=%d + dropped=%d = %d\n",
+                via_anchors, via_mesh, via_flood,
+                via_anchors + via_mesh + via_flood,
+                total_solved, post_dropped, total_solved + post_dropped);
+
+    // The anchor lattice solves grid points outright, so this fails if its
+    // bucket is dropped again — which is exactly how the defect presented.
+    CHECK(via_anchors > 0);
+
+    // Every point some path solved is either in the output or was discarded by
+    // the strain post-filter. Nothing may fall out of the accounting in between.
+    CHECK(via_anchors + via_mesh + via_flood == total_solved + post_dropped);
+
+    // Mean ICGN iterations divides total iterations by valid_count. Dropping a
+    // phase's iterations while keeping its points understates it; a solve that
+    // converges at all cannot average below one iteration per point.
+    CHECK(metrics[8] >= 1.0f);
+
+    // Slot 18 is labelled total ICGN time and slot 17 total simplex time; both
+    // must cover the anchor phase, which runs before either path.
+    CHECK(metrics[18] > 0.0f);
+}
+
+#else
+
+TEST_CASE(FullField, OpenCvRequired_SkippedWithoutOpenCV) {
+    // Suite still registers when OpenCV is absent so the filter surface is stable.
+    CHECK(true);
+}
+
+#endif // DIC_HAVE_OPENCV

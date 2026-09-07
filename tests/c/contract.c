@@ -18,10 +18,11 @@
 /* ---- Compile-time Frozen shape. A break here is a build failure, not a
  *      silent runtime mis-read in a caller that was not recompiled. ---- */
 _Static_assert(SEMPER_FLOATS_PER_POINT == 8, "packed point stride is Frozen at 8");
-_Static_assert(SEMPER_METRICS_LEN == 17, "metrics length is Frozen at 17");
+_Static_assert(SEMPER_METRICS_LEN == 23, "metrics length grew to 23 in v0.3.0");
 _Static_assert(SEMPER_ERR_ROI == -2, "SEMPER_ERR_ROI is Frozen at -2");
 _Static_assert(SEMPER_ERR_INIT == -3, "SEMPER_ERR_INIT is Frozen at -3");
 _Static_assert(SEMPER_ERR_CANCELLED == -99, "SEMPER_ERR_CANCELLED is Frozen at -99");
+_Static_assert(SEMPER_ERR_STRAIN_WINDOW == -4, "SEMPER_ERR_STRAIN_WINDOW is Frozen at -4");
 
 /* semper_params layout is Frozen: reordering/inserting a field silently
  * mis-reads every caller's parameters. Pin size and every field offset. */
@@ -63,7 +64,10 @@ static semper_params valid_params(void) {
     p.rect_h = 112;
     p.step = 16;
     p.subset_size = 21;
-    p.strain_window = 5;
+    /* >= 2 * step, or the VSG window holds one grid node and semper_run
+       returns SEMPER_ERR_STRAIN_WINDOW. At the old value of 5 this whole
+       suite ran against an empty field. */
+    p.strain_window = 33;
     p.use_6x6_interpolator = 0;
     return p;
 }
@@ -115,6 +119,20 @@ static void test_degenerate_roi(uint8_t* ref, uint8_t* def) {
     int rc = semper_run(eng, def, (size_t)W * H, NULL, 0, &p, out, 8 * 4,
                         metrics, SEMPER_METRICS_LEN, NULL, NULL);
     CHECK(rc == SEMPER_ERR_ROI);
+    semper_destroy(eng);
+}
+
+/* ---- strain_window too small for step -> SEMPER_ERR_STRAIN_WINDOW (v0.3.0) ---- */
+static void test_strain_window_guard(uint8_t* ref, uint8_t* def) {
+    semper_engine* eng = semper_create();
+    CHECK(semper_set_reference(eng, ref, (size_t)W * H, NULL, 0, W, H) == 0);
+    semper_params p = valid_params();
+    p.strain_window = p.step;   /* one grid node in the VSG window */
+    float out[8 * 4];
+    float metrics[SEMPER_METRICS_LEN];
+    int rc = semper_run(eng, def, (size_t)W * H, NULL, 0, &p, out, 8 * 4,
+                        metrics, SEMPER_METRICS_LEN, NULL, NULL);
+    CHECK(rc == SEMPER_ERR_STRAIN_WINDOW);
     semper_destroy(eng);
 }
 
@@ -236,6 +254,7 @@ int main(void) {
     test_run_null_guards(def);
     test_set_reference_guards(ref);
     test_degenerate_roi(ref, def);
+    test_strain_window_guard(ref, def);
     test_capacity_rule(ref, def);
     test_metrics_len_rule(ref, def);
     test_cancel_independence(ref, def);

@@ -1,5 +1,5 @@
 // pybind11 bindings for the Semper DIC engine — wraps the C++ core directly.
-// NumPy in, (N, 8) points + (17,) metrics out. Behavior is identical to the
+// NumPy in, (N, 8) points + (23,) metrics out. Behavior is identical to the
 // Android/JNI path; see docs/CONTRACT.md for the frozen formats.
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
@@ -83,7 +83,7 @@ public:
         const int rows = step > 0 ? (p.rect_h / step + 1) : 0;
         const size_t max_pts = static_cast<size_t>(std::max(0, cols) * std::max(0, rows));
         std::vector<float> out(max_pts * 8, 0.0f);
-        float metrics[17] = {0};
+        float metrics[23] = {0};
 
         ProgressCallback cb;
         if (!progress.is_none()) {
@@ -98,10 +98,10 @@ public:
         {
             py::gil_scoped_release rel;  // long solve must not hold the GIL
             n = run_full_field(cache_, def, roi, p, out.data(),
-                               static_cast<int>(out.size()), metrics, 17, cancel_, cb);
+                               static_cast<int>(out.size()), metrics, 23, cancel_, cb);
         }
 
-        py::array_t<float> met(17);
+        py::array_t<float> met(23);
         std::memcpy(met.mutable_data(), metrics, sizeof(metrics));
         if (n < 0) {
             return py::make_tuple(n, py::none(), met);

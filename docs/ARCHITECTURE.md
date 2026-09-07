@@ -36,6 +36,13 @@ is a final result for that node. Path A then skips it and Path B takes it as a
 boundary seed. See [SEEDING_BENCHMARK.md](SEEDING_BENCHMARK.md) for why this
 replaced AKAZE feature matching.
 
+"Converges well enough" is decided in two steps, not one. The lattice solve
+records every node's outcome and writes nothing to the field; the universal
+median test then runs over the whole lattice; and only then does
+`publish_anchor_results` mark the survivors solved. A node that correlates
+confidently onto the wrong speckle blob is dropped by the median test before
+Path B can flood fill from it.
+
 Package layout and contributor rules: [`README.md`](../README.md).
 
 ---
@@ -306,8 +313,7 @@ starts — a pending edit can never reach the engine uncommitted.
 | `src/math/` | Image / SubsetPrecomputer / OptimizationEngine |
 | `src/strain/` | StrainCalculator |
 | `src/io/` | Platform-agnostic OpenCV decode |
-| `src/seeding/` | phase correlation (global rigid shift) |
-| `src/pipeline/` | Anchor seeding + full-field Path A/B/C + OpenMP |
+| `src/pipeline/` | Anchor seeding (phase correlation + lattice) + full-field Path A/B/C + OpenMP |
 | `adapters/android/` | JNI only → `libsemper_core.so` |
 | `adapters/c/` | Stable C ABI → `libsemper_c` |
 | `bindings/python/` | pybind11 module |
@@ -319,13 +325,28 @@ CMake targets: `semper_math`, `semper_pipeline`, `semper_android` (`OUTPUT_NAME 
 
 ## Dependencies (git submodules, built from source)
 
-Both libraries are **git submodules pinned to release tags**, not vendored
-binaries. Run `git submodule update --init --recursive` after cloning.
+Both libraries are **git submodules**, not vendored binaries. Run
+`git submodule update --init --recursive` after cloning.
 
-| Dependency | Path | Version | How it's used |
-|---|---|---|---|
-| **Eigen** | `third_party/eigen` | 5.0.1 | header-only; added via `include_directories` |
-| **OpenCV** | `third_party/opencv` | 4.13.0 | **compiled from source** in the engine build |
+`.gitmodules` records only `path` and `url` — there is no `branch` or tag entry.
+What pins the build is the **commit SHA the superproject records**, which is
+what `git submodule update` checks out. Those SHAs currently sit exactly on the
+upstream release tags below, so `git submodule status` prints the tag name, but
+that is a property of the commits chosen, not a constraint the repo enforces:
+bumping a submodule to an arbitrary commit would be accepted silently. Verify
+with `git submodule status` rather than trusting this table.
+
+| Dependency | Path | Recorded commit | Tag at that commit | How it's used |
+|---|---|---|---|---|
+| **Eigen** | `third_party/eigen` | `bc3b3987` | 5.0.1 | header-only; added via `include_directories` |
+| **OpenCV** | `third_party/opencv` | `fe38fc60` | 4.13.0 | **compiled from source** in the engine build |
+
+**OpenCV modules compiled:** `core,imgproc,imgcodecs` only
+(`SEMPER_OPENCV_BUILD_LIST` in `cmake/SemperOpenCV.cmake`, overridable from the
+cache). `features2d`, `flann` and `calib3d` were dropped in v0.2.2 along with the
+descriptor seeding front-end that used them; that removal is worth ~29% of the
+aarch64 `libsemper_c.so`. Nothing under `include/semper/` includes a header from
+the dropped modules, so re-adding one is a deliberate act, not an accident.
 
 **Sparse OpenCV checkout:** the full OpenCV repo includes `doc/`, `samples/`,
 `data/`, and `apps/` that this project never builds. After submodule init, run
@@ -377,3 +398,29 @@ configure.
   omit `-flto` (MinGW LTO + DLL is unstable).
 - 16 KB page alignment: `-Wl,-z,max-page-size=16384` on the Android shared lib for
   Android 15+ devices.
+
+### Platform support, and what CI actually gates
+
+| platform | status | gated by |
+|---|---|---|
+| Linux x86_64 (GCC, Clang) | supported | every CI job |
+| Android arm64-v8a | shipping target | not built in CI; built by the app |
+| Windows x86_64 (MinGW-w64) | **works, but ungated** | nothing |
+| aarch64 Linux cross | measurement only | nothing (see the toolchain header) |
+| MSVC | headers declare `dllexport`/`dllimport`, never built | nothing |
+
+Windows is a first-class *development* platform here — the engine, the C SDK
+and the full test suite all build and pass under MinGW-w64 — but no workflow
+builds it, so nothing stops a Windows break from landing. That is not
+hypothetical: `tests/integration/test_seeding_bench.cpp` shipped with an
+unguarded `<sys/resource.h>`, which broke not the benchmark but the whole
+`dic_tests` binary, and it survived review and a green CI run because CI is
+Linux.
+
+A Windows job is the real fix and is not currently justified: it would have to
+build the vendored OpenCV submodule on a Windows runner, which is the slowest
+part of the build and would dominate CI time for a platform nothing ships on.
+Until that changes, the rule is procedural: **a change that touches system
+headers, process/OS APIs or paths must be compiled on both hosts before
+merge**, and cross-host numeric results are covered separately by the
+tolerances documented in [TESTING.md](TESTING.md).
