@@ -115,6 +115,7 @@ Configure with `-DSEMPER_ANDROID=ON`. The shared library `OUTPUT_NAME` is
 | [docs/TESTING.md](docs/TESTING.md) | Host / C / Python test catalog |
 | [docs/EXAMPLES.md](docs/EXAMPLES.md) | Beginner samples + verified results |
 | [docs/PERF_BASELINE_bd44af0.md](docs/PERF_BASELINE_bd44af0.md) | Non-regression speed/quality floor |
+| [docs/VALIDATION.md](docs/VALIDATION.md) | Cross-check against pydic; large-deformation envelope |
 
 Output packing (**8 floats/point**), metrics layout (**17 floats**), and return
 codes are **Frozen**. Touching `include/semper/*` requires stating the semver

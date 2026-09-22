@@ -58,5 +58,10 @@ See [docs/CONTRACT.md](../docs/CONTRACT.md) and
 ## Going further
 
 - Inspect `samples/oht_cfrp/` for a real experiment + DICe solution file.
+- `python examples/python/envelope_sweep.py [--image my_ref.tif]` — how large a
+  translation, rotation, stretch or shear your own speckle can take in one solve.
+- [python/pydic_crosscheck/](python/pydic_crosscheck/) — the engine against pydic
+  on pydic's bending, tension and wedge-splitting series.
+  Results: [docs/VALIDATION.md](../docs/VALIDATION.md).
 - Host suite: `dic_tests DiceTranslationReal` / `DiceFieldAgreement`.
 - Catalog: [docs/TESTING.md](../docs/TESTING.md) · [docs/EXAMPLES.md](../docs/EXAMPLES.md).
