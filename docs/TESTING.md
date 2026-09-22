@@ -402,8 +402,26 @@ The downstream app's own test map lives in that private repository (see
 ["Downstream app tests"](#downstream-app-tests-informative) above); it is not
 reachable from this tree.
 
+## Suite: `StrainSweep` — `integration/test_strain_sweep.cpp`
+
+Characterization of the large-strain limit on the exact analytic speckle. Prints
+tables; asserts only the validated 1% operating point, so it never gates on the
+characterized limit itself. `FullField` is OpenCV-gated.
+
+| Test | Measures |
+|---|---|
+| `SubsetHomogeneous` | Recovery of homogeneous uniaxial $u_x=\varepsilon$ up to 100%, coarse and fine speckle, $N\in\{21,31,41\}$, from three starts: zero gradient (Path B seed), zero gradient + Simplex, exact gradient (Path A) |
+| `SubsetBand` | Gaussian strain band $\varepsilon(x)=\varepsilon_0 e^{-(x-c)^2/2w^2}$, $w\in\{40,20,10\}$ px: accepted / ZNSSD-rejected / non-converged / accepted-but-biased, against the second-order edge residual $\tfrac12\lvert\varepsilon'\rvert(N/2)^2$ |
+| `FullField` | `run_full_field` on both fields: seeding path, displacement and packed coverage, $E_{xx}$ error (homogeneous) and peak $E_{xx}$ attenuation (band) |
+
 ## Known limitations / future work
 
+- **`ReferenceCache` AKAZE keypoints are not invalidated on an ROI change**
+  (`StrainSweep.FullField` uses a fresh cache per ROI for this reason): the cached
+  reference keypoints are in padded-ROI coordinates and are cleared only when the
+  AKAZE scale changes (`full_field_akaze.cpp`). Reusing a cache with a different
+  `rect_x/rect_y` offsets every seed; on the 512² sweep pair, ROI 160 → 96 with one
+  cache solves 0/1024 points versus 1024/1024 with a fresh cache.
 - **Per-ABI numerical drift**: the host suite runs on x86 SSE. To compare ABIs,
   build the same suite with the NDK toolchain per-ABI and run on devices —
   tolerances are already set to absorb fast-math reassociation differences.

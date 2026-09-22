@@ -67,6 +67,7 @@ set(DIC_INTEGRATION_TESTS
         integration/test_optimization_engine.cpp
         integration/test_robustness.cpp
         integration/test_golden_corpus.cpp
+        integration/test_strain_sweep.cpp
 )
 set(DIC_DICE_TESTS
         dice/test_translation_synthetic.cpp

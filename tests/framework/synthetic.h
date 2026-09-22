@@ -33,11 +33,12 @@ namespace dictest {
     class SpeckleField {
     public:
         explicit SpeckleField(unsigned seed, int width, int height,
-                              int blob_count = 400) {
+                              int blob_count = 400,
+                              float sigma_min = 1.5f, float sigma_max = 3.5f) {
             std::mt19937 rng(seed);
             std::uniform_real_distribution<float> ux(0.0f, (float) width);
             std::uniform_real_distribution<float> uy(0.0f, (float) height);
-            std::uniform_real_distribution<float> usigma(1.5f, 3.5f);
+            std::uniform_real_distribution<float> usigma(sigma_min, sigma_max);
             std::uniform_real_distribution<float> uamp(-90.0f, 90.0f);
 
             cx_.reserve(blob_count);
