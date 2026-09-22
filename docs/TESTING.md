@@ -412,6 +412,8 @@ characterized limit itself. `FullField` is OpenCV-gated.
 |---|---|
 | `SubsetHomogeneous` | Recovery of homogeneous uniaxial $u_x=\varepsilon$ up to 100%, coarse and fine speckle, $N\in\{21,31,41\}$, from three starts: zero gradient (Path B seed), zero gradient + Simplex, exact gradient (Path A) |
 | `SubsetBand` | Gaussian strain band $\varepsilon(x)=\varepsilon_0 e^{-(x-c)^2/2w^2}$, $w\in\{40,20,10\}$ px: accepted / ZNSSD-rejected / non-converged / accepted-but-biased, against the second-order edge residual $\tfrac12\lvert\varepsilon'\rvert(N/2)^2$ |
+| `SecondOrderSubsetBand` | Engine IC-GN vs the experimental forward-additive Gauss-Newton solver (`src/math/second_order_solver.cpp`, test-only) at order 1 (control) and order 2 on the band subsets: acceptance, median $\lvert\Delta u\rvert$, median $\lvert\Delta u_x\rvert$ |
+| `SecondOrderPeakStrain` | Peak $E_{xx}$ at the band centre from a 21×11 grid: engine + VSG, order 2 + VSG, and each solver's own subset $u_x$ without VSG — separates subset and VSG attenuation |
 | `FullField` | `run_full_field` on both fields: seeding path, displacement and packed coverage, $E_{xx}$ error (homogeneous) and peak $E_{xx}$ attenuation (band) |
 
 ## Known limitations / future work

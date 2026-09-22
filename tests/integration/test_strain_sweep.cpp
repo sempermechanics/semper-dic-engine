@@ -16,6 +16,10 @@
 //   ZG+SX   same, Simplex rescue allowed         → production A/B flag
 //   TG      (u,v) and local gradient exact, ICGN → ideal Path A start
 //
+// SecondOrder* compare the engine against the experimental forward-additive
+// Gauss-Newton solver (src/math/second_order_solver.cpp) at order 1 (control:
+// same shape function as the engine, different optimiser) and order 2.
+//
 // FullField runs run_full_field end to end (OpenCV builds only).
 //
 // This is a characterization, not a gate: the tables are printed for
@@ -25,8 +29,11 @@
 #include "framework/synthetic.h"
 
 #include <semper/solver.hpp>
+#include <semper/strain.hpp>
 #include <semper/subset.hpp>
 #include <semper/tuning.hpp>
+
+#include "math/second_order_solver.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -237,6 +244,171 @@ TEST_CASE(StrainSweep, SubsetBand) {
                 if (eps0 == 0.01f)
                     for (int di = 0; di < 3; ++di) CHECK(acc[di] == tot[di]);
             }
+        }
+    }
+}
+
+namespace {
+
+    using Semper::experimental::ShapeFitResult;
+    using Semper::experimental::solve_shape_fagn;
+
+    float median(std::vector<float> v) {
+        if (v.empty()) return -1.f;
+        std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+        return v[v.size() / 2];
+    }
+
+    ShapeFitResult fagn(const SubsetData &s, const Image &def, int order, float u, float ux) {
+        float p0[12] = {u, 0.f, ux, 0.f, 0.f, 0.f};
+        return solve_shape_fagn(s, def, order, p0);
+    }
+
+} // namespace
+
+// Subset level: same 27 band subsets as SubsetBand. For each solver, the share
+// of subsets that converge, pass the ZNSSD gate, and land within |du| <= 0.1 px
+// and |dux − eps(x)| <= 0.01 of the POINT values; plus the median errors at N=31.
+TEST_CASE(StrainSweep, SecondOrderSubsetBand) {
+    const float CX = SW / 2.0f, CY = SH / 2.0f;
+    const auto &sp = SPECKLES[0];
+    dictest::SpeckleField field(/*seed=*/2024, SW, SH, sp.blobs, sp.s0, sp.s1);
+    const Image ref = dictest::make_reference_image(field, SW, SH);
+
+    std::printf("\n  Second-order shape function, band, %s. IC1 = engine IC-GN (order 1);\n"
+                "  FA1 = FA-GN order 1 (control); FA2 = FA-GN order 2. Start: exact u, u_x; second-order terms 0.\n"
+                "  ok = accepted AND |du|<=%.1f px AND |dux|<=%.2f vs point values; errors are medians at N=31.\n",
+                sp.name, TOL_U, TOL_GRAD);
+    std::printf("  %4s %6s | %-17s | %-17s | %-17s | %-23s | %s\n", "w", "eps0", "IC1 ok", "FA1 ok", "FA2 ok",
+                "|du| px  IC1/FA1/FA2", "|dux| IC1/FA1/FA2");
+
+    for (float w : {40.0f, 20.0f, 10.0f}) {
+        std::vector<int> xs;
+        for (float f : {-2.0f, -1.5f, -1.0f, -0.5f, 0.0f, 0.5f, 1.0f, 1.5f, 2.0f})
+            xs.push_back((int)std::lround(CX + f * w));
+        const int ys[] = {(int)CY - 30, (int)CY, (int)CY + 30};
+
+        for (float eps0 : {0.05f, 0.10f, 0.20f, 0.30f, 0.50f}) {
+            const Band band{eps0, w, CX};
+            const Image def = make_band_image(field, SW, SH, band);
+
+            int ok[3][3] = {}, tot[3] = {};
+            std::vector<float> du[3], dux[3];
+            for (int di = 0; di < 3; ++di) {
+                for (int y : ys)
+                    for (int x : xs) {
+                        SubsetData s;
+                        SubsetPrecomputer::precompute_subset(s, ref, x, y, DIMS[di]);
+                        if (!s.is_initialized) continue;
+                        tot[di]++;
+                        const float ut = band.u((float)x), et = band.eps((float)x);
+
+                        OptimizationEngine e;
+                        e.lm_enabled = true;
+                        e.lm_alpha = Semper::tuning::kLmAlpha;
+                        const auto r0 = e.calculate_deformation(s, def, ut, 0, et, 0, 0, 0, INIT_NO_SIMPLEX);
+                        const ShapeFitResult r1 = fagn(s, def, 1, ut, et);
+                        const ShapeFitResult r2 = fagn(s, def, 2, ut, et);
+
+                        const float st[3] = {(float)r0.status, (float)r1.status, (float)r2.status};
+                        const float zn[3] = {r0.correlation_score, r1.correlation_score, r2.correlation_score};
+                        const float eu[3] = {std::fabs(r0.u - ut), std::fabs(r1.p[0] - ut), std::fabs(r2.p[0] - ut)};
+                        const float ev[3] = {std::fabs(r0.v), std::fabs(r1.p[1]), std::fabs(r2.p[1])};
+                        const float eg[3] = {std::fabs(r0.ux - et), std::fabs(r1.p[2] - et), std::fabs(r2.p[2] - et)};
+                        for (int k = 0; k < 3; ++k) {
+                            ok[k][di] += st[k] == 0 && zn[k] <= Semper::tuning::kCorrAccept && eu[k] <= TOL_U &&
+                                         ev[k] <= TOL_U && eg[k] <= TOL_GRAD;
+                            if (DIMS[di] == 31 && st[k] == 0) {
+                                du[k].push_back(eu[k]);
+                                dux[k].push_back(eg[k]);
+                            }
+                        }
+                    }
+                REQUIRE(tot[di] > 0);
+            }
+            std::printf("  %4.0f %5.0f%% |", w, eps0 * 100.f);
+            for (int k = 0; k < 3; ++k)
+                std::printf(" %4d%% %4d%% %4d%% |", (100 * ok[k][0]) / tot[0], (100 * ok[k][1]) / tot[1],
+                            (100 * ok[k][2]) / tot[2]);
+            std::printf(" %6.3f/%6.3f/%6.3f  | %6.4f/%6.4f/%6.4f\n", median(du[0]), median(du[1]), median(du[2]),
+                        median(dux[0]), median(dux[1]), median(dux[2]));
+
+            // The order-2 model contains the band's local strain gradient: on the
+            // wide band it must match or beat the order-1 control at every N, and
+            // recover every subset at N >= 31 (at N = 21 the six extra DOF cost
+            // some gradient precision, so that size is not pinned).
+            if (w == 40.0f && eps0 == 0.20f)
+                for (int di = 0; di < 3; ++di) {
+                    CHECK(ok[2][di] >= ok[1][di]);
+                    if (DIMS[di] >= 31) CHECK(ok[2][di] == tot[di]);
+                }
+        }
+    }
+}
+
+// Grid level: where does the peak attenuation come from? A 21x11 grid (step
+// 10 px, N = 31) across the band is solved per subset from the exact start,
+// then the peak E_xx at the band centre is estimated four ways:
+//   IC1+VSG  engine IC-GN displacements → VSG (production path)
+//   FA2+VSG  order-2 displacements      → VSG
+//   IC1 pt   engine IC-GN u_x at the centre subset (no VSG)
+//   FA2 pt   order-2 u_x at the centre subset (no VSG)
+TEST_CASE(StrainSweep, SecondOrderPeakStrain) {
+    constexpr int STEP = 10, N = 31, VSG = 41;
+    const float CX = SW / 2.0f, CY = SH / 2.0f;
+    const auto &sp = SPECKLES[0];
+    dictest::SpeckleField field(/*seed=*/2024, SW, SH, sp.blobs, sp.s0, sp.s1);
+    const Image ref = dictest::make_reference_image(field, SW, SH);
+
+    const int GW = 21, GH = 11;
+    const int x0 = (int)CX - STEP * (GW / 2), y0 = (int)CY - STEP * (GH / 2);
+    const int centre = (GH / 2) * GW + GW / 2;
+
+    std::printf("\n  Peak E_xx at the band centre, grid step %d, N=%d, VSG %d, %s. Ratios measured/true.\n",
+                STEP, N, VSG, sp.name);
+    std::printf("  %4s %6s | %8s | %8s %8s %8s %8s\n", "w", "eps0", "Exx true", "IC1+VSG", "FA2+VSG",
+                "IC1 pt", "FA2 pt");
+
+    for (float w : {40.0f, 20.0f, 10.0f}) {
+        for (float eps0 : {0.05f, 0.20f, 0.50f}) {
+            const Band band{eps0, w, CX};
+            const Image def = make_band_image(field, SW, SH, band);
+
+            Semper::DisplacementField d1, d2;
+            for (auto *d : {&d1, &d2}) {
+                d->width = GW; d->height = GH; d->step = STEP;
+                d->u.assign(GW * GH, 0.f); d->v.assign(GW * GH, 0.f); d->valid.assign(GW * GH, false);
+            }
+            float ux1c = 0.f, vx1c = 0.f, ux2c = 0.f, vx2c = 0.f;
+            for (int gy = 0; gy < GH; ++gy)
+                for (int gx = 0; gx < GW; ++gx) {
+                    const int x = x0 + gx * STEP, y = y0 + gy * STEP, idx = gy * GW + gx;
+                    SubsetData s;
+                    SubsetPrecomputer::precompute_subset(s, ref, x, y, N);
+                    if (!s.is_initialized) continue;
+                    const float ut = band.u((float)x), et = band.eps((float)x);
+                    OptimizationEngine e;
+                    e.lm_enabled = true;
+                    e.lm_alpha = Semper::tuning::kLmAlpha;
+                    const auto r1 = e.calculate_deformation(s, def, ut, 0, et, 0, 0, 0, INIT_NO_SIMPLEX);
+                    if (r1.status == 0 && r1.correlation_score <= Semper::tuning::kCorrAccept) {
+                        d1.u[idx] = r1.u; d1.v[idx] = r1.v; d1.valid[idx] = true;
+                        if (idx == centre) { ux1c = r1.ux; vx1c = r1.vx; }
+                    }
+                    const ShapeFitResult r2 = fagn(s, def, 2, ut, et);
+                    if (r2.status == 0 && r2.correlation_score <= Semper::tuning::kCorrAccept) {
+                        d2.u[idx] = r2.p[0]; d2.v[idx] = r2.p[1]; d2.valid[idx] = true;
+                        if (idx == centre) { ux2c = r2.p[2]; vx2c = r2.p[4]; }
+                    }
+                }
+            const auto s1 = Semper::StrainCalculator::compute_vsg_strain(d1, VSG);
+            const auto s2 = Semper::StrainCalculator::compute_vsg_strain(d2, VSG);
+            const float truth = eps0 + 0.5f * eps0 * eps0;
+            auto gl = [](float ux, float vx) { return ux + 0.5f * (ux * ux + vx * vx); };
+            auto ratio = [&](float v) { return v <= Semper::tuning::kStrainFailSentinel ? -1.f : v / truth; };
+            std::printf("  %4.0f %5.0f%% | %8.4f | %8.3f %8.3f %8.3f %8.3f\n", w, eps0 * 100.f, truth,
+                        ratio(s1.exx[centre]), ratio(s2.exx[centre]), gl(ux1c, vx1c) / truth,
+                        gl(ux2c, vx2c) / truth);
         }
     }
 }

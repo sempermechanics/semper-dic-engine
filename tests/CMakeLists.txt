@@ -86,6 +86,8 @@ set(DIC_ENGINE_SOURCES
         ${NATIVE_ROOT}/src/math/optimization_engine.cpp
         ${NATIVE_ROOT}/src/strain/strain_calculator.cpp
         ${NATIVE_ROOT}/src/pipeline/cancel.cpp
+        # Experimental, test-only (not in semper_math): StrainSweep.SecondOrder*
+        ${NATIVE_ROOT}/src/math/second_order_solver.cpp
 )
 
 # Full-field solver + seeding (OpenCV). Linked only when OpenCV is present so
