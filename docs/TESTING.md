@@ -309,6 +309,41 @@ quality. OpenCV-gated.
 | `MetricsLen16_LeavesSlot16Untouched` | `metrics_len == 16` fills 0..15 and never writes slot 16 | Write past a 16-float caller buffer |
 | `NullMetrics_DoesNotCrash` | `metrics == nullptr` is legal | Null-deref when a caller wants points only |
 
+## Suite: `Envelope` — `integration/test_operating_envelope.cpp`
+
+`run_full_field` under **large homogeneous deformation**, full pipeline
+including AKAZE seeding, against analytic ground truth (512² `SpeckleField`,
+seed 21). Every point is checked, not a median: max displacement error
+≤ 0.10 px, max Green-Lagrange strain error ≤ 3×10⁻³, and every VSG-supported
+interior grid point must be solved. OpenCV-gated.
+
+The shape function (6-DOF affine) and strain measure (Green-Lagrange) are exact
+for any homogeneous warp, so the limit is seeding. On this speckle single-shot
+seeding holds to 40% stretch / γ = 0.4 and first fails at 50% / γ = 0.5. The
+tests assert **floors well inside that**, not the failure point: asserting the
+cliff would fail CI on a seeding improvement, and behaviour at the edge is
+non-monotonic (70% stretch succeeds via Path C while 50–60% return −1). All five
+cases passed on five independent speckle seeds; the worst reached
+0.058 px / 1.8×10⁻³ against the 0.10 / 3×10⁻³ tolerances. See
+[VALIDATION.md](VALIDATION.md) for the envelope on real speckle.
+
+Rendering the 512² field dominates the cost: ~4 s in Release, ~5 min in the
+`-O0` coverage build, where the suite is skipped for runtime (its results there
+were verified identical to Release).
+
+| Test | Proves | Failure would mean |
+|---|---|---|
+| `LargeTranslation_100px_Recovered` | (100.3, −40.6) px, far outside Path C's ±15 px search, is seeded by the AKAZE mesh and solved to sub-pixel | Large-displacement seeding regressed — the solve falls back to Path C and returns −1 |
+| `RigidRotation_45deg_IsStrainFree` | A 45° rigid rotation (displacements up to ~130 px) reports E ≈ 0 | Strain measure no longer objective: a small-strain formula would report exx = cos 45° − 1 = −0.29 |
+| `UniaxialStretch_30pct_Recovered` | 30% stretch: Exx = 0.345 recovered, other components ≈ 0 | Large-strain seeding or the quadratic Green-Lagrange terms regressed |
+| `SimpleShear_Gamma0p3_Recovered` | γ = 0.3: Exy = 0.15 and Eyy = γ²/2 = 0.045 recovered | Shear seeding, uy/vx handling, or the quadratic term in Eyy regressed |
+| `RotationPlusStretch_StrainIgnoresRotation` | A = R(30°)·diag(1.2, 1) reports E = diag(0.22, 0) — the stretch alone | Rotation leaks into strain when combined with real deformation |
+
+Mutation-checked when added: replacing Green-Lagrange with small strain in
+`strain_calculator.cpp` fails the four gradient cases (translation, correctly,
+still passes); disabling the AKAZE mesh (`ref_pts.size() >= 25` → an
+unreachable count) fails all five.
+
 ### C ABI contract — `tests/c/contract.c` (built with `SEMPER_BUILD_C_SDK`)
 
 Where `c/smoke.c` proves the happy path runs, `c/contract.c` pins the **Frozen
@@ -363,8 +398,8 @@ tests/
                             test_cancel_token, test_image_codec (OpenCV-gated)
   integration/            the assembled engine end-to-end + robustness
                             test_optimization_engine, test_robustness,
-                            test_full_field_contracts, test_reference_cache
-                            (the last two OpenCV-gated)
+                            test_full_field_contracts, test_reference_cache,
+                            test_operating_envelope (the last three OpenCV-gated)
   dice/                   DICe golden comparisons
   perf/                   throughput gates
 ```
@@ -372,7 +407,8 @@ tests/
 `tests/CMakeLists.txt` lists sources under `DIC_UNIT_TESTS` /
 `DIC_INTEGRATION_TESTS` / `DIC_DICE_TESTS` / `DIC_PERF_TESTS`, plus
 `DIC_PIPELINE_TESTS` for the OpenCV-gated suites (`test_full_field_contracts`,
-`test_image_codec`, `test_reference_cache`) — attached only when OpenCV is present.
+`test_image_codec`, `test_reference_cache`, `test_operating_envelope`) — attached
+only when OpenCV is present.
 
 ## Adding a new test
 

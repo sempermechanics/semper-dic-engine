@@ -111,6 +111,7 @@ set(DIC_PIPELINE_TESTS
         integration/test_full_field_contracts.cpp
         unit/test_image_codec.cpp
         integration/test_reference_cache.cpp
+        integration/test_operating_envelope.cpp
 )
 
 add_executable(dic_tests
