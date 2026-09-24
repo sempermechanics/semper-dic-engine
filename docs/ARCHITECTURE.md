@@ -264,8 +264,8 @@ Where it is polled, and why there:
 | Site | Shape |
 |---|---|
 | Hessian pre-pass, Path A mesh execution | `if (cancel_requested()) continue;` — OpenMP forbids breaking out of a parallel `for`, so a cancel skips the remaining iterations |
-| Path B queue workers | `return` at the top of the work loop, plus the flag in the condition-variable predicate |
-| Path B's CV wait | bounded (`wait_for`, 20 ms) — a worker parked on an empty queue has no one to notify it of a cancel, so it re-checks on a timer |
+| Path B workers | the flag in the condition-variable predicate, then `return` |
+| Path B's CV wait | bounded (`wait_for`, 20 ms) — a worker waiting for the next round has no one to notify it of a cancel, so it re-checks on a timer |
 | After Path A, after Path B | `return kCancelled` — a cancelled field is partial, so strain and packing are never run on it |
 
 `run_full_field` returns `kCancelled` (**-99**), which is deliberately the same

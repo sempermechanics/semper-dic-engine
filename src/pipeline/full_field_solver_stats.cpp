@@ -137,11 +137,11 @@ void log_profiling_summary(
              s.a_simp_calls, s.a_simp_crash, s.a_simp_timeout, s.a_simp_saved, s.a_simp_dead);
     }
 
+    LOGD("Path B (Flood Fill):  %.2f ms (Throughput: %.1f pts/ms)", t.pathB, (t.pathB > 0) ? s.pathB_pts / t.pathB : 0.0);
     if (s.pathB_pts > 0) {
         LOGD("  ↳ Path B ICGN Math: %.2f ms | Simplex: %.2f ms", s.b_icgn, s.b_simp);
         LOGD("      ↳ %d Calls (%d Crashes, %d Timeouts) -> %d Saved, %d Dead",
              s.b_simp_calls, s.b_simp_crash, s.b_simp_timeout, s.b_simp_saved, s.b_simp_dead);
-        LOGD("  ↳ Path B Wait Time: %.2f ms (Thread idle/lock contention)", s.b_wait);
     }
 
     LOGD("Strain Calculation:   %.2f ms", t.strain);
