@@ -2,7 +2,9 @@
 #include <semper/tuning.hpp>
 #include "util/log.hpp"
 #include <Eigen/Dense>
+#include <algorithm>
 #include <cmath>
+#include <vector>
 
 namespace Semper {
 
@@ -137,5 +139,83 @@ namespace Semper {
             }
         }
         return strain;
+    }
+
+    namespace {
+
+        // Median of vals (reordered). The mean of the middle two when the count
+        // is even, so it matches numpy's median.
+        float median_of(std::vector<float>& vals) {
+            const size_t n = vals.size();
+            const size_t mid = n / 2;
+            std::nth_element(vals.begin(), vals.begin() + mid, vals.end());
+            float hi = vals[mid];
+            if (n % 2 == 1) return hi;
+            float lo = *std::max_element(vals.begin(), vals.begin() + mid);
+            return 0.5f * (lo + hi);
+        }
+
+        // Normalized residual of centre against its neighbours: distance from
+        // their median over the median of their own distances from it, plus eps.
+        float normalized_residual(float centre, std::vector<float>& nb, std::vector<float>& scratch) {
+            float med = median_of(nb);
+            scratch.resize(nb.size());
+            for (size_t i = 0; i < nb.size(); ++i) scratch[i] = std::abs(nb[i] - med);
+            float spread = median_of(scratch);
+            return std::abs(centre - med) / (spread + tuning::kOutlierEpsPx);
+        }
+
+    } // namespace
+
+    int StrainCalculator::reject_displacement_outliers(DisplacementField& disp) {
+        const int w = disp.width, h = disp.height;
+        const int r = tuning::kOutlierRadius;
+        // Flags from finished passes. A pass reads only these, so the order
+        // points are visited in does not change the result.
+        std::vector<bool> ok = disp.valid;
+        std::vector<int> failed;
+        std::vector<float> nu, nv, scratch;
+        const size_t max_nb = static_cast<size_t>((2 * r + 1) * (2 * r + 1) - 1);
+        nu.reserve(max_nb);
+        nv.reserve(max_nb);
+        scratch.reserve(max_nb);
+        int rejected = 0;
+
+        for (int pass = 0; pass < tuning::kOutlierMaxPasses; ++pass) {
+            failed.clear();
+            for (int y = 0; y < h; ++y) {
+                for (int x = 0; x < w; ++x) {
+                    const int idx = y * w + x;
+                    if (!ok[idx]) continue;
+                    nu.clear();
+                    nv.clear();
+                    for (int dy = -r; dy <= r; ++dy) {
+                        const int ny = y + dy;
+                        if (ny < 0 || ny >= h) continue;
+                        for (int dx = -r; dx <= r; ++dx) {
+                            const int nx = x + dx;
+                            if (nx < 0 || nx >= w || (dx == 0 && dy == 0)) continue;
+                            const int nidx = ny * w + nx;
+                            if (!ok[nidx]) continue;
+                            nu.push_back(disp.u[nidx]);
+                            nv.push_back(disp.v[nidx]);
+                        }
+                    }
+                    if (static_cast<int>(nu.size()) < tuning::kOutlierMinNeighbours) continue;
+                    if (normalized_residual(disp.u[idx], nu, scratch) > tuning::kOutlierThreshold ||
+                        normalized_residual(disp.v[idx], nv, scratch) > tuning::kOutlierThreshold) {
+                        failed.push_back(idx);
+                    }
+                }
+            }
+            if (failed.empty()) break;
+            for (int idx : failed) ok[idx] = false;
+            rejected += static_cast<int>(failed.size());
+        }
+
+        for (size_t i = 0; i < ok.size(); ++i) {
+            if (!ok[i]) disp.valid[i] = false;
+        }
+        return rejected;
     }
 }

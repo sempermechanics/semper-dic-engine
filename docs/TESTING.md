@@ -235,6 +235,11 @@ precision, not "close enough".
 | `VsgRecoversGeneralLinearField` | All three strain components for a general 4-coefficient field, at multiple interior points |
 | `VsgRigidBodyTranslationGivesZeroStrain` | Constant displacement → zero strain (the classic false-strain bug) |
 | `VsgLeavesSentinelWhereWindowUnsupported` | Corner points (<90% window fill) and invalidated points keep the `−1000` sentinel |
+| `OutlierTestLeavesSmoothNoisyFieldAlone` | A general linear field with ±0.1 px noise loses no point to the median test |
+| `OutlierTestRejectsASingleSpike` | One point 3 px off is the only one rejected |
+| `OutlierTestRejectsAWholeCluster` | A 4x4 block 20 px off is rejected whole (its inner points only on a later pass), and strain beside it is the field's again |
+| `OutlierTestKeepsAStraightJump` | A 5 px step along a column (a crack) is not an outlier on either side |
+| `OutlierTestSkipsSparseAndInvalidPoints` | Under 3 neighbours, no test; an already invalid point is neither counted nor used |
 
 ## Suite: `CancelToken` — `unit/test_cancel_token.cpp`
 

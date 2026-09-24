@@ -266,6 +266,7 @@ struct PackedFieldResult {
     StrainField strain;
     int valid_count = 0;
     int dropped_by_post_filter = 0;
+    int dropped_as_outlier = 0;
     bool output_truncated = false;
     double time_strain_ms = 0.0;
 };
