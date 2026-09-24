@@ -509,6 +509,41 @@ double dudy = Cu(2);
 
 ```
 
+### 9.4 Displacement Outlier Rejection
+
+**Motivation:** A wrong match can pass the ZNSSD check, and on real images wrong
+matches come in clusters: a dozen neighbouring points all off by about the same
+amount (≈ 20 px near a bending beam's edge). One such point inside a VSG
+window tilts the whole plane fit, so strain there can be off by 10⁵–10⁶ µε.
+
+**Method:** the normalized median test (Westerweel & Scarano 2005), per
+component, before the VSG fit. For a point with value `x` (u or v) and accepted
+neighbours `x_i` in its 5x5 block:
+
+```
+m  = median(x_i)
+rm = median(|x_i − m|)
+r  = |x − m| / (rm + ε)          ε = 0.1 px
+```
+
+The point is rejected when `r > 3` for u or v. A point with fewer than 3
+accepted neighbours is not tested. The test is repeated with rejected points
+removed from every neighbourhood until a pass rejects nothing (at most 5
+passes): inside a cluster the wrong values are the local majority, so the
+cluster is peeled from its edge inward. A straight jump (a crack) survives,
+because each side is its own majority.
+
+**Where:** `StrainCalculator::reject_displacement_outliers`, called from
+`pack_full_field_output`; constants `tuning::kOutlier*`.
+
+**Validation (real images):** on the 3-point-bending PMMA series it rejects 211
+points over 33 frames and nothing in 26 of them; each rejected point checked
+sat 4–23 px from its neighbours' median. VSG strain RMSE against the
+authors' field at a 45 px VSG drops from 716 / 4150 / 2196 µε (exx / eyy / exy) to 429 / 385 / 398.
+On a steel tensile series (40 frames) it rejects nothing. Threshold 2 rejects the
+same points on the PMMA series (and 8 on the steel's last frame, by the
+fracture); 3 leaves more room for noise.
+
 ---
 
 ## 10. Error Analysis & Uncertainty

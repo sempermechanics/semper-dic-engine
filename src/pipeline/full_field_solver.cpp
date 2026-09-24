@@ -297,7 +297,8 @@ int run_full_field(
         timings.strain = packed.time_strain_ms;
 
         // 🚀 DIAGNOSTIC: Print exactly how many points the filter caught
-        LOGD("DIAGNOSTIC POST-FILTER: Dropped %d noisy points. Final Valid Output: %d", packed.dropped_by_post_filter, valid_count);
+        LOGD("DIAGNOSTIC POST-FILTER: Dropped %d displacement outliers and %d noisy points. Final Valid Output: %d",
+             packed.dropped_as_outlier, packed.dropped_by_post_filter, valid_count);
         if (packed.output_truncated) {
             LOGE("Output buffer full at %d points (capacity %d floats); remaining points dropped.", valid_count, output_capacity);
         }

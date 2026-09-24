@@ -47,12 +47,23 @@ PackedFieldResult pack_full_field_output(
         }
     }
 
+    // Wrong matches can pass the correlation check, alone or in clusters of
+    // a dozen points all off by the same amount; one inside a strain window
+    // tilts its whole plane fit. Reject them first, so they neither feed the
+    // fit nor reach the output.
+    out.dropped_as_outlier = StrainCalculator::reject_displacement_outliers(dispField);
     out.strain = StrainCalculator::compute_vsg_strain(dispField, strain_window);
 
     for (int y = 0; y < gridH && !out.output_truncated; ++y) {
         for (int x = 0; x < gridW; ++x) {
             int idx = y * gridW + x;
-            if (!dispField.valid[idx]) continue;
+            if (!dispField.valid[idx]) {
+                // Solved but rejected by the median test above.
+                if (resultGrid[y][x].solved && resultGrid[y][x].corr >= 0.0f) {
+                    resultGrid[y][x].solved = false;
+                }
+                continue;
+            }
             if ((out.valid_count + 1) * 8 > output_capacity) {
                 out.output_truncated = true;
                 break;

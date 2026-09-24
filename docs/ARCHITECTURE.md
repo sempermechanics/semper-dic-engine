@@ -208,7 +208,14 @@ struct DisplacementField { int width, height, step;       // grid dims + px spac
                            std::vector<bool> valid; };
 
 static StrainField compute_vsg_strain (const DisplacementField&, int window_pixels);
+static int reject_displacement_outliers(DisplacementField&);   // clears valid[], returns count
 ```
+
+`pack_full_field_output` runs `reject_displacement_outliers` on the solved grid
+before `compute_vsg_strain`. It is a normalized median test (MATHEMATICS §9.4)
+on u and v over each point's 5x5 neighbours, repeated until nothing new fails.
+Rejected points feed no strain window and are not written to the output, so they
+count in metrics slot 2 (rejected = attempted − solved) like any other drop.
 
 Outputs **Green-Lagrange strain**:
 `exx = ∂u/∂x + ½((∂u/∂x)² + (∂v/∂x)²)`, etc.
@@ -218,6 +225,7 @@ Outputs **Green-Lagrange strain**:
 | Method | least-squares plane fit over a circular window |
 | Exact for | any linear displacement field |
 | Rejection | < 90% window fill or `rcond < 1e-12` → sentinel `−1000.0f` |
+| Displacement outliers | normalized median test, 5x5, ε 0.1 px, threshold 3, repeated (`tuning::kOutlier*`) → point dropped before the fit |
 
 **Consumer warning:** VSG failures are marked with `−1000.0f`. Check before
 rendering/statistics.
