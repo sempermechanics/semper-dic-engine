@@ -538,8 +538,9 @@ because each side is its own majority.
 
 **Validation (real images):** on the 3-point-bending PMMA series it rejects 211
 points over 33 frames and nothing in 26 of them; each rejected point checked
-sat 4–23 px from its neighbours' median. VSG strain RMSE against the
-authors' field at a 45 px VSG drops from 716 / 4150 / 2196 µε (exx / eyy / exy) to 429 / 385 / 398.
+sat 4–23 px from its neighbours' median. Strain RMSE against the authors'
+field over all frames, at a 45 px VSG, drops from 915 / 3874 / 2117 µε
+(exx / eyy / exy) to 412 / 394 / 392; at 15 px, from about 20,000 to about 900.
 On a steel tensile series (40 frames) it rejects nothing. Threshold 2 rejects the
 same points on the PMMA series (and 8 on the steel's last frame, by the
 fracture); 3 leaves more room for noise.
