@@ -1,6 +1,37 @@
-// Path B — global priority-queue flood fill (RGDIC). Lifted verbatim out of
-// full_field_solver.cpp: same worker count, same queue discipline, same
-// bounded cancel-poll wait, same locking.
+// Path B — reliability-guided flood fill (RGDIC), deterministic in parallel.
+//
+// The flood fill grows the solved region outwards from Path A's boundary (or
+// from AKAZE / Path C seeds when Path A solved nothing). Each unsolved cell is
+// solved once, from the first solved neighbour that reaches it: the
+// neighbour's displacement, projected by its gradients, is the cell's initial
+// guess. Which neighbour that is decides the answer — a different guess
+// converges to a slightly different optimum, and near the ZNSSD gate it can
+// flip a cell between accepted and failed.
+//
+// This used to run free-running workers on one shared priority queue, and
+// each claim was a compare-exchange race, so the neighbour that won a cell
+// depended on thread timing and the field changed from run to run (app
+// TD-65). The flood now advances in numbered rounds, and only the solves run
+// concurrently:
+//
+//   claim  (serial)   pop the kPathBBatchNodes most reliable nodes (lowest
+//                     ZNSSD; ties by row, then column — a total order) and
+//                     hand each unclaimed 4-neighbour to the first of them
+//                     that touches it. The cell and its guess are now fixed.
+//   solve  (parallel) any worker solves any claimed cell; a task writes only
+//                     its own slot.
+//   commit (serial)   once every cell of round r is solved and round r-1 is
+//                     committed, write round r into the grid and push its
+//                     accepted cells, in claim order; then claim new rounds
+//                     until two are in flight.
+//
+// A claim therefore sees exactly the rounds committed before it, whichever
+// thread runs it and however the solves interleave, so the output does not
+// depend on timing or on the thread count. Keeping two rounds in flight lets
+// workers carry on with round r+1 while one slow cell (an ICGN timeout plus a
+// Simplex rescue) finishes round r, so the determinism costs little
+// throughput. The batch size is a fixed constant, not the core count, so a
+// 4-core and an 8-core device give the same field.
 
 #include "full_field_internal.hpp"
 
@@ -10,12 +41,11 @@
 #include "util/log.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <deque>
 #include <exception>
-#include <memory>
 #include <mutex>
 #include <queue>
 #include <thread>
@@ -28,8 +58,99 @@ namespace Semper {
 namespace pipeline {
 namespace internal {
 
+namespace {
+
+// Strict weak order with no ties between distinct cells: lower ZNSSD first,
+// then lower row, then lower column. std::priority_queue keeps the "largest"
+// on top, so "a < b" here means "b is popped before a".
+struct ReliabilityOrder {
+    bool operator()(const SeedNode& a, const SeedNode& b) const {
+        if (a.correlation_score != b.correlation_score) return a.correlation_score > b.correlation_score;
+        if (a.y_idx != b.y_idx) return a.y_idx > b.y_idx;
+        return a.x_idx > b.x_idx;
+    }
+};
+
+using ReliabilityQueue = std::priority_queue<SeedNode, std::vector<SeedNode>, ReliabilityOrder>;
+
+// One cell to solve: where, from which guess, and (filled by the solve) what
+// came out.
+struct CellTask {
+    int x = 0, y = 0;
+    float gu = 0, gv = 0, gux = 0, guy = 0, gvx = 0, gvy = 0;
+    bool counts_as_path_b = true; // AKAZE / Path C seeds are not counted
+
+    bool initialized = false;     // subset fit inside the image
+    bool needed_rescue = false;   // Simplex ran
+    int tid = 0;
+    double hessian_ms = 0.0;
+    AnalysisResult res;
+};
+
+// One claim's worth of cells. `tasks` is never resized after the claim, so a
+// worker can hold a pointer into it while solving without the lock.
+struct Round {
+    std::vector<CellTask> tasks;
+    size_t next = 0;      // first task no worker has taken yet
+    size_t remaining = 0; // tasks not yet solved
+};
+
+using SubsetPool = std::vector<SubsetData, Eigen::aligned_allocator<SubsetData>>;
+
+void solve_cell(const SolveContext& ctx, OptimizationEngine& engine, SubsetData& subset, CellTask& t) {
+    const FullFieldParams& params = ctx.params;
+    const int flat = t.y * ctx.gridW + t.x;
+    const int realX = params.rect_x + t.x * params.step, realY = params.rect_y + t.y * params.step;
+
+    auto th1 = std::chrono::high_resolution_clock::now();
+    SubsetPrecomputer::precompute_subset_fast(subset, *ctx.cache.ref_img, realX, realY, params.subset_size, ctx.hessian_pool[flat]);
+    t.hessian_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - th1).count();
+    t.initialized = subset.is_initialized;
+    if (!t.initialized) return;
+
+    const int simplex_count_before = engine.count_simplex;
+    auto search_flag = ALLOW_SIMPLEX_RESCUE ? INIT_NO_SEARCH : INIT_NO_SIMPLEX;
+    t.res = engine.calculate_deformation(subset, ctx.def_img, t.gu, t.gv, t.gux, t.guy, t.gvx, t.gvy, search_flag);
+    // Matters more here than on Path A: an accepted cell seeds every point
+    // that floods out from it, so a subset sitting in the mask must not pass.
+    reject_if_ghosted(t.res, params.subset_size);
+    t.needed_rescue = (engine.count_simplex > simplex_count_before);
+    if (!ALLOW_SIMPLEX_RESCUE && t.res.status != 0) { t.res.correlation_score = 1.0f; }
+}
+
+// Serial: record one solved cell in the grid, the stats and the queue.
+void commit_cell(const SolveContext& ctx, const CellTask& t, ResultGrid& resultGrid,
+                 std::vector<ThreadStats>& stats_pathB, ReliabilityQueue& q) {
+    GridPoint& gp = resultGrid[t.y][t.x];
+    ThreadStats& bucket = stats_pathB[t.tid];
+    bucket.hessian_time_ms += t.hessian_ms;
+    if (!t.initialized) return;
+
+    bucket.icgn_iters += t.res.iters;
+    if (t.needed_rescue) record_simplex_outcome(bucket, t.res);
+
+    const AnalysisResult& res = t.res;
+    if (res.status == 0 && res.correlation_score <= tuning::kCorrAccept) {
+        const FullFieldParams& params = ctx.params;
+        const int realX = params.rect_x + t.x * params.step, realY = params.rect_y + t.y * params.step;
+        const int order = ctx.compute_order_counter.fetch_add(1, std::memory_order_relaxed);
+        gp = {(float)realX, (float)realY, res.u, res.v, res.ux, res.uy, res.vx, res.vy,
+              res.correlation_score, true, t.tid, order, gp.mesh_assignment_type,
+              t.needed_rescue, res.iters};
+        ctx.global_points_solved.fetch_add(1, std::memory_order_relaxed);
+        if (t.counts_as_path_b) bucket.points_solved++;
+        q.push(SeedNode(t.x, t.y, res.u, res.v, res.ux, res.uy, res.vx, res.vy, res.correlation_score));
+    } else {
+        gp.corr = CORR_INVALID;
+        gp.used_simplex = t.needed_rescue;
+        gp.icgn_iters = res.iters;
+    }
+}
+
+} // namespace
+
 // ==========================================
-// 🚀 PATH B (GLOBAL QUEUE EXECUTION)
+// 🚀 PATH B (DETERMINISTIC ROUND-BASED FLOOD FILL)
 // ==========================================
 void run_path_b(
         const SolveContext& ctx,
@@ -47,10 +168,12 @@ void run_path_b(
     const int gridH = ctx.gridH;
     const int safe_cores = ctx.safe_cores;
 
-    std::unique_ptr<std::atomic<bool>[]> cell_claimed(new std::atomic<bool>[gridW * gridH]);
+    // A cell is claimed once (skipped, solved by Path A, or handed to a
+    // neighbour) and never attempted again. Only claims touch it, and claims
+    // are serial.
+    std::vector<unsigned char> claimed((size_t)gridW * gridH);
     for (int i = 0; i < gridW * gridH; ++i) {
-        int gx = i % gridW, gy = i / gridW;
-        cell_claimed[i].store(resultGrid[gy][gx].solved, std::memory_order_relaxed);
+        claimed[i] = resultGrid[i / gridW][i % gridW].solved ? 1 : 0;
     }
 
     std::vector<Semper::SeedNode> boundary_seeds;
@@ -107,235 +230,150 @@ void run_path_b(
         }
     }
 
-    struct GlobalQueue {
-        std::priority_queue<Semper::SeedNode> q;
-        std::mutex mtx; std::condition_variable cv;
-        int active = 0; bool done = false;
-    } gq;
-    std::atomic<int> seed_idx(0);
-    // No grid_mutex: every resultGrid[y][x] write below is preceded by that
-    // cell's compare_exchange_strong on cell_claimed, so exactly one thread
-    // ever owns a given cell — a different memory location than any other
-    // thread is touching. ResultGrid is a pre-sized (never resized during
-    // this parallel phase) std::vector<std::vector<GridPoint>> of a plain POD
-    // struct, so concurrent writes to distinct elements are race-free by the
-    // standard's element-independence guarantee — no lock was ever needed
-    // here for correctness, only for the now-removed shared stat accumulation
-    // this loop used to also do.
-    const int cores_to_use = safe_cores;
+    ReliabilityQueue q;
+    for (const auto &s : boundary_seeds) q.push(s);
 
-    for (const auto &s : boundary_seeds) {
-        gq.q.push(s);
+    // One engine and one subset buffer per worker, reused for every cell it
+    // solves. calculate_deformation and precompute_subset_fast overwrite all
+    // they read, so which worker solves a cell cannot change its result (Path
+    // A relies on the same property under schedule(dynamic)).
+    std::vector<OptimizationEngine> engines(safe_cores);
+    SubsetPool subsets(safe_cores);
+    for (auto& e : engines) {
+        // 🚀 ENABLE LEVENBERG-MARQUARDT - PATH B
+        e.lm_enabled = true;
+        e.lm_alpha = tuning::kLmAlpha; // <--- TUNE THIS VALUE
+        e.use_6x6_interpolator = params.use_6x6_interpolator;
     }
-
-    OptimizationEngine prewarm_engine;
-    // 🚀 ENABLE LEVENBERG-MARQUARDT - PATH B (PREWARM)
-    prewarm_engine.lm_enabled = true;
-    prewarm_engine.lm_alpha = tuning::kLmAlpha; // <--- TUNE THIS VALUE
-    prewarm_engine.use_6x6_interpolator = params.use_6x6_interpolator;
-
-    Semper::SubsetData prewarm_subset;
-
-    while ((int)gq.q.size() < cores_to_use && seed_idx.load() < (int)global_seeds.size()) {
-        int si = seed_idx.fetch_add(1, std::memory_order_relaxed);
-        if (si >= (int)global_seeds.size()) break;
-        const auto &seed = global_seeds[si];
-        int flat = seed.y_idx * gridW + seed.x_idx;
-
-        bool unclaimed = false;
-        if (!cell_claimed[flat].compare_exchange_strong(unclaimed, true, std::memory_order_acq_rel, std::memory_order_relaxed)) continue;
-
-        int realX = params.rect_x + seed.x_idx * params.step, realY = params.rect_y + seed.y_idx * params.step;
-        SubsetPrecomputer::precompute_subset_fast(prewarm_subset, *ctx.cache.ref_img, realX, realY, params.subset_size, ctx.hessian_pool[flat]);
-        if (!prewarm_subset.is_initialized) continue;
-
-        int simplex_count_before = prewarm_engine.count_simplex;
-
-        auto search_flag = ALLOW_SIMPLEX_RESCUE ? INIT_NO_SEARCH : INIT_NO_SIMPLEX;
-        Semper::AnalysisResult res = prewarm_engine.calculate_deformation(
-                prewarm_subset, ctx.def_img, seed.u, seed.v, 0.f, 0.f, 0.f, 0.f, search_flag);
-        // Matters more here than on the other paths: an accepted prewarm seed is
-        // pushed onto the propagation queue below, so a subset sitting in the mask
-        // seeds every point that floods out from it.
-        reject_if_ghosted(res, params.subset_size);
-        stats_pathB[0].icgn_iters += res.iters;
-        bool needed_rescue = (prewarm_engine.count_simplex > simplex_count_before);
-
-        if (!ALLOW_SIMPLEX_RESCUE && res.status != 0) { res.correlation_score = 1.0f; }
-
-        if (needed_rescue) {
-            record_simplex_outcome(stats_pathB[0], res);
+    struct StatsFlush {
+        std::vector<OptimizationEngine>& engines; std::vector<ThreadStats>& stats;
+        ~StatsFlush() {
+            for (size_t t = 0; t < engines.size(); ++t) {
+                stats[t].icgn_time_ms += engines[t].time_icgn_ms;
+                stats[t].simplex_time_ms += engines[t].time_simplex_ms;
+                stats[t].simplex_iters += engines[t].count_simplex;
+            }
         }
+    } flush{engines, stats_pathB};
 
-        if (res.status == 0 && res.correlation_score <= tuning::kCorrAccept) {
-            int order = ctx.compute_order_counter.fetch_add(1, std::memory_order_relaxed);
-            resultGrid[seed.y_idx][seed.x_idx] = {(float)realX, (float)realY, res.u, res.v, res.ux, res.uy, res.vx, res.vy, res.correlation_score, true, -1, order, resultGrid[seed.y_idx][seed.x_idx].mesh_assignment_type, needed_rescue, res.iters};
-            ctx.global_points_solved.fetch_add(1, std::memory_order_relaxed);
-            gq.q.push(Semper::SeedNode(seed.x_idx, seed.y_idx, res.u, res.v, res.ux, res.uy, res.vx, res.vy, res.correlation_score));
-        } else {
-            resultGrid[seed.y_idx][seed.x_idx].corr = CORR_INVALID;
-            resultGrid[seed.y_idx][seed.x_idx].used_simplex = needed_rescue;
-            resultGrid[seed.y_idx][seed.x_idx].icgn_iters = res.iters;
+    // Seeds (only when Path A left no boundary): solved serially, in their
+    // sorted order, before the flood starts — all of them, as the threaded
+    // version did on any device with at least as many cores as seeds.
+    for (const auto& seed : global_seeds) {
+        if (cancel_requested()) return;
+        const int flat = seed.y_idx * gridW + seed.x_idx;
+        if (claimed[flat]) continue;
+        claimed[flat] = 1;
+        CellTask t;
+        t.x = seed.x_idx; t.y = seed.y_idx;
+        t.gu = seed.u; t.gv = seed.v;
+        t.counts_as_path_b = false;
+        solve_cell(ctx, engines[0], subsets[0], t);
+        commit_cell(ctx, t, resultGrid, stats_pathB, q);
+    }
+
+    // ---- Round bookkeeping. Everything below is guarded by `mtx`. ----------
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::deque<Round> rounds;   // in-flight rounds, oldest first
+    bool done = false;
+
+    // Claim one round from the queue as it stands. Returns false (and adds
+    // nothing) when the queue is empty.
+    auto claim_round = [&]() -> bool {
+        if (q.empty()) return false;
+        Round round;
+        int popped = 0;
+        while (!q.empty() && popped < tuning::kPathBBatchNodes) {
+            const SeedNode cur = q.top();
+            q.pop();
+            ++popped;
+            for (int k = 0; k < 4; ++k) {
+                const int nx = cur.x_idx + dx4[k], ny = cur.y_idx + dy4[k];
+                if (nx < 0 || nx >= gridW || ny < 0 || ny >= gridH) continue;
+                const int flat = ny * gridW + nx;
+                if (claimed[flat]) continue;
+                claimed[flat] = 1;
+                resultGrid[ny][nx].solved = true;
+
+                // 🚀 FIRST-ORDER KINEMATIC EXPANSION (The Path B Fix)
+                // Project the parent's solution to the neighbour through its
+                // displacement gradients.
+                const float dx = (nx - cur.x_idx) * params.step;
+                const float dy = (ny - cur.y_idx) * params.step;
+                CellTask t;
+                t.x = nx; t.y = ny;
+                t.gu = cur.u + cur.ux * dx + cur.uy * dy;
+                t.gv = cur.v + cur.vx * dx + cur.vy * dy;
+                t.gux = cur.ux; t.guy = cur.uy; t.gvx = cur.vx; t.gvy = cur.vy;
+                round.tasks.push_back(t);
+            }
         }
-    }
+        round.remaining = round.tasks.size();
+        rounds.push_back(std::move(round));
+        return true;
+    };
 
-    if (gq.q.empty() && seed_idx.load() >= (int)global_seeds.size()) {
-        gq.done = true;
-    }
+    // Commit every finished round at the head, in order; after each commit,
+    // refill to two rounds in flight. Sets `done` when nothing is left.
+    auto advance = [&]() {
+        while (!rounds.empty() && rounds.front().remaining == 0) {
+            for (const CellTask& t : rounds.front().tasks) commit_cell(ctx, t, resultGrid, stats_pathB, q);
+            rounds.pop_front();
+            while (rounds.size() < 2 && claim_round()) {}
+        }
+        if (rounds.empty()) done = true;
+    };
+
+    while (rounds.size() < 2 && claim_round()) {}
+    advance(); // commits any round that claimed nothing; may finish outright
 
     std::vector<std::thread> workers;
     struct WorkerGuard { std::vector<std::thread> &ws; ~WorkerGuard() { for (auto &w : ws) if (w.joinable()) w.join(); } } wg{workers};
 
-    for (int t = 0; t < cores_to_use; ++t) {
-        workers.emplace_back([&, t]() {
+    for (int w = 0; w < safe_cores && !done; ++w) {
+        workers.emplace_back([&, w]() {
             try {
-                const int tid = t;
-                const int DX[] = {1, -1, 0, 0}, DY[] = {0, 0, 1, -1};
-                OptimizationEngine local_engine;
-                // 🚀 ENABLE LEVENBERG-MARQUARDT - PATH B (WORKERS)
-                local_engine.lm_enabled = true;
-                local_engine.lm_alpha = tuning::kLmAlpha; // <--- TUNE THIS VALUE
-                local_engine.use_6x6_interpolator = params.use_6x6_interpolator;
-                Semper::SubsetData local_subset;
-                double local_hessian_ms = 0.0, local_wait_ms = 0.0;
-                int local_points_solved = 0;
-                EngineStatFlusher flusher(local_engine, stats_pathB[tid], local_points_solved, local_hessian_ms, local_wait_ms);
-
+                std::unique_lock<std::mutex> lk(mtx);
                 while (true) {
-                    if (cancel_requested()) return;
-                    Semper::SeedNode cur;
-                    bool has_node = false;
-                    {
-                        std::unique_lock<std::mutex> lk(gq.mtx);
-                        auto wait_start = std::chrono::high_resolution_clock::now();
-                        // Bounded wait: a worker parked on the queue has no
-                        // one to notify it of a cancel, so it re-checks on a
-                        // timer instead. A timeout is not an error — it just
-                        // sends the worker round the loop again.
-                        bool ready = gq.cv.wait_for(lk, std::chrono::milliseconds(tuning::kCancelPollMs), [&] { return !gq.q.empty() || gq.done || cancel_requested() || (gq.active == 0 && seed_idx.load(std::memory_order_relaxed) < (int)global_seeds.size()); });
-                        local_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - wait_start).count();
-                        if (gq.done || cancel_requested()) return;
-                        if (!ready) continue;
-                        if (!gq.q.empty()) { cur = gq.q.top(); gq.q.pop(); gq.active++; has_node = true; } else { gq.active++; }
-                    }
-
-                    if (!has_node) {
-                        int si = seed_idx.fetch_add(1, std::memory_order_relaxed);
-                        if (si < (int)global_seeds.size()) {
-                            const auto &seed = global_seeds[si];
-                            int flat = seed.y_idx * gridW + seed.x_idx;
-                            bool unclaimed = false;
-                            if (cell_claimed[flat].compare_exchange_strong(unclaimed, true, std::memory_order_acq_rel, std::memory_order_relaxed)) {
-                                int realX = params.rect_x + seed.x_idx * params.step, realY = params.rect_y + seed.y_idx * params.step;
-                                auto th1 = std::chrono::high_resolution_clock::now();
-                                SubsetPrecomputer::precompute_subset_fast(local_subset, *ctx.cache.ref_img, realX, realY, params.subset_size, ctx.hessian_pool[flat]);
-                                local_hessian_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - th1).count();
-                                if (local_subset.is_initialized) {
-
-                                    int simplex_count_before = local_engine.count_simplex;
-
-                                    auto search_flag = ALLOW_SIMPLEX_RESCUE ? INIT_NO_SEARCH : INIT_NO_SIMPLEX;
-                                    Semper::AnalysisResult res = local_engine.calculate_deformation(
-                                            local_subset, ctx.def_img, seed.u, seed.v, 0.f, 0.f, 0.f, 0.f, search_flag);
-
-                                    reject_if_ghosted(res, params.subset_size);
-                                    stats_pathB[tid].icgn_iters += res.iters;
-                                    bool needed_rescue = (local_engine.count_simplex > simplex_count_before);
-
-                                    if (!ALLOW_SIMPLEX_RESCUE && res.status != 0) { res.correlation_score = 1.0f; }
-
-                                    if (needed_rescue) {
-                                        record_simplex_outcome(stats_pathB[tid], res);
-                                    }
-
-                                    if (res.status == 0 && res.correlation_score <= tuning::kCorrAccept) {
-                                        int order = ctx.compute_order_counter.fetch_add(1, std::memory_order_relaxed);
-                                        // 🚀 FIX: Use res.iters at the end
-                                        resultGrid[seed.y_idx][seed.x_idx] = {(float)realX, (float)realY, res.u, res.v, res.ux, res.uy, res.vx, res.vy,
-                                                                              res.correlation_score, true, tid, order, 0, needed_rescue, res.iters};
-                                        ctx.global_points_solved.fetch_add(1, std::memory_order_relaxed); local_points_solved++;
-                                        { std::lock_guard<std::mutex> lq(gq.mtx); gq.q.push(Semper::SeedNode(seed.x_idx, seed.y_idx, res.u, res.v, res.ux, res.uy, res.vx, res.vy, res.correlation_score)); gq.cv.notify_one(); }
-                                    } else {
-                                        resultGrid[seed.y_idx][seed.x_idx].corr = CORR_INVALID;
-                                        resultGrid[seed.y_idx][seed.x_idx].used_simplex = needed_rescue;
-                                        // 🚀 FIX: Assign the real iterations
-                                        resultGrid[seed.y_idx][seed.x_idx].icgn_iters = res.iters;
-                                    }
-                                }
-                            }
+                    // Bounded wait: a worker parked here has no one to notify
+                    // it of a cancel, so it re-checks on a timer. A timeout is
+                    // not an error — it just goes round the loop again.
+                    Round* round = nullptr;
+                    auto has_work = [&] {
+                        round = nullptr;
+                        for (Round& r : rounds) {
+                            if (r.next < r.tasks.size()) { round = &r; return true; }
                         }
-                        { std::lock_guard<std::mutex> lq(gq.mtx); gq.active--; bool seeds_exhausted = seed_idx.load(std::memory_order_relaxed) >= (int)global_seeds.size(); if (gq.q.empty() && gq.active == 0 && seeds_exhausted) { gq.done = true; } gq.cv.notify_all(); }
-                        continue;
+                        return false;
+                    };
+                    cv.wait_for(lk, std::chrono::milliseconds(tuning::kCancelPollMs),
+                                [&] { return done || cancel_requested() || has_work(); });
+                    if (done || cancel_requested()) return;
+                    if (round == nullptr) continue;
+
+                    // Oldest round first: that is the one blocking the next commit.
+                    CellTask& task = round->tasks[round->next++];
+                    lk.unlock();
+                    task.tid = w;
+                    solve_cell(ctx, engines[w], subsets[w], task);
+                    lk.lock();
+                    // `round` is still valid: a round leaves the deque only
+                    // once all its tasks are solved, and this one was not.
+                    if (--round->remaining == 0) {
+                        advance();
+                        cv.notify_all();
                     }
-
-                    std::vector<Semper::SeedNode> pending_pushes;
-                    pending_pushes.reserve(4);
-                    for (int k = 0; k < 4; ++k) {
-                        const int nx = cur.x_idx + DX[k], ny = cur.y_idx + DY[k];
-                        if (nx < 0 || nx >= gridW || ny < 0 || ny >= gridH) continue;
-                        const int flat = ny * gridW + nx;
-                        bool was_unclaimed = false;
-                        if (!cell_claimed[flat].compare_exchange_strong(was_unclaimed, true, std::memory_order_acq_rel, std::memory_order_relaxed)) continue;
-                        resultGrid[ny][nx].solved = true;
-                        const int realX = params.rect_x + nx * params.step, realY = params.rect_y + ny * params.step;
-                        auto th1 = std::chrono::high_resolution_clock::now();
-                        SubsetPrecomputer::precompute_subset_fast(local_subset, *ctx.cache.ref_img, realX, realY, params.subset_size, ctx.hessian_pool[flat]);
-                        local_hessian_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - th1).count();
-                        if (!local_subset.is_initialized) continue;
-
-                        int simplex_count_before = local_engine.count_simplex;
-
-                        // 🚀 FIRST-ORDER KINEMATIC EXPANSION (The Path B Fix)
-                        // Calculate the physical distance from the solved point to the new neighbor
-                        float dx = (nx - cur.x_idx) * params.step;
-                        float dy = (ny - cur.y_idx) * params.step;
-
-                        // Project the initial guess using the solved point's strain gradients
-                        float guess_u = cur.u + cur.ux * dx + cur.uy * dy;
-                        float guess_v = cur.v + cur.vx * dx + cur.vy * dy;
-
-                        auto search_flag = ALLOW_SIMPLEX_RESCUE ? INIT_NO_SEARCH : INIT_NO_SIMPLEX;
-                        Semper::AnalysisResult res = local_engine.calculate_deformation(
-                                local_subset, ctx.def_img, guess_u, guess_v, cur.ux, cur.uy, cur.vx, cur.vy, search_flag);
-                        reject_if_ghosted(res, params.subset_size);
-                        stats_pathB[tid].icgn_iters += res.iters; // 🚀 ADD THIS
-                        bool needed_rescue = (local_engine.count_simplex > simplex_count_before);
-
-                        if (!ALLOW_SIMPLEX_RESCUE && res.status != 0) { res.correlation_score = 1.0f; }
-
-                        if (needed_rescue) {
-                            record_simplex_outcome(stats_pathB[tid], res);
-                        }
-
-                        if (res.status == 0 && res.correlation_score <= tuning::kCorrAccept) {
-                            const int order = ctx.compute_order_counter.fetch_add(1, std::memory_order_relaxed);
-                            // 🚀 FIX: Use res.iters at the end
-                            resultGrid[ny][nx] = {(float)realX, (float)realY, res.u, res.v, res.ux, res.uy, res.vx, res.vy,
-                                                  res.correlation_score, true, tid, order, resultGrid[ny][nx].mesh_assignment_type,
-                                                  needed_rescue, res.iters};
-                            ctx.global_points_solved.fetch_add(1, std::memory_order_relaxed); local_points_solved++;
-                            pending_pushes.push_back(Semper::SeedNode(nx, ny, res.u, res.v, res.ux, res.uy, res.vx, res.vy, res.correlation_score));
-                        } else {
-                            resultGrid[ny][nx].corr = CORR_INVALID;
-                            resultGrid[ny][nx].used_simplex = needed_rescue;
-                            // 🚀 FIX: Assign the real iterations
-                            resultGrid[ny][nx].icgn_iters = res.iters;
-                        }
-                    }
-                    if (!pending_pushes.empty()) { std::lock_guard<std::mutex> lq(gq.mtx); for (auto &node : pending_pushes) { gq.q.push(std::move(node)); gq.cv.notify_one(); } }
-                    { std::lock_guard<std::mutex> lq(gq.mtx); gq.active--; if (gq.q.empty() && gq.active == 0) { bool seeds_exhausted = seed_idx.load(std::memory_order_relaxed) >= (int)global_seeds.size(); if (seeds_exhausted) { gq.done = true; } gq.cv.notify_all(); } }
                 }
             } catch (const std::exception &e) {
-                // A worker that throws mid-item never runs its gq.active--,
-                // so the queue's (active == 0) termination becomes
-                // unreachable and the remaining workers park until cancel.
-                // Log it (it used to vanish silently) and signal done so the
-                // solve finishes with a partial field instead of hanging.
-                LOGE("Path B worker %d aborted: %s", t, e.what());
-                std::lock_guard<std::mutex> lq(gq.mtx); gq.done = true; gq.cv.notify_all();
+                // A worker that throws mid-task leaves its round unfinished,
+                // so the flood can never commit past it. Log it and stop the
+                // flood so the solve ends with a partial field, not a hang.
+                LOGE("Path B worker %d aborted: %s", w, e.what());
+                std::lock_guard<std::mutex> lg(mtx); done = true; cv.notify_all();
             } catch (...) {
-                LOGE("Path B worker %d aborted: unknown exception", t);
-                std::lock_guard<std::mutex> lq(gq.mtx); gq.done = true; gq.cv.notify_all();
+                LOGE("Path B worker %d aborted: unknown exception", w);
+                std::lock_guard<std::mutex> lg(mtx); done = true; cv.notify_all();
             }
         });
     }

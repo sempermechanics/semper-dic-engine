@@ -42,6 +42,14 @@ inline constexpr float kStrainFailSentinel = -999.0f;
 /** Path B queue wait cancel-poll interval (ms). */
 inline constexpr int kCancelPollMs = 20;
 
+/**
+ * Path B flood fill: solved nodes expanded per round (full_field_path_b.cpp).
+ * A fixed number, not the core count, so the field does not depend on the
+ * device. Larger rounds give the workers more cells at once but follow the
+ * reliability order less strictly. Changing it changes the field.
+ */
+inline constexpr int kPathBBatchNodes = 32;
+
 /** Floating-point radius fudge used in VSG window membership. */
 inline constexpr double kVsgRadiusTiny = 1.0e-5;
 
