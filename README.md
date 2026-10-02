@@ -82,7 +82,8 @@ Wheels are built with `cibuildwheel` (see `.github/workflows/wheels.yml`).
 
 Configure with `-DSEMPER_ANDROID=ON`. The shared library `OUTPUT_NAME` is
 `semper_core` (`System.loadLibrary("semper_core")`). JNI symbols target
-`com.indicvision.semper.SemperNativeLib`.
+`com.sempermechanics.semper.SemperNativeLib` (forwarders for the old
+`com.indicvision.semper` package stay until the apps have moved).
 
 ## CMake targets
 
