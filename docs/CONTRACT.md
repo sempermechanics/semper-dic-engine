@@ -165,7 +165,8 @@ exported — a symbol that loses its annotation silently vanishes from the ABI.
 ## A.3 The JNI mapping (informative)
 
 JNI exports live in `adapters/android/jni/SemperJNI.cpp` under the package
-`com.indicvision.semper.SemperNativeLib`. All OpenMP work must stay on one pinned
+`com.sempermechanics.semper.SemperNativeLib`, with forwarders for the old
+`com.indicvision.semper` package until the apps have moved. All OpenMP work must stay on one pinned
 thread on Android.
 
 | JNI export | Public engine calls used |
