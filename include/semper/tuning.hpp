@@ -110,17 +110,21 @@ inline constexpr int kOutlierMaxPasses = 5;
  */
 inline constexpr float kIncTaylorMaxCells = 1.5f;
 
-/** Incremental DIC mask warp: Newton iterations to invert X + U(X) = p. */
-inline constexpr int kIncMaskNewtonIters = 8;
-
-/** Incremental DIC mask warp: Newton stops once the residual is below this (px). */
-inline constexpr float kIncMaskNewtonTolPx = 0.01f;
+/**
+ * Incremental DIC mask warp: cap on frame-0 samples per pixel per axis when
+ * the material mask is pushed forward through X + U(X). The warp uses enough
+ * samples that neighbours land within 0.7 px of each other at the largest
+ * local stretch (2 per axis for a rigid or mildly strained body); 8 covers a
+ * local stretch of 5.6 between references.
+ */
+inline constexpr int kIncMaskMaxSamplesPerPx = 8;
 
 /**
  * Incremental DIC mask warp: how far past the outermost frame-0 nodes (in
- * grid cells) the displacement field is extended linearly before it is held
- * constant. The mask reaches up to a cell plus half a subset past the last
- * node, so this has to cover more than one cell.
+ * grid cells, plus half a subset) the warped mask is evaluated. The field is
+ * extended linearly from the edge cells over that window. The material
+ * reaches up to ceil(half*sqrt(2)) + 1 px past the outer nodes (no user
+ * mask), so this has to cover more than one cell.
  */
 inline constexpr int kIncMaskExtrapCells = 3;
 

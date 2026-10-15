@@ -29,6 +29,7 @@
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
+#include <cmath>
 
 #undef LOG_TAG
 #define LOG_TAG "SemperIncremental"
@@ -102,16 +103,36 @@ struct IncrementalSession::Impl {
 
         params_k = params.field;
         const cv::Rect bb = cv::boundingRect(mask_k);
-        // One more step on the far sides: the grid stops at rect + (n-1)*step,
-        // which would otherwise leave the last strip of material without nodes.
-        const cv::Rect grid_rect = cv::Rect(bb.x, bb.y, bb.width + grid0.step, bb.height + grid0.step)
-                                   & cv::Rect(0, 0, width, height);
+        // The new grid spans where the tracked frame-0 nodes now sit, plus one
+        // step on the far sides: the grid stops at rect + (n-1)*step, which
+        // would otherwise leave the last strip of points without a cell to
+        // sample. Nothing wider: a node further out has a subset leaving the
+        // mask, so the scan would skip it anyway, and a needlessly large grid
+        // makes the anchor lattice sparser and the solve slower. Static
+        // material gets back exactly the frame-0 grid.
+        float min_x = 1e30f, min_y = 1e30f, max_x = -1e30f, max_y = -1e30f;
+        for (int j = 0; j < grid0.gridH; ++j) {
+            for (int i = 0; i < grid0.gridW; ++i) {
+                const size_t n = (size_t)j * grid0.gridW + i;
+                if (!alive[n]) continue;
+                const float x = grid0.rect_x + i * grid0.step + Ubase[n];
+                const float y = grid0.rect_y + j * grid0.step + Vbase[n];
+                min_x = std::min(min_x, x); max_x = std::max(max_x, x);
+                min_y = std::min(min_y, y); max_y = std::max(max_y, y);
+            }
+        }
+        cv::Rect grid_rect;
+        if (min_x <= max_x) {
+            const int x0 = (int)std::floor(min_x), y0 = (int)std::floor(min_y);
+            grid_rect = cv::Rect(x0, y0, (int)std::ceil(max_x) - x0 + grid0.step,
+                                 (int)std::ceil(max_y) - y0 + grid0.step)
+                        & cv::Rect(0, 0, width, height);
+        }
         params_k.rect_x = grid_rect.x;
         params_k.rect_y = grid_rect.y;
         params_k.rect_w = grid_rect.width;
         params_k.rect_h = grid_rect.height;
         if (bb.area() == 0) std::fill(alive.begin(), alive.end(), 0);
-
         ref_index = new_ref_index;
         frames_since_update = 0;
     }
@@ -162,9 +183,13 @@ int IncrementalSession::init(const cv::Mat& ref_gray, const cv::Mat& roi_mask,
         s.user_mask0 = m.clone();
         cv::compare(s.user_mask0, 128, s.material_mask0, cv::CMP_GE);
     } else {
-        // No mask: the material is the ROI rect, plus the half subset its edge
-        // nodes' subsets reach past it.
-        const int half = f.subset_size / 2;
+        // No mask: the material is the ROI rect, plus the reach of its edge
+        // nodes' subsets. Subsets stay axis-aligned on every reference while
+        // the material turns, so a node's subset needs up to half*sqrt(2) of
+        // material around it (at 45 deg), not just half; with only half the
+        // edge nodes of a rotated ROI fall out of the scan and the chain
+        // erodes inwards.
+        const int half = (int)std::ceil(f.subset_size / 2 * std::sqrt(2.0)) + 1;
         s.material_mask0 = cv::Mat::zeros(s.height, s.width, CV_8U);
         const cv::Rect r = cv::Rect(f.rect_x - half, f.rect_y - half,
                                     f.rect_w + 2 * half, f.rect_h + 2 * half)

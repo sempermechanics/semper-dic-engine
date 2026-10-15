@@ -5,6 +5,8 @@
 #include <semper/strain.hpp>
 #include <semper/tuning.hpp>
 
+#include <opencv2/imgproc.hpp>
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -169,24 +171,27 @@ bool fill_field(int w, int h, std::vector<float> &U, std::vector<float> &V,
     return true;
 }
 
-// Continuous field over the filled grid, in image pixels. Bilinear inside,
-// linear extrapolation of the edge cell up to `extrap` cells out, then held.
+// Continuous field over the filled grid, in image pixels. Bilinear inside.
+// Outside, the plane through the nearest grid point with that point's
+// gradient: exact for any affine field, so a turning body stays a rigid turn
+// out to the warp window. Two extensions that fail under large rotation:
+// holding the value constant (a pure translation, which gives pixels outside
+// the material a second, false preimage that a row's warm start can follow
+// across the material), and extending the edge cell's bilinear (its cross term
+// grows quadratically off the corners and folds the map). The caller bounds
+// how far out it evaluates (the warp window).
 struct ContinuousField {
     const GridGeom &g;
     const std::vector<float> &U, &V;
-    float extrap;
 
     // Value and derivatives (per pixel) at image point (x, y).
     void eval(double x, double y, double &u, double &v,
               double &ux, double &uy, double &vx, double &vy) const {
-        double gx = (x - g.rect_x) / g.step;
-        double gy = (y - g.rect_y) / g.step;
-        bool clamp_x = false, clamp_y = false;
-        const double lo = -extrap, hix = (g.gridW - 1) + extrap, hiy = (g.gridH - 1) + extrap;
-        if (gx < lo) { gx = lo; clamp_x = true; }
-        if (gx > hix) { gx = hix; clamp_x = true; }
-        if (gy < lo) { gy = lo; clamp_y = true; }
-        if (gy > hiy) { gy = hiy; clamp_y = true; }
+        const double gx_raw = (x - g.rect_x) / g.step;
+        const double gy_raw = (y - g.rect_y) / g.step;
+        const double gx = std::max(0.0, std::min(gx_raw, (double)(g.gridW - 1)));
+        const double gy = std::max(0.0, std::min(gy_raw, (double)(g.gridH - 1)));
+        const double ox = (gx_raw - gx) * g.step, oy = (gy_raw - gy) * g.step;   // px outside
 
         int i0 = (int)std::floor(gx), j0 = (int)std::floor(gy);
         i0 = std::max(0, std::min(i0, std::max(g.gridW - 2, 0)));
@@ -208,8 +213,8 @@ struct ContinuousField {
         };
         bil(U, u, ux, uy);
         bil(V, v, vx, vy);
-        if (clamp_x) { ux = 0.0; vx = 0.0; }
-        if (clamp_y) { uy = 0.0; vy = 0.0; }
+        u += ux * ox + uy * oy;
+        v += vx * ox + vy * oy;
     }
 };
 
@@ -228,68 +233,67 @@ cv::Mat warp_material_mask(const cv::Mat &material_mask0,
     std::vector<float> U(U_in), V(V_in);
     if (!fill_field(geom.gridW, geom.gridH, U, V, valid)) return out;
 
-    const ContinuousField field{geom, U, V, (float)tuning::kIncMaskExtrapCells};
+    const ContinuousField field{geom, U, V};
 
-    // Window: the forward-mapped grid, widened by the margin.
-    double minx = 1e300, miny = 1e300, maxx = -1e300, maxy = -1e300;
+    // Forward warp: every frame-0 material sample X lands at X + U(X). There
+    // is no inverse to solve, so no branch to pick: where a few drifted nodes
+    // fold the field, samples overlap or spread locally, and the rest of the
+    // mask is untouched. (A per-pixel Newton inverse can follow a fold, or a
+    // false preimage in an extrapolated zone, across the material and blank a
+    // whole band of rows.)
+    //
+    // Sample spacing: fine enough that neighbouring samples land within 0.7 px
+    // of each other at the largest local stretch, so a 3x3 close fills every
+    // pinhole. Rounded to a whole number of samples per pixel.
+    double stretch = 1.0;
     for (int gy = 0; gy < geom.gridH; ++gy) {
         for (int gx = 0; gx < geom.gridW; ++gx) {
             const size_t i = (size_t)gy * geom.gridW + gx;
-            const double px = geom.rect_x + gx * geom.step + U[i];
-            const double py = geom.rect_y + gy * geom.step + V[i];
-            minx = std::min(minx, px); maxx = std::max(maxx, px);
-            miny = std::min(miny, py); maxy = std::max(maxy, py);
+            const size_t ix = gx + 1 < geom.gridW ? i + 1 : i;
+            const size_t iy = gy + 1 < geom.gridH ? i + geom.gridW : i;
+            const double ux = (U[ix] - U[i]) / geom.step, uy = (U[iy] - U[i]) / geom.step;
+            const double vx = (V[ix] - V[i]) / geom.step, vy = (V[iy] - V[i]) / geom.step;
+            stretch = std::max(stretch, std::max(std::abs(1 + ux) + std::abs(uy),
+                                                 std::abs(vx) + std::abs(1 + vy)));
         }
     }
-    const int x0 = std::max(0, (int)std::floor(minx) - margin_px);
-    const int x1 = std::min(W - 1, (int)std::ceil(maxx) + margin_px);
-    const int y0 = std::max(0, (int)std::floor(miny) - margin_px);
-    const int y1 = std::min(H - 1, (int)std::ceil(maxy) + margin_px);
-    if (x0 > x1 || y0 > y1) return out;
+    const int per_px = std::min(tuning::kIncMaskMaxSamplesPerPx,
+                                std::max(2, (int)std::ceil(stretch / 0.7)));
+    const double hs = 1.0 / per_px;
 
-    const double tol = tuning::kIncMaskNewtonTolPx;
-    const int iters = tuning::kIncMaskNewtonIters;
+    // Frame-0 window: the grid widened by the margin (the material the nodes'
+    // subsets can reach).
+    const int X0 = std::max(0, geom.rect_x - margin_px);
+    const int X1 = std::min(W - 1, geom.rect_x + (geom.gridW - 1) * geom.step + margin_px);
+    const int Y0 = std::max(0, geom.rect_y - margin_px);
+    const int Y1 = std::min(H - 1, geom.rect_y + (geom.gridH - 1) * geom.step + margin_px);
+    if (X0 > X1 || Y0 > Y1) return out;
 
+    unsigned char *dst = out.data;
+    const size_t dstep = out.step;
 #pragma omp parallel for schedule(static)
-    for (int py = y0; py <= y1; ++py) {
-        unsigned char *row = out.ptr<unsigned char>(py);
-        double X = 0, Y = 0;
-        bool warm = false;
-        for (int px = x0; px <= x1; ++px) {
-            double u, v, ux, uy, vx, vy;
-            if (warm) {
-                X += 1.0;   // the neighbour's preimage, one pixel on
-            } else {
-                field.eval(px, py, u, v, ux, uy, vx, vy);
-                X = px - u;
-                Y = py - v;
+    for (int sy = Y0; sy <= Y1; ++sy) {
+        const unsigned char *mrow = material_mask0.ptr<unsigned char>(sy);
+        for (int sx = X0; sx <= X1; ++sx) {
+            if (mrow[sx] < 128) continue;
+            for (int b = 0; b < per_px; ++b) {
+                for (int a = 0; a < per_px; ++a) {
+                    const double X = sx - 0.5 + (a + 0.5) * hs;
+                    const double Y = sy - 0.5 + (b + 0.5) * hs;
+                    double u, v, ux, uy, vx, vy;
+                    field.eval(X, Y, u, v, ux, uy, vx, vy);
+                    const long px = std::lround(X + u), py = std::lround(Y + v);
+                    if (px < 0 || px >= W || py < 0 || py >= H) continue;
+                    // Every writer stores the same value; atomic keeps it
+                    // race-free, and the result does not depend on order.
+                    unsigned char *cell = dst + (size_t)py * dstep + (size_t)px;
+#pragma omp atomic write
+                    *cell = 255;
+                }
             }
-            double rx = 0, ry = 0;
-            bool converged = false;
-            for (int it = 0; it < iters; ++it) {
-                field.eval(X, Y, u, v, ux, uy, vx, vy);
-                rx = X + u - px;
-                ry = Y + v - py;
-                if (std::abs(rx) < tol && std::abs(ry) < tol) { converged = true; break; }
-                const double a = 1 + ux, b = uy, c = vx, d = 1 + vy;
-                const double det = a * d - b * c;
-                if (std::abs(det) < 1e-6) break;
-                X -= ( d * rx - b * ry) / det;
-                Y -= (-c * rx + a * ry) / det;
-            }
-            if (!converged) {
-                field.eval(X, Y, u, v, ux, uy, vx, vy);
-                rx = X + u - px;
-                ry = Y + v - py;
-                converged = std::abs(rx) < 0.5 && std::abs(ry) < 0.5;
-            }
-            warm = converged;
-            if (!converged) continue;
-            const int sx = (int)std::lround(X), sy = (int)std::lround(Y);
-            if (sx < 0 || sx >= W || sy < 0 || sy >= H) continue;
-            if (material_mask0.at<unsigned char>(sy, sx) >= 128) row[px] = 255;
         }
     }
+    cv::morphologyEx(out, out, cv::MORPH_CLOSE, cv::Mat::ones(3, 3, CV_8U));
     return out;
 }
 

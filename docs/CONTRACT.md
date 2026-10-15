@@ -271,8 +271,8 @@ thread on Android.
 
 The fixed-reference and incremental paths share one lock and do not run at the
 same time: `initializeIncremental` drops the cached reference, and
-`initializeReference` should be called again before going back to
-`computeFullFieldDirect`.
+`initializeReference` closes any open incremental session, so call it again
+before going back to `computeFullFieldDirect`.
 
 ---
 

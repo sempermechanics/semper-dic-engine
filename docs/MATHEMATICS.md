@@ -652,14 +652,41 @@ is not fed back into tracking: a false positive there would be permanent.
 **Moving the reference.** Every `N` frames (`update_interval`) frame t becomes
 the new reference. Its image is already prepared for correlation (intensities
 and gradients), so it is handed over without decoding or preparing it again.
-The ROI mask has to follow the material. For each pixel `p` of the new
-reference, solve `X + U(X) = p` for its frame-0 position with Newton's method
-(`kIncMaskNewtonIters` = 8, tolerance 0.01 px), where `U` is the bilinear total
-field with invalid nodes filled by neighbour averaging and extrapolated
-linearly up to `kIncMaskExtrapCells` = 3 cells. A pixel is material if it
-converged to within 0.5 px and the frame-0 mask is set at `X`. Rows warm-start
-from their left neighbour. The new reference's ROI is the bounding box of the
-warped mask, widened by one grid step.
+The ROI mask has to follow the material, so the frame-0 mask is warped
+forward. Every material pixel of the frame-0 window (the grid widened by
+`kIncMaskExtrapCells` = 3 cells plus half a subset) is sampled on a sub-pixel
+lattice, each sample `X` is moved to `X + U(X)`, and the pixel it lands in is
+set. `U` is the bilinear total field with invalid nodes filled by neighbour
+averaging. Outside the grid it is extended by the plane through the nearest
+grid point, which is exact for any affine motion. The lattice uses 2 samples
+per pixel per axis, more where the field stretches, so neighbouring samples
+land within 0.7 px of each other (up to `kIncMaskMaxSamplesPerPx` = 8). A 3×3
+morphological close then fills the pinholes.
+
+A forward warp has no inverse to solve, so it has no wrong branch to follow.
+Two earlier designs failed under large rotation:
+
+* The first solved `X + U(X) = p` per pixel by Newton.
+* It also held the field constant past a few cells. A held field is a pure
+  translation, which gives pixels outside a turned body a second, false
+  preimage.
+* Where a few drifted nodes fold the field, there are false branches too, and
+  a row's warm start followed them across the material, blanking whole bands.
+* Extending the edge cells' bilinear instead of a plane makes things worse:
+  its cross term grows quadratically off the corners.
+
+With the forward warp, a fold only makes samples overlap locally. The new
+reference's grid spans the tracked nodes' current positions, plus one step on
+the far sides.
+
+Without a user mask, the frame-0 material is the ROI rectangle widened by
+`ceil(half·√2) + 1` px, where `half` is half the subset size, rather than by
+`half` alone. Subsets stay axis-aligned on every reference while the material
+turns, so at 45° a node's subset reaches `half·√2` from its centre. With only
+`half` of material around the ROI, the edge nodes of a rotating ROI fall out
+of the scan, get sampled by Taylor fallback, and the losses spread inwards.
+With a user mask the mask is used as drawn, so a rotating masked region loses
+its edge ring the same way: draw it a subset wider if it will turn.
 
 **Why the error grows, and what N does.** Each solve carries an interpolation
 bias that depends on the sub-pixel part of the displacement (§10.1). Against a

@@ -237,6 +237,10 @@ Java_com_sempermechanics_semper_SemperNativeLib_initializeReference(
         JNIEnv* env, jobject, jbyteArray refBytes, jbyteArray maskBytes,
         jint width, jint height) {
     std::lock_guard<std::mutex> lock(g_cache.mutex);
+    // Back to the fixed-reference path: an incremental session left open
+    // would hold its two images until the next initializeIncremental.
+    g_session.reset();
+    g_session_w = g_session_h = 0;
     if (refBytes == nullptr) {
         g_cache.reset();
         return;

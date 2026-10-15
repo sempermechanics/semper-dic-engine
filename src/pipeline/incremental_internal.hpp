@@ -54,15 +54,14 @@ struct GridGeom {
 };
 
 // Warp the frame-0 material mask into the configuration where frame-0 point X
-// sits at X + U(X). For each output pixel p, solves X + U(X) = p by Newton on
-// a continuous field built from the grid (invalid nodes filled by iterated
-// neighbour averaging, bilinear inside, linear extrapolation up to
-// kIncMaskExtrapCells cells outside), then reads material_mask0 at X.
+// sits at X + U(X). A forward warp: every material pixel of the frame-0 window
+// (the grid widened by `margin_px`) is sampled 2+ times per axis (enough for
+// the largest local stretch), each sample is pushed to X + U(X) on a
+// continuous field built from the grid (invalid nodes filled by iterated
+// neighbour averaging, bilinear inside, planar extension outside), and the
+// landed pixels are closed with a 3x3 kernel to fill pinholes.
 // Output: CV_8U, 255 inside, 0 outside; all zero when no node is valid.
-// `margin_px` widens the window searched around the forward-mapped grid.
-// Rows are independent and each row is walked left to right with the previous
-// pixel's solution as the starting point, so the result does not depend on
-// thread scheduling.
+// Every write stores 255, so the result does not depend on thread scheduling.
 cv::Mat warp_material_mask(const cv::Mat &material_mask0,
                            const GridGeom &geom,
                            const std::vector<float> &U,

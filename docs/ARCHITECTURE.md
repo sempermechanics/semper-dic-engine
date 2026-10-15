@@ -290,8 +290,8 @@ process_frame(t):
 - **Metrics** are the increment solve's; frame-0 counts are in
   `IncrementalFrameInfo`.
 
-Tunables: `tuning::kIncTaylorMaxCells`, `kIncMaskNewtonIters`,
-`kIncMaskNewtonTolPx`, `kIncMaskExtrapCells`.
+Tunables: `tuning::kIncTaylorMaxCells`, `kIncMaskMaxSamplesPerPx`,
+`kIncMaskExtrapCells`.
 
 ---
 

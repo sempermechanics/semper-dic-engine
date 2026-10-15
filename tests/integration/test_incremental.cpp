@@ -96,6 +96,7 @@ struct Frame {
     int rc = 0;
     std::vector<float> out;
     IncrementalFrameInfo info;
+    float attempted = 0, solved = 0;   // metrics slots 0 and 1: the increment solve
 };
 
 bool bit_equal(const Frame &a, const Frame &b) {
@@ -118,6 +119,8 @@ std::vector<Frame> run_session(const Sequence &s, const cv::Mat &mask, const Ful
         fr.out.assign((size_t)cap, 0.0f);
         float metrics[23] = {};
         fr.rc = session.process_frame(f, fr.out.data(), cap, metrics, 23, nullptr, &fr.info);
+        fr.attempted = metrics[0];
+        fr.solved = metrics[1];
         frames.push_back(std::move(fr));
     }
     return frames;
@@ -290,6 +293,54 @@ TEST_CASE(Incremental, StretchRotation_TracksWhereFixedReferenceDegrades) {
     CHECK(a.rms_u <= 0.10);
     CHECK(a.rms_e <= 5e-3);
     CHECK(a.within > f.within);
+}
+
+TEST_CASE(Incremental, Rotation90_200Frames_TracksTheTurningRoi) {
+    // Steady rotation to 90 degrees, 0.45 per frame. Regressions guarded:
+    // edge nodes falling out of the ref-k scan as the ROI turns (axis-aligned
+    // subsets need half*sqrt(2) of material at 45 degrees), and the mask warp
+    // blanking whole bands of rows (a per-pixel Newton inverse following a
+    // false branch where the field folds or was held constant). Before those
+    // fixes every mode lost the chain between 50 and 85 degrees.
+    //
+    // N = 1 is held to 45 degrees only: 100+ updates of a sub-pixel rotation
+    // accumulate interpolation bias (MATHEMATICS 9.5). That is the cost the
+    // benchmark measures, not a defect of the turning ROI.
+    const int T = 200;
+    const Sequence s = stretch_rotate_sequence(256, 256, T, 0.0, 90.0);
+    FullFieldParams p = centred_params(256, 256, 110, 5);
+    p.strain_window = 15;
+    struct Case { int interval; bool six; int until; double min_within; double max_rms; };
+    for (const Case c : {Case{5, true, T, 0.95, 0.08}, Case{10, false, T, 0.95, 0.20},
+                         Case{1, true, T / 2, 0.90, 0.40}}) {
+        p.use_6x6_interpolator = c.six;
+        const std::vector<Frame> inc = run_session(s, cv::Mat(), p, c.interval);
+        REQUIRE((int)inc.size() == T);
+        if (std::getenv("SEMPER_INC_TRACE")) {
+            for (int t = 0; t < T; ++t) {
+                const IncrementalFrameInfo &i = inc[t].info;
+                if ((t + 1) % 10 && i.lost_this_frame == 0 && inc[t].rc > 0) continue;
+                const Accuracy at = evaluate(inc[t], s.motion[t]);
+                std::printf("    t=%3d rc=%3d tracked=%3d/%d taylor=%3d lost=%3d rms=%.4f max=%.3f\n",
+                            t + 1, inc[t].rc, i.tracked_points, i.frame0_points, i.taylor_fallbacks,
+                            i.lost_this_frame, at.rms_u, at.max_u);
+                if (inc[t].rc <= 0) break;
+            }
+        }
+        const Frame &last = inc[c.until - 1];
+        const Accuracy a = evaluate(last, s.motion[c.until - 1], 0.5);
+        std::printf("  [rotation to %.0f deg N=%d %s] %d/%d pts, %d within 0.5 px, tracked %d/%d, "
+                    "rms u %.4f px, max %.3f\n",
+                    0.45 * c.until, c.interval, c.six ? "6x6" : "4x4", a.points, inc[0].rc, a.within,
+                    last.info.tracked_points, last.info.frame0_points, a.rms_u, a.max_u);
+        for (int t = 1; t < c.until; ++t) CHECK(inc[t].rc > 0);
+        CHECK(last.info.tracked_points >= (int)(0.98 * last.info.frame0_points));
+        // The rms carries one weakly textured corner of this speckle, which
+        // drifts by a pixel or more over 100+ updates; everywhere else the
+        // error stays under 0.1 px, hence the share within 0.5 px.
+        CHECK(a.within >= (int)(c.min_within * inc[0].rc));
+        CHECK(a.rms_u <= c.max_rms);
+    }
 }
 
 TEST_CASE(Incremental, MaskedSequence_TracksMaterialInsideMask) {

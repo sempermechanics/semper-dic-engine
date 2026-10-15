@@ -177,6 +177,44 @@ TEST_CASE(IncrementalMath, MaskWarp_Stretch_ScalesArea) {
     CHECK(std::abs(bb.x + bb.width - (cx + 1.2 * (r.x + r.width - cx))) <= 1.5);
 }
 
+TEST_CASE(IncrementalMath, MaskWarp_LargeRotation_IsTheRotatedMask) {
+    // An 84 degree turn about the mask centre, with the material reaching past
+    // the outer nodes as it does in a session (the field is extended there).
+    // A Newton inverse once lost whole rows here; the forward warp must give
+    // the rotated square: same area, no stray pixels, nothing missing inside.
+    const cv::Rect r(110, 110, 100, 100);
+    const cv::Mat m0 = rect_mask(320, 320, cv::Rect(r.x - 16, r.y - 16, r.width + 32, r.height + 32));
+    const GridGeom g = geom_over(r, 5);
+    const size_t n = (size_t)g.gridW * g.gridH;
+    const double c = 160.0, th = 84.0 * 3.14159265358979323846 / 180.0;
+    const double ct = std::cos(th), st = std::sin(th);
+    std::vector<float> U(n), V(n);
+    for (int j = 0; j < g.gridH; ++j)
+        for (int i = 0; i < g.gridW; ++i) {
+            const double X = g.rect_x + i * g.step - c, Y = g.rect_y + j * g.step - c;
+            U[(size_t)j * g.gridW + i] = (float)(ct * X - st * Y - X);
+            V[(size_t)j * g.gridW + i] = (float)(st * X + ct * Y - Y);
+        }
+    const cv::Mat w = warp_material_mask(m0, g, U, V, std::vector<unsigned char>(n, 1), 40);
+    const double ratio = cv::countNonZero(w) / (double)cv::countNonZero(m0);
+    CHECK_NEAR(ratio, 1.0, 0.02);
+    // Pull every pixel back analytically: set pixels must come from the
+    // material (within a pixel of its edge), and pixels well inside it must be set.
+    int stray = 0, missing = 0;
+    const double lo = r.x - 16, hi = r.x + r.width + 16;
+    for (int y = 0; y < w.rows; ++y)
+        for (int x = 0; x < w.cols; ++x) {
+            const double dx = x - c, dy = y - c;
+            const double X = ct * dx + st * dy + c, Y = -st * dx + ct * dy + c;
+            const double inside = std::min(std::min(X - lo, hi - 1 - X), std::min(Y - lo, hi - 1 - Y));
+            const bool set = w.at<unsigned char>(y, x) != 0;
+            if (set && inside < -1.0) ++stray;
+            if (!set && inside > 1.0) ++missing;
+        }
+    CHECK(stray == 0);
+    CHECK(missing == 0);
+}
+
 TEST_CASE(IncrementalMath, MaskWarp_NoValidNode_IsEmpty) {
     const cv::Rect r(60, 50, 100, 80);
     const cv::Mat m0 = rect_mask(240, 200, r);
