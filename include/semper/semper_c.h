@@ -115,7 +115,10 @@ SEMPER_C_API const char* semper_version(void);
  * displacement from the first image, at the first image's grid points, in the
  * same packed layout as semper_run: 8 floats per point
  * [x0, y0, u, v, exx, eyy, exy, corr], strain being Green-Lagrange of the
- * total displacement. A point that cannot be followed is dropped for good.
+ * total displacement. A point the solve cannot reach on a frame is followed
+ * on estimated motion but not reported until it is measured (and, after a
+ * long coast, confirmed) again; one that cannot be followed at all is dropped
+ * for good.
  *
  * The metrics array describes the solve against the current reference;
  * frame-0 bookkeeping is in semper_incremental_info. Threading as for
@@ -129,7 +132,7 @@ typedef struct semper_incremental semper_incremental;
 typedef struct semper_incremental_info {
     int32_t reference_frame;   /* frame solved against (0 = first image; frames count from 1) */
     int32_t reference_updated; /* 1 if this frame became the reference for the next one */
-    int32_t tracked_points;    /* first-image grid points with a total displacement now */
+    int32_t tracked_points;    /* first-image grid points still followed, reported or not */
     int32_t frame0_points;     /* first-image grid points that passed the ROI/mask scan */
     int32_t taylor_fallbacks;  /* points sampled by first-order expansion near an edge */
     int32_t lost_this_frame;   /* points dropped for good at this frame's reference update */

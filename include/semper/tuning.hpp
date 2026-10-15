@@ -120,6 +120,60 @@ inline constexpr float kIncTaylorMaxCells = 1.5f;
 inline constexpr int kIncMaskMaxSamplesPerPx = 8;
 
 /**
+ * Incremental DIC coasting: a tracked node whose increment cannot be sampled
+ * (no solved node within kIncTaylorMaxCells) is carried on a plane fitted to
+ * the solved increments within this many grid cells, instead of being dropped.
+ * It is not reported while it coasts, and it is measured again as soon as the
+ * solve reaches it. 8 cells spans a band one subset wide with solved nodes on
+ * both sides at the default step-to-subset ratio.
+ */
+inline constexpr int kIncCoastRadiusCells = 8;
+
+/** Incremental DIC coasting: solved nodes the plane fit needs. */
+inline constexpr int kIncCoastMinNodes = 6;
+
+/**
+ * Incremental DIC coasting: how far (in subset sizes, image pixels) a node may
+ * travel on fitted increments before it is dropped. Crossing a stationary
+ * edge takes about one subset of travel; past two, the node is not coming back.
+ */
+inline constexpr float kIncCoastMaxTravelSubsets = 2.0f;
+
+/**
+ * Incremental DIC re-anchoring: a coasted node whose increment can be sampled
+ * again is not reported until its subset from the last reference it was
+ * measured on matches the current frame directly. The match may move the node
+ * from where coasting left it by at most this fraction of the distance it
+ * coasted (a plane fitted over a gap drifts by up to ~20% of the motion across
+ * it), and never less than kIncReanchorMinShiftPx.
+ */
+/**
+ * Incremental DIC re-anchoring: a node that coasted no further than this (in
+ * subset sizes) is reported again as soon as it is measured, without a direct
+ * match. A short coast, typically a frame or two at the edge of a gap, adds
+ * an error well below the measurement noise; a node that has never had a
+ * clean subset (it sat in the gap on frame 0) could not be confirmed anyway.
+ */
+inline constexpr float kIncCoastTrustedTravelSubsets = 0.25f;
+inline constexpr float kIncReanchorMaxShiftFraction = 0.3f;
+inline constexpr float kIncReanchorMinShiftPx = 1.0f;
+
+/** Incremental DIC re-anchoring: pixels kept around a stored subset, past its
+ *  edge, so its intensity gradients do not see the edge of the patch. */
+inline constexpr int kIncAnchorMarginPx = 10;
+
+/**
+ * Incremental DIC early update: with an interval N > 1, the reference moves to
+ * the frame just solved, without waiting out N, when the points it reports
+ * fall this fraction below those reported on the first frame against the
+ * current reference. The increment has grown past what the images still
+ * correlate over (fast loading, necking, whitening), and the frames after it
+ * correlate against something closer. The comparison is with this reference's
+ * own first frame, so a band that always fails does not shorten N.
+ */
+inline constexpr float kIncEarlyUpdateDrop = 0.05f;
+
+/**
  * Incremental DIC mask warp: how far past the outermost frame-0 nodes (in
  * grid cells, plus half a subset) the warped mask is evaluated. The field is
  * extended linearly from the edge cells over that window. The material

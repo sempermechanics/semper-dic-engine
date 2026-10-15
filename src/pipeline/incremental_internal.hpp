@@ -48,6 +48,55 @@ struct IncrementSample {
 //  - Nothing within reach: ok = false.
 IncrementSample sample_increment(const NodeField &f, float x, float y);
 
+// The increment at (x, y) estimated, not measured: a weighted least-squares
+// plane u = a + b*dx + c*dy (and v likewise) through the valid nodes within
+// `radius_px`, weights 1 / (1 + (d / step)^2). For a node that sits in a band
+// no subset can match across (a stationary background edge under translucent
+// material, a reflection) while its neighbours on either side still solve.
+// Needs tuning::kIncCoastMinNodes nodes spread over both axes (the smaller
+// principal spread at least one grid step); otherwise ok = false. corr is the
+// worst ZNSSD of the nodes used. Exact for a linear increment field.
+IncrementSample fit_increment(const NodeField &f, float x, float y, float radius_px);
+
+// A coasting node's subset on the last reference it was measured on, kept so
+// the node can be matched directly when it can be measured again: coasting
+// leaves it where a fitted plane put it, and a measurement started there
+// would carry that error for good.
+struct CoastAnchor {
+    cv::Mat patch;          // gray around (ax, ay), tuning::kIncAnchorMarginPx past the subset
+    int ax = 0, ay = 0;     // the pixel the subset is centred on, on that reference
+    float dx = 0, dy = 0;   // the node's position there minus (ax, ay)
+};
+
+// What to do with the anchor of a measured node at (x, y) on the field's
+// reference. Its subset is clean when every grid node within it (half a
+// subset plus a step) solved; a gap is within reach when a grid position
+// within two subsets plus two steps did not solve, or is off the grid.
+//  - kDrop:    clean, no gap within reach. It is not about to coast.
+//  - kRefresh: clean, a gap within reach. Cut a new anchor here.
+//  - kKeep:    its subset is not clean (it is at the gap's edge). The anchor
+//              it already has, cut where it was clean, is the one to keep.
+// Distances are taken from gap_distance(f), computed once per field.
+enum class AnchorNeed { kDrop, kRefresh, kKeep };
+struct GapDistance {
+    cv::Mat hole;   // CV_32F per node: px to the nearest unsolved node
+    cv::Mat gap;    // CV_32F per node: px to the nearest unsolved or off-grid position
+};
+GapDistance gap_distance(const NodeField &f);
+AnchorNeed anchor_need(const NodeField &f, const GapDistance &g, float x, float y, int subset_size);
+
+// Cut the anchor for a node at (x, y) on `ref_gray`. False when the patch
+// would leave the image.
+bool make_anchor(const cv::Mat &ref_gray, float x, float y, int subset_size, CoastAnchor &out);
+
+// Match the anchor's subset on `def` (a prepared deformed image), starting
+// from (guess_x, guess_y), where the node is thought to be now. True when the
+// match converges, its ZNSSD is within tuning::kCorrAccept, and it puts the
+// node within `max_shift` px of the guess; then (x, y) is where the node is
+// and corr the match's ZNSSD.
+bool match_anchor(const CoastAnchor &a, const Image &def, int subset_size, bool use_6x6,
+                  float guess_x, float guess_y, float max_shift, float &x, float &y, float &corr);
+
 // Geometry of the frame-0 grid that total displacements are stored on.
 struct GridGeom {
     int gridW = 0, gridH = 0, rect_x = 0, rect_y = 0, step = 0;

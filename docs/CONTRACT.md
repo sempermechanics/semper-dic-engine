@@ -115,12 +115,13 @@ header.
 struct IncrementalParams {
     FullFieldParams field;     // the frame-0 grid, exactly as for run_full_field
     int update_interval = 1;   // 0 = fixed reference, N = move the reference every N frames
+                               // (sooner when a frame reports 5% fewer points, N > 1)
 };
 
 struct IncrementalFrameInfo {
     int  reference_frame;      // frame this one was solved against (0 = first image)
     bool reference_updated;    // this frame became the next reference
-    int  tracked_points;       // frame-0 nodes still followed
+    int  tracked_points;       // frame-0 nodes still followed, reported or not
     int  frame0_points;        // frame-0 nodes after the boundary + mask scan
     int  taylor_fallbacks;     // nodes sampled by first-order expansion
     int  lost_this_frame;      // nodes that stopped being followed on this frame
@@ -146,7 +147,11 @@ public:
 - **Output** *(Frozen)*: the same 8-float packing and capacity rule as
   `run_full_field`. `x, y` are **frame-0 grid coordinates**, `u, v` the **total**
   displacement from the first image, and the strains are Green-Lagrange strain
-  of that total. A frame-0 node that cannot be followed is dropped and never
+  of that total. Only measured nodes are reported. A node the solve cannot
+  reach on a frame (a gap it cannot correlate across) is followed on estimated
+  motion, unreported, and is reported again once it is measured; after a long
+  coast, only once its own earlier subset confirms where it is (MATHEMATICS
+  §9.5). A frame-0 node that cannot be followed at all is dropped and never
   returns.
 - **`update_interval = 0`** *(Frozen)*: every frame is bit-identical to
   `run_full_field` against the first image. With any interval, the first frame

@@ -269,8 +269,11 @@ process_frame(t):
   k  > 0             -> run_full_field_impl on reference k's grid into scratch
                         -> node_field_from_capture (solved, ZNSSD >= 0, median test)
                         -> sample_increment at X0 + U(X0,k) for every tracked node
+                           - nothing in reach: fit_increment (coast, unreported)
+                           - coasted far: match_anchor before it is reported again
                         -> frame-0 ResultGrid -> pack_full_field_output (VSG, packing)
-  every N frames     -> warp_material_mask, ReferenceCache::adopt(prepared image)
+  every N frames,    -> make_anchor for clean nodes near a gap (from this frame)
+  or on a 5% drop       warp_material_mask, ReferenceCache::adopt(prepared image)
 ```
 
 - **Hand-off without rework.** `run_full_field_impl` takes an optional
@@ -279,9 +282,11 @@ process_frame(t):
   `ReferenceCache::adopt` takes them over and stamps the mask, so the new
   reference is never decoded or prepared twice, and at most two `Image`s are
   alive at once.
-- **State.** Per frame-0 node: the base displacement `U(X0, k)` and an `alive`
-  flag. Also the reference index, the frames since the last update, and the
-  reference's mask and ROI.
+- **State.** Per frame-0 node: the base displacement `U(X0, k)`, an `alive`
+  flag and the distance it has coasted. Anchors (a ~1.5 KB grey patch each)
+  only for nodes near a gap or coasting. Also the reference index, the frames
+  since the last update, the points reported on the first frame against the
+  reference, and the reference's mask and ROI.
 - **Errors and cancel.** Every state change happens after a successful solve,
   so a negative return leaves the session as it was.
 - **Between updates (N > 1)** every frame after the first one on a reference
@@ -291,7 +296,10 @@ process_frame(t):
   `IncrementalFrameInfo`.
 
 Tunables: `tuning::kIncTaylorMaxCells`, `kIncMaskMaxSamplesPerPx`,
-`kIncMaskExtrapCells`.
+`kIncMaskExtrapCells`, `kIncCoastRadiusCells`, `kIncCoastMinNodes`,
+`kIncCoastMaxTravelSubsets`, `kIncCoastTrustedTravelSubsets`,
+`kIncReanchorMaxShiftFraction`, `kIncReanchorMinShiftPx`, `kIncAnchorMarginPx`,
+`kIncEarlyUpdateDrop`.
 
 ---
 

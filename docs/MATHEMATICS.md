@@ -642,15 +642,66 @@ grid:
   displacement gradient, the same expansion Path B uses for its guesses:
   `u_k(x) ≈ u_n + ∇u_n · (x − x_n)`. Ties go to the lowest row-major index, so
   the result does not depend on thread timing.
-* Further away, the node is lost. A lost node never returns, since there is no
-  `U(X0, k)` to compose onto.
+* Further away, the node **coasts** (below). A node that cannot coast either is
+  lost. A lost node never returns, since there is no `U(X0, k)` to compose
+  onto.
 
 Increment nodes go through the median test of §9.4 before they are sampled. The
 same test on the total field only drops points from that frame's output, and
 is not fed back into tracking: a false positive there would be permanent.
 
+**Coasting across a gap.** Some bands of an image cannot be correlated for a
+while even though the material in them is fine: a stationary reflection or
+glare, a translucent specimen passing from a light background onto a dark
+rig, a necking edge where the subset starts to take in background. A node in
+such a band gets no increment, while the nodes on either side do. Rather than
+drop it, its increment is estimated by a weighted least-squares plane
+`u = a + b·dx + c·dy` (and `v` likewise) through the solved increment nodes
+within `kIncCoastRadiusCells` = 8 cells, weights `1 / (1 + (d/step)²)`. The fit
+needs `kIncCoastMinNodes` = 6 nodes whose weighted spread is at least one step
+along both principal axes, so it is pinned in both directions. A coasting node
+is carried to the next reference but not reported. It is dropped once the
+fitted increments have carried it `kIncCoastMaxTravelSubsets` = 2 subsets, or
+once it leaves the image. Only a node that has been measured coasts. A node
+that frame 1 cannot measure may sit in a gap, or on texture too weak to
+correlate at all, and nothing could ever confirm it, so it is not followed.
+
+**Re-anchoring.** A plane fitted over a gap a subset wide drifts. Measured on a
+synthetic band crossing, the drift is up to about 20% of the distance coasted,
+0.5 to 2 px for a crossing. Once the node is measured again, that measurement
+starts from where coasting left it, so the drift would stay in it for good.
+So a node that coasted more than `kIncCoastTrustedTravelSubsets` = 0.25 subset
+is reported again only after a direct check:
+
+* While nodes are measured, each clean one within reach of a gap keeps an
+  **anchor**: its subset, cut from a reference where every node inside that
+  subset solved. "Within reach" means an unsolved or off-grid position within
+  two subsets plus two steps. Only a ~1.5 KB grey patch is kept, with
+  `kIncAnchorMarginPx` = 10 px of margin so its gradients do not see the
+  patch edge.
+* A measured node whose own subset is no longer clean keeps the anchor it has,
+  which was cut before it reached the gap.
+* When the coasted node can be sampled again and its subset here is clean, the
+  anchor subset is solved by ICGN straight onto the current frame, with a
+  simplex rescue as in Path B. It starts from where coasting put it.
+* The match must pass `kCorrAccept`, and it may move the node by at most
+  `max(1 px, 0.3 × distance coasted)`. Its position, through the matched
+  affine map, replaces the coasted one.
+* Until a match succeeds, the node moves on its measured increments,
+  unreported. Those do not count against its coasting distance.
+
+On the band crossing, nodes
+re-anchored on the far side are within 0.03 px (median) and 0.20 px (worst) of
+the truth, against up to 2.3 px without re-anchoring. `tracked_points` counts
+coasting and unconfirmed nodes; the output holds only measured ones.
+
 **Moving the reference.** Every `N` frames (`update_interval`) frame t becomes
-the new reference. Its image is already prepared for correlation (intensities
+the new reference. With N > 1 it also moves early, to the frame just solved,
+when that frame reports `kIncEarlyUpdateDrop` = 5% fewer points than the
+first frame solved against the current reference. That happens when the
+increment has outgrown what the images still correlate over, as with fast
+loading, necking or whitening. On the tensile video it lifts the late-test
+minimum at N = 20 from 337 to 397 points, and changes nothing at N = 5. Its image is already prepared for correlation (intensities
 and gradients), so it is handed over without decoding or preparing it again.
 The ROI mask has to follow the material, so the frame-0 mask is warped
 forward. Every material pixel of the frame-0 window (the grid widened by

@@ -20,7 +20,11 @@ namespace pipeline {
  * moves to the latest solved frame:
  *   0   never — a fixed reference, identical to calling run_full_field per frame
  *   1   every frame (classic incremental DIC)
- *   N   every N frames
+ *   N   every N frames, or as soon as a frame reports 5% fewer points than the
+ *       first frame on the current reference
+ * A node the solve cannot reach on a frame coasts, unreported, on the plane
+ * through its neighbours' increments, and is reported again once measured
+ * (after a long coast, once its earlier subset confirms it).
  */
 struct IncrementalParams {
     FullFieldParams field;
@@ -31,7 +35,7 @@ struct IncrementalParams {
 struct IncrementalFrameInfo {
     int reference_frame = 0;      // frame index this frame was solved against (0 = first image)
     bool reference_updated = false; // this frame became the new reference after solving
-    int tracked_points = 0;       // frame-0 nodes still tracked after this frame
+    int tracked_points = 0;       // frame-0 nodes still tracked after this frame, reported or coasting
     int frame0_points = 0;        // frame-0 nodes that passed the boundary + mask scan
     int taylor_fallbacks = 0;     // nodes sampled by first-order expansion, not bilinear
     int lost_this_frame = 0;      // nodes that stopped being tracked on this frame

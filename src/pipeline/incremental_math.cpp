@@ -1,4 +1,5 @@
-// Sampling and mask warping for incremental DIC. See incremental_internal.hpp.
+// Sampling, coasting fits, anchors and mask warping for incremental DIC. See
+// incremental_internal.hpp.
 
 #include "incremental_internal.hpp"
 
@@ -119,6 +120,152 @@ IncrementSample sample_increment(const NodeField &f, float x, float y) {
     s.v = f.v[k] + f.vx[k] * dx + f.vy[k] * dy;
     s.corr = f.corr[k];
     return s;
+}
+
+IncrementSample fit_increment(const NodeField &f, float x, float y, float radius_px) {
+    IncrementSample s;
+    if (f.gridW <= 0 || f.gridH <= 0 || f.step <= 0 || radius_px <= 0.0f) return s;
+
+    const double step = f.step;
+    const int r = (int)std::ceil(radius_px / step);
+    const int ic = (int)std::lround((x - f.rect_x) / step);
+    const int jc = (int)std::lround((y - f.rect_y) / step);
+    const double r2max = (double)radius_px * radius_px;
+
+    // Weighted sums for the normal equations of [1, dx, dy] (offsets in
+    // steps, so the matrix stays well scaled).
+    double S[3][3] = {{0}}, bu[3] = {0}, bv[3] = {0};
+    int n = 0;
+    float worst = 0.0f;
+    for (int j = std::max(0, jc - r); j <= std::min(f.gridH - 1, jc + r); ++j) {
+        for (int i = std::max(0, ic - r); i <= std::min(f.gridW - 1, ic + r); ++i) {
+            const size_t k = (size_t)j * f.gridW + i;
+            if (!f.valid[k]) continue;
+            const double dx = f.node_x(i) - x, dy = f.node_y(j) - y;
+            const double d2 = dx * dx + dy * dy;
+            if (d2 > r2max) continue;
+            const double w = 1.0 / (1.0 + d2 / (step * step));
+            const double p[3] = {1.0, dx / step, dy / step};
+            for (int a = 0; a < 3; ++a) {
+                for (int b = 0; b < 3; ++b) S[a][b] += w * p[a] * p[b];
+                bu[a] += w * p[a] * f.u[k];
+                bv[a] += w * p[a] * f.v[k];
+            }
+            worst = std::max(worst, f.corr[k]);
+            ++n;
+        }
+    }
+    if (n < tuning::kIncCoastMinNodes) return s;
+
+    // Spread: the weighted covariance of the offsets must have both principal
+    // values >= one step^2, so the plane is pinned in both directions.
+    const double W = S[0][0];
+    const double mx = S[0][1] / W, my = S[0][2] / W;
+    const double cxx = S[1][1] / W - mx * mx, cyy = S[2][2] / W - my * my, cxy = S[1][2] / W - mx * my;
+    const double tr = cxx + cyy, det2 = cxx * cyy - cxy * cxy;
+    const double lmin = 0.5 * (tr - std::sqrt(std::max(0.0, tr * tr - 4.0 * det2)));
+    if (lmin < 1.0) return s;
+
+    // Solve S c = b by Cramer's rule; only c[0] (the plane at the point) is needed.
+    auto det3 = [](const double m[3][3]) {
+        return m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) -
+               m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+               m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    };
+    const double D = det3(S);
+    if (std::abs(D) < 1e-12) return s;
+    auto first = [&](const double b[3]) {
+        double M[3][3];
+        for (int a = 0; a < 3; ++a) {
+            M[a][0] = b[a];
+            M[a][1] = S[a][1];
+            M[a][2] = S[a][2];
+        }
+        return det3(M) / D;
+    };
+    s.ok = true;
+    s.u = (float)first(bu);
+    s.v = (float)first(bv);
+    s.corr = worst;
+    return s;
+}
+
+GapDistance gap_distance(const NodeField &f) {
+    GapDistance g;
+    if (f.gridW <= 0 || f.gridH <= 0 || f.step <= 0) return g;
+    // distanceTransform measures to the nearest zero. A one-node ring around
+    // the grid stands for "off the grid": unsolved for `gap`, solved for
+    // `hole`, so only real holes count against a clean subset.
+    cv::Mat solved(f.gridH + 2, f.gridW + 2, CV_8U, cv::Scalar(0)), hole_in(solved.size(), CV_8U, cv::Scalar(1));
+    for (int j = 0; j < f.gridH; ++j)
+        for (int i = 0; i < f.gridW; ++i) {
+            const unsigned char v = f.valid[(size_t)j * f.gridW + i] ? 1 : 0;
+            solved.at<uchar>(j + 1, i + 1) = v;
+            hole_in.at<uchar>(j + 1, i + 1) = v;
+        }
+    cv::Mat d_gap, d_hole;
+    cv::distanceTransform(solved, d_gap, cv::DIST_L2, cv::DIST_MASK_PRECISE);
+    cv::distanceTransform(hole_in, d_hole, cv::DIST_L2, cv::DIST_MASK_PRECISE);
+    const cv::Rect inner(1, 1, f.gridW, f.gridH);
+    g.gap = d_gap(inner) * (double)f.step;
+    g.hole = d_hole(inner) * (double)f.step;
+    return g;
+}
+
+AnchorNeed anchor_need(const NodeField &f, const GapDistance &g, float x, float y, int subset_size) {
+    if (g.gap.empty()) return AnchorNeed::kKeep;
+    // The node nearest (x, y); distances are node to node, so within about
+    // 0.7 step of the point's own.
+    const int i = std::min(f.gridW - 1, std::max(0, (int)std::lround((x - f.rect_x) / f.step)));
+    const int j = std::min(f.gridH - 1, std::max(0, (int)std::lround((y - f.rect_y) / f.step)));
+    if (g.hole.at<float>(j, i) <= (float)(subset_size / 2 + f.step)) return AnchorNeed::kKeep;
+    if (g.gap.at<float>(j, i) <= (float)(2 * subset_size + 2 * f.step)) return AnchorNeed::kRefresh;
+    return AnchorNeed::kDrop;
+}
+
+bool make_anchor(const cv::Mat &ref_gray, float x, float y, int subset_size, CoastAnchor &out) {
+    const int ax = (int)std::lround(x), ay = (int)std::lround(y);
+    const int r = subset_size / 2 + tuning::kIncAnchorMarginPx;
+    const cv::Rect box(ax - r, ay - r, 2 * r + 1, 2 * r + 1);
+    if (ref_gray.empty() || (box & cv::Rect(0, 0, ref_gray.cols, ref_gray.rows)) != box) return false;
+    out.patch = ref_gray(box).clone();
+    out.ax = ax;
+    out.ay = ay;
+    out.dx = x - (float)ax;
+    out.dy = y - (float)ay;
+    return true;
+}
+
+bool match_anchor(const CoastAnchor &a, const Image &def, int subset_size, bool use_6x6,
+                  float guess_x, float guess_y, float max_shift, float &x, float &y, float &corr) {
+    if (a.patch.empty()) return false;
+    Image patch(a.patch.cols, a.patch.rows, a.patch.data);
+    patch.prepare_data(false);
+    SubsetData subset;
+    const int c = a.patch.cols / 2;
+    SubsetPrecomputer::precompute_subset(subset, patch, c, c, subset_size);
+    if (!subset.is_initialized) return false;
+    // The subset's data is relative to its centre; the solve reads the
+    // deformed image at the centre plus the warp, so it can sit anywhere.
+    subset.cx = a.ax;
+    subset.cy = a.ay;
+
+    OptimizationEngine engine;
+    engine.lm_enabled = true;
+    engine.lm_alpha = tuning::kLmAlpha;
+    engine.use_6x6_interpolator = use_6x6;
+    // Guess for the centre pixel: the node's guess less its offset from it.
+    const AnalysisResult res = engine.calculate_deformation(
+            subset, def, guess_x - a.dx - (float)a.ax, guess_y - a.dy - (float)a.ay,
+            0.0f, 0.0f, 0.0f, 0.0f, INIT_NO_SEARCH);   // simplex rescue, as Path B
+    // The node, (dx, dy) from the centre, through the matched affine map.
+    const float nx = (float)a.ax + res.u + (1.0f + res.ux) * a.dx + res.uy * a.dy;
+    const float ny = (float)a.ay + res.v + res.vx * a.dx + (1.0f + res.vy) * a.dy;
+    if (!(std::hypot(nx - guess_x, ny - guess_y) <= max_shift)) return false;
+    x = nx;
+    y = ny;
+    corr = res.correlation_score;
+    return true;
 }
 
 namespace {

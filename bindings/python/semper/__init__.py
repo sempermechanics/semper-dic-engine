@@ -140,7 +140,13 @@ class IncrementalSession:
     frame). Each frame is correlated against the current reference and composed
     onto the running total, so large deformation can be followed frame by
     frame. Every update adds a little error, so on slow loading a larger
-    interval (or the fixed reference) is more accurate.
+    interval (or the fixed reference) is more accurate. With an interval above
+    1 the reference also moves as soon as a frame reports 5% fewer points.
+
+    A point the solve cannot reach on a frame (a band that does not correlate,
+    such as glare or a background edge) coasts on its neighbours' motion and is
+    not reported; it is reported again once it is measured, after a long coast
+    only once its own earlier subset confirms where it is.
 
     Not thread-safe except for :meth:`cancel`.
 

@@ -522,13 +522,183 @@ TEST_CASE(Incremental, LongHorizon_160Frames) {
         CHECK(a.points >= (int)(0.75 * first_rc));
         // Each update adds a small per-node interpolation bias (a few % of a
         // tiny sub-pixel step, the same sign frame after frame), so error grows
-        // with the number of updates: measured 0.31 px (N=1) and 0.22 px (N=5)
+        // with the number of updates: measured 0.40 px (N=1) and 0.19 px (N=5)
         // here against 0.05 px for the fixed reference. These bounds hold that
         // with margin; docs/INCREMENTAL_BENCHMARK.md has the full picture.
         CHECK(a.rms_u <= (interval == 1 ? 0.45 : 0.35));
         CHECK(a.rms_e <= 3.5e-2);
         if (rss_early > 0) CHECK(rss_late - rss_early < 16L * 1048576L);
     }
+}
+
+namespace {
+
+// Material sliding down under a stationary band 9 px tall where the image
+// decorrelates from frame to frame: glare flicker, a reflection, translucent
+// film passing from a white background onto a dark rig (the tensile video this
+// was found on). The band shows a different speckle on every frame, with the
+// same statistics as the material's, so a subset reaching into it does not
+// match and the nodes within about a subset of it fail, while nodes either
+// side solve. (A sharp stationary intensity edge is a different case: a subset
+// holding it can lock onto the edge and report a wrong, smooth match that the
+// median test cannot see. Full-range noise in the band is different again: it
+// swamps the phase correlation and seeding fails over the whole ROI.)
+Sequence band_sequence(int w, int h, int T, double ty_max, double e_max, int band_y) {
+    Sequence s;
+    s.w = w; s.h = h;
+    const dictest::SmoothSpeckleField field(43, w, h);
+    const dictest::Vec2 c{w / 2.0, h / 2.0};
+    auto glare = [&](cv::Mat img, unsigned seed) {
+        const dictest::SmoothSpeckleField other(seed, w, h);
+        for (int y = band_y - 4; y <= band_y + 4; ++y)
+            for (int x = 0; x < w; ++x)
+                img.at<uchar>(y, x) = static_cast<uchar>(other.sample_fast((float)x, (float)y) + 0.5f);
+        return img;
+    };
+    s.ref = glare(dictest::render_frame(field, w, h, dictest::identity_motion(), 1.0f, 2000), 3000);
+    for (int t = 1; t <= T; ++t) {
+        const double f = (double)t / T;
+        dictest::Motion m = dictest::stretch_rotate(e_max * f, 0.3, 0.0, dictest::Vec2{0.0, ty_max * f}, c);
+        s.frames.push_back(glare(dictest::render_frame(field, w, h, m, 1.0f, 2000 + t), 3000 + t));
+        s.motion.push_back(std::move(m));
+    }
+    return s;
+}
+
+} // namespace
+
+TEST_CASE(Incremental, StationaryBand_NodesCoastAcrossAndComeBack) {
+    // 108 px down in 3 px steps across a band 12 px below the ROI centre.
+    // Nodes near the band cannot be measured. They coast on the plane through
+    // the nodes either side, unreported, and are reported again only once
+    // their subset from before the band matches them directly beyond it, so
+    // the drift of the coast does not stay in them. Before coasting every
+    // node that reached the band was lost for good.
+    const int T = 36, band_y = 252;
+    const Sequence s = band_sequence(320, 480, T, 108.0, 0.03, band_y);
+    FullFieldParams p = centred_params(320, 480, 160, 5);
+    p.strain_window = 15;
+    const std::vector<Frame> inc = run_session(s, cv::Mat(), p, 1);
+    REQUIRE((int)inc.size() == T);
+    const int gw = p.rect_w / p.step, gh = p.rect_h / p.step;
+
+    if (std::getenv("SEMPER_INC_TRACE")) {
+        for (int t : {0, 11, 23, 35}) {
+            const Accuracy at = evaluate(inc[t], s.motion[t], 0.5);
+            std::printf("    t=%2d rc=%3d tracked=%3d within 0.5 px %3d rms=%.3f; error map (0.1 px, '.' absent):\n",
+                        t + 1, inc[t].rc, inc[t].info.tracked_points, at.within, at.rms_u);
+            std::vector<int> map((size_t)gw * gh, -1);
+            for (int i = 0; i < inc[t].rc; ++i) {
+                const float *q = &inc[t].out[(size_t)i * 8];
+                const dictest::Vec2 d = s.motion[t].displacement(q[0], q[1]);
+                const int gx = (int)((q[0] - p.rect_x) / p.step), gy = (int)((q[1] - p.rect_y) / p.step);
+                map[(size_t)gy * gw + gx] = std::min(9, (int)(std::hypot(q[2] - d.x, q[3] - d.y) * 10));
+            }
+            for (int gy = 0; gy < gh; ++gy) {
+                std::printf("    %3d ", p.rect_y + gy * p.step);
+                for (int gx = 0; gx < gw; ++gx) {
+                    const int v = map[(size_t)gy * gw + gx];
+                    std::printf("%c", v < 0 ? '.' : (char)('0' + v));
+                }
+                std::printf("\n");
+            }
+        }
+    }
+
+    // Frame-0 nodes in three groups, by where their path took them:
+    //  - clear:   never within reach of the band;
+    //  - crossed: from above the band's reach to below it, so coasted;
+    //  - started: in reach of it on frame 0. Those frame 1 could not measure
+    //    are not followed at all.
+    // Reach: a subset and a half, past which a node's subset is clean and so
+    // are its strain-window neighbours'. Only nodes frame 1 could report
+    // count (the outer ring never reaches VSG output; the right edge of this
+    // speckle has a weak patch).
+    const Frame &f1 = inc[0];
+    const Frame &last = inc[T - 1];
+    const dictest::Motion &m = s.motion[T - 1];
+    const double reach = 1.5 * p.subset_size;
+    auto find = [](const Frame &f, float x0, float y0) -> const float * {
+        for (int i = 0; i < f.rc; ++i) {
+            const float *o = &f.out[(size_t)i * 8];
+            if (o[0] == x0 && o[1] == y0) return o;
+        }
+        return nullptr;
+    };
+    struct Group { int n = 0, back = 0; std::vector<double> err; };
+    Group clear, crossed, started;
+    for (int gy = 0; gy < gh; ++gy) {
+        for (int gx = 0; gx < gw; ++gx) {
+            const float x0 = (float)(p.rect_x + gx * p.step), y0 = (float)(p.rect_y + gy * p.step);
+            const dictest::Vec2 d = m.displacement(x0, y0);
+            const double y_end = y0 + d.y;
+            if (std::abs(y_end - band_y) < reach) continue;      // in reach of the band now
+            Group *g = nullptr;
+            if (std::abs(y0 - band_y) < reach) g = &started;
+            else if (y0 < band_y && y_end > band_y) g = &crossed;
+            else if (y0 > band_y || y_end < band_y - reach) g = &clear;
+            if (g == nullptr) continue;
+            // Interior of what frame 1 reports, by column: a node in a column
+            // frame 1 reports somewhere, and not on the outer ring.
+            if (gx == 0 || gx == gw - 1 || gy == 0 || gy == gh - 1) continue;
+            if (g != &started && find(f1, x0, y0) == nullptr) continue;
+            g->n++;
+            if (const float *o = find(last, x0, y0)) {
+                g->back++;
+                g->err.push_back(std::hypot(o[2] - d.x, o[3] - d.y));
+            }
+        }
+    }
+    auto pct = [](std::vector<double> e, double q) {
+        if (e.empty()) return 0.0;
+        std::sort(e.begin(), e.end());
+        return e[std::min(e.size() - 1, (size_t)(q * (double)e.size()))];
+    };
+    std::printf("  [stationary band T=%d] tracked %d (frame 1: %d) | clear: %d/%d reported, p90 %.3f max %.3f px "
+                "| crossed: %d/%d, median %.3f p90 %.3f max %.3f px | started in it: %d/%d\n",
+                T, last.info.tracked_points, f1.info.tracked_points, clear.back, clear.n,
+                pct(clear.err, 0.9), pct(clear.err, 1.0), crossed.back, crossed.n, pct(crossed.err, 0.5),
+                pct(crossed.err, 0.9), pct(crossed.err, 1.0), started.back, started.n);
+    // Measured: tracked 806 (frame 1: 816); clear 168/180, max 0.46 px
+    // (incremental drift beside the gap, as without coasting); crossed
+    // 146/285 back by frame 36 (the rest still wait for a clean subset, 20-25
+    // a frame), median 0.029 px, max 0.20 px; started in it 43/360.
+    REQUIRE(crossed.n > 0);
+    CHECK(last.info.tracked_points >= (int)(0.98 * f1.info.tracked_points));
+    CHECK(clear.back >= (int)(0.90 * clear.n));
+    CHECK(pct(clear.err, 1.0) <= 0.60);
+    CHECK(crossed.back >= (int)(0.45 * crossed.n));
+    CHECK(pct(crossed.err, 0.5) <= 0.08);
+    CHECK(pct(crossed.err, 1.0) <= 0.40);
+}
+
+TEST_CASE(Incremental, EarlyUpdate_WhenReportedPointsDrop) {
+    // The same sequence with an interval longer than it: the band costs points
+    // as the material moves under it, and the reference moves early each time the
+    // count falls 5% below the first frame on the current reference.
+    const int T = 36, band_y = 252;
+    const Sequence s = band_sequence(320, 480, T, 108.0, 0.03, band_y);
+    FullFieldParams p = centred_params(320, 480, 160, 5);
+    p.strain_window = 15;
+    const std::vector<Frame> inc = run_session(s, cv::Mat(), p, 100);
+    REQUIRE((int)inc.size() == T);
+    int updates = 0, first_on_ref = -1;
+    for (int t = 0; t < T; ++t) {
+        const Frame &f = inc[t];
+        if (first_on_ref < 0) first_on_ref = f.rc;   // first frame on this reference
+        if (f.info.reference_updated) {
+            updates++;
+            CHECK(f.rc < 0.95 * first_on_ref);
+            if (t + 1 < T) CHECK(inc[t + 1].info.reference_frame == t + 1);
+            first_on_ref = -1;
+        } else {
+            CHECK(f.rc >= 0.95 * first_on_ref);
+        }
+    }
+    std::printf("  [early update N=100 T=%d] %d early updates\n", T, updates);
+    CHECK(updates > 0);
+    // A fixed reference never updates, early or not.
+    for (const Frame &f : run_session(s, cv::Mat(), p, 0)) CHECK(!f.info.reference_updated);
 }
 
 #else

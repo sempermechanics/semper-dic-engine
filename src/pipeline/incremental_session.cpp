@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <unordered_map>
 
 #undef LOG_TAG
 #define LOG_TAG "SemperIncremental"
@@ -54,9 +55,16 @@ struct IncrementalSession::Impl {
     // whether it is known. A node unknown at a reference stays unknown.
     std::vector<float> Ubase, Vbase;
     std::vector<unsigned char> alive;
+    // Pixels a node has travelled on fitted increments since it was last
+    // measured and, if need be, confirmed (0 while it is). MATHEMATICS 9.5.
+    std::vector<float> coast_travel;
+    // Subset of a node near a gap, cut on a reference where it was clean;
+    // kept while it coasts, to confirm it by when it can be measured again.
+    std::unordered_map<size_t, CoastAnchor> anchors;
 
     int ref_index = 0;            // frame index of the current reference
     int frames_since_update = 0;
+    int ref_reported = -1;        // points reported on the first frame against this reference
     int frame_count = 0;          // frames solved so far
 
     FullFieldParams params_k;     // grid on the current reference (k > 0)
@@ -72,9 +80,11 @@ struct IncrementalSession::Impl {
         material_mask0.release();
         grid0 = GridGeom();
         frame0_points = -1;
-        Ubase.clear(); Vbase.clear(); alive.clear();
+        Ubase.clear(); Vbase.clear(); alive.clear(); coast_travel.clear();
+        anchors.clear();
         ref_index = 0;
         frames_since_update = 0;
+        ref_reported = -1;
         frame_count = 0;
         params_k = FullFieldParams();
         mask_k.release();
@@ -135,6 +145,7 @@ struct IncrementalSession::Impl {
         if (bb.area() == 0) std::fill(alive.begin(), alive.end(), 0);
         ref_index = new_ref_index;
         frames_since_update = 0;
+        ref_reported = -1;
     }
 };
 
@@ -202,6 +213,7 @@ int IncrementalSession::init(const cv::Mat& ref_gray, const cv::Mat& roi_mask,
     s.Ubase.assign(n, 0.0f);
     s.Vbase.assign(n, 0.0f);
     s.alive.assign(n, 1);
+    s.coast_travel.assign(n, 0.0f);
     s.initialized = true;
     return 0;
 }
@@ -227,7 +239,7 @@ int IncrementalSession::process_frame(const cv::Mat& def_gray, float* output, in
     IncrementalFrameInfo fi;
     fi.reference_frame = s.ref_index;
     const int N = s.params.update_interval;
-    const bool will_update = N > 0 && s.frames_since_update + 1 >= N;
+    bool will_update = N > 0 && s.frames_since_update + 1 >= N;
     const GridGeom& g0 = s.grid0;
     const size_t n0 = (size_t)g0.gridW * g0.gridH;
 
@@ -240,12 +252,45 @@ int IncrementalSession::process_frame(const cv::Mat& def_gray, float* output, in
     }
 
     FieldCapture cap;
-    cap.keep_deformed = will_update;
+    // With N > 1 any frame may become the reference early (kIncEarlyUpdateDrop).
+    cap.keep_deformed = N > 0;
     if (!s.debug_dir.empty()) s.cache.debug_dir = s.debug_dir;
 
     std::vector<float> U(n0, 0.0f), V(n0, 0.0f);
-    std::vector<unsigned char> valid(n0, 0);
+    std::vector<unsigned char> valid(n0, 0);     // measured on this frame
+    std::vector<unsigned char> carried(n0, 0);   // measured or coasting: kept at an update
+    std::vector<float> coast_step(n0, 0.0f);     // |fitted increment| of a coasting node
+    std::vector<AnchorNeed> need(n0, AnchorNeed::kKeep);   // for measured nodes
+    int coasting = 0;
     int written = 0;
+
+    // A node the solve did not reach coasts on the plane through the solved
+    // increments around it, unreported, until the solve reaches it again or
+    // it has travelled too far. (px, py): where the node sits on the solve's
+    // reference; `inc` holds that solve's increments.
+    const int subset_size = s.params.field.subset_size;
+    const float max_travel = tuning::kIncCoastMaxTravelSubsets * (float)subset_size;
+    auto carry = [&](size_t i, float du, float dv) {
+        const float travel = std::hypot(du, dv);
+        if (s.coast_travel[i] + travel > max_travel) return;
+        U[i] = s.Ubase[i] + du;
+        V[i] = s.Vbase[i] + dv;
+        carried[i] = 1;
+        coast_step[i] = travel;
+        coasting++;
+    };
+    // Only a node that has been measured coasts: one that frame 1 cannot
+    // measure may sit in a gap, or on texture too weak to correlate at all,
+    // and nothing would ever confirm it. Nor does one that has left the image.
+    auto coast = [&](size_t i, const NodeField &inc, float px, float py) {
+        if (px < 0.0f || py < 0.0f || px > (float)(s.width - 1) || py > (float)(s.height - 1)) return;
+        const float radius = (float)(tuning::kIncCoastRadiusCells * inc.step);
+        const IncrementSample fit = fit_increment(inc, px, py, radius);
+        if (!fit.ok) return;
+        carry(i, fit.u, fit.v);
+    };
+    const float trusted_travel = tuning::kIncCoastTrustedTravelSubsets * (float)subset_size;
+    int reanchored = 0;
 
     if (s.ref_index == 0) {
         // Same call as run_full_field, straight into the caller's buffer.
@@ -258,7 +303,15 @@ int IncrementalSession::process_frame(const cv::Mat& def_gray, float* output, in
         U = nf.u;
         V = nf.v;
         valid = nf.valid;
+        carried = valid;
         if (s.frame0_points < 0) s.frame0_points = cap.attempted;
+        const GapDistance gd = gap_distance(nf);
+        for (size_t i = 0; i < n0; ++i) {
+            if (valid[i]) {
+                need[i] = anchor_need(nf, gd, nf.node_x((int)(i % g0.gridW)),
+                                      nf.node_y((int)(i / g0.gridW)), subset_size);
+            }
+        }
     } else {
         const int gw = s.params_k.rect_w / s.params_k.step;
         const int gh = s.params_k.rect_h / s.params_k.step;
@@ -268,6 +321,7 @@ int IncrementalSession::process_frame(const cv::Mat& def_gray, float* output, in
                                            metrics, metrics_len, std::move(on_progress), &cap);
         if (rc < 0) return rc;
         const NodeField inc = node_field_from_capture(cap);
+        const GapDistance gd = gap_distance(inc);
 
         ResultGrid grid(g0.gridH, std::vector<GridPoint>(g0.gridW));
         for (int gy = 0; gy < g0.gridH; ++gy) {
@@ -278,15 +332,48 @@ int IncrementalSession::process_frame(const cv::Mat& def_gray, float* output, in
                 gp.y = (float)(g0.rect_y + gy * g0.step);
                 gp.corr = tuning::kCorrInvalid;
                 if (!s.alive[i]) continue;
-                const IncrementSample smp = sample_increment(inc, gp.x + s.Ubase[i], gp.y + s.Vbase[i]);
-                if (!smp.ok) continue;
+                const float px = gp.x + s.Ubase[i], py = gp.y + s.Vbase[i];
+                const IncrementSample smp = sample_increment(inc, px, py);
+                if (!smp.ok) {
+                    coast(i, inc, px, py);   // no solved node close enough
+                    continue;
+                }
                 U[i] = s.Ubase[i] + smp.u;
                 V[i] = s.Vbase[i] + smp.v;
+                float corr = smp.corr;
+                need[i] = anchor_need(inc, gd, px, py, subset_size);
+                if (s.coast_travel[i] > trusted_travel) {
+                    // It coasted across an update, so it sits where a fitted
+                    // plane put it, and this increment was measured from
+                    // there. Report it again only once its subset, from where
+                    // it was last clean, matches it here, and only try where
+                    // its subset here is clean too: one still reaching into
+                    // the gap can match with a bias.
+                    const auto a = s.anchors.find(i);
+                    const float max_shift = std::max(tuning::kIncReanchorMinShiftPx,
+                                                     tuning::kIncReanchorMaxShiftFraction * s.coast_travel[i]);
+                    float x = 0.0f, y = 0.0f;
+                    if (need[i] == AnchorNeed::kKeep || a == s.anchors.end() || !cap.deformed ||
+                        !match_anchor(a->second, *cap.deformed, subset_size,
+                                      s.params.field.use_6x6_interpolator, gp.x + U[i], gp.y + V[i],
+                                      max_shift, x, y, corr)) {
+                        // Unconfirmed: it moves on the measured increment,
+                        // unreported, and adds nothing to its coasted
+                        // distance. It is tried again on the next frame.
+                        carried[i] = 1;
+                        coasting++;
+                        continue;
+                    }
+                    U[i] = x - gp.x;
+                    V[i] = y - gp.y;
+                    reanchored++;
+                }
                 valid[i] = 1;
+                carried[i] = 1;
                 if (smp.taylor) fi.taylor_fallbacks++;
                 gp.u = U[i];
                 gp.v = V[i];
-                gp.corr = smp.corr;
+                gp.corr = corr;
                 gp.solved = true;
             }
         }
@@ -304,17 +391,42 @@ int IncrementalSession::process_frame(const cv::Mat& def_gray, float* output, in
         written = packed.valid_count;
     }
 
-    for (unsigned char v : valid) fi.tracked_points += v ? 1 : 0;
+    for (unsigned char v : carried) fi.tracked_points += v ? 1 : 0;
     fi.frame0_points = std::max(s.frame0_points, 0);
+
+    // Early update on a drop in the points reported (written), not in the
+    // nodes sampled: a sparse loss of increment nodes still samples through
+    // the Taylor fallback but fails the median test and the strain window.
+    if (!will_update && N > 1) {
+        if (s.ref_reported < 0) {
+            s.ref_reported = written;
+        } else if ((float)written < (1.0f - tuning::kIncEarlyUpdateDrop) * (float)s.ref_reported) {
+            will_update = true;
+        }
+    }
 
     s.frame_count++;
     if (will_update) {
         const int before = (s.ref_index == 0) ? fi.frame0_points : s.alive_count();
-        s.move_reference(cap, U, V, valid, s.frame_count);
+        // Anchors are cut on the frame about to become the reference, where
+        // a measured node sits at X0 + U. A coasting node keeps the one it has.
+        for (size_t i = 0; i < n0; ++i) {
+            s.coast_travel[i] = (carried[i] && !valid[i]) ? s.coast_travel[i] + coast_step[i] : 0.0f;
+            if (!carried[i] || (valid[i] && need[i] == AnchorNeed::kDrop)) {
+                s.anchors.erase(i);
+            } else if (valid[i] && need[i] == AnchorNeed::kRefresh) {
+                CoastAnchor a;
+                if (make_anchor(cap.deformed_gray, g0.rect_x + (int)(i % g0.gridW) * g0.step + U[i],
+                                g0.rect_y + (int)(i / g0.gridW) * g0.step + V[i], subset_size, a)) {
+                    s.anchors[i] = std::move(a);
+                }
+            }
+        }
+        s.move_reference(cap, U, V, carried, s.frame_count);
         fi.reference_updated = true;
         fi.lost_this_frame = std::max(0, before - s.alive_count());
-        LOGD("Reference moved to frame %d: %d of %d frame-0 nodes tracked",
-             s.ref_index, s.alive_count(), fi.frame0_points);
+        LOGD("Reference moved to frame %d: %d of %d frame-0 nodes tracked (%d coasting, %d re-anchored)",
+             s.ref_index, s.alive_count(), fi.frame0_points, coasting, reanchored);
     } else {
         s.frames_since_update++;
     }

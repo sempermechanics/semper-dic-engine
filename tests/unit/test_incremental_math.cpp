@@ -96,6 +96,119 @@ TEST_CASE(IncrementalMath, Sample_CorrIsWorstContributor) {
     CHECK(s.corr == 0.09f);
 }
 
+TEST_CASE(IncrementalMath, Fit_ReproducesLinearFieldAcrossAHole) {
+    // A band 4 nodes wide with nothing solved in it, as where the material
+    // crosses a stationary background edge: sampling has no node within reach
+    // of the band's middle, the plane through the nodes either side does.
+    NodeField f = linear_field(12, 12, 20, 30, 10, kA, kB);
+    for (int j = 4; j < 8; ++j)
+        for (int i = 0; i < 12; ++i) f.valid[(size_t)j * 12 + i] = 0;
+    for (double x : {20.0, 73.0, 130.0}) {
+        const float y = 85.0f;   // between rows 5 and 6
+        CHECK(!sample_increment(f, (float)x, y).ok);
+        const IncrementSample s = fit_increment(f, (float)x, y, 80.0f);
+        REQUIRE(s.ok);
+        CHECK_NEAR(s.u, lin(kA, x, y), 1e-3);
+        CHECK_NEAR(s.v, lin(kB, x, y), 1e-3);
+    }
+}
+
+TEST_CASE(IncrementalMath, Fit_TooFewOrCollinearNodes_IsInvalid) {
+    NodeField f = linear_field(10, 10, 0, 0, 10, kA, kB);
+    // One row left: plenty of nodes, but no spread across it.
+    for (size_t k = 0; k < f.size(); ++k) f.valid[k] = (k / 10 == 3) ? 1 : 0;
+    CHECK(!fit_increment(f, 45.0f, 50.0f, 80.0f).ok);
+    // Five nodes two steps around (50, 40): spread in both axes, one short of
+    // the minimum; a sixth makes it.
+    std::fill(f.valid.begin(), f.valid.end(), 0);
+    for (int k : {43, 47, 25, 65, 23}) f.valid[(size_t)k] = 1;
+    CHECK(!fit_increment(f, 50.0f, 40.0f, 80.0f).ok);
+    f.valid[(size_t)67] = 1;
+    const IncrementSample s = fit_increment(f, 50.0f, 40.0f, 80.0f);
+    REQUIRE(s.ok);
+    CHECK_NEAR(s.u, lin(kA, 50, 40), 1e-3);
+    CHECK_NEAR(s.v, lin(kB, 50, 40), 1e-3);
+    // Nothing within the radius.
+    CHECK(!fit_increment(f, 50.0f, 40.0f, 5.0f).ok);
+}
+
+TEST_CASE(IncrementalMath, Fit_CorrIsWorstUsed) {
+    NodeField f = linear_field(8, 8, 0, 0, 10, kA, kB);
+    f.corr[(size_t)2 * 8 + 3] = 0.12f;   // within the radius of (35, 35)
+    f.corr[(size_t)7 * 8 + 7] = 0.30f;   // outside it
+    const IncrementSample s = fit_increment(f, 35.0f, 35.0f, 30.0f);
+    REQUIRE(s.ok);
+    CHECK(s.corr == 0.12f);
+}
+
+TEST_CASE(IncrementalMath, AnchorNeed_DropRefreshKeep) {
+    // 30 x 30 nodes, step 5, over (0..145)^2; subset 21: its own reach 15 px,
+    // a gap counts within 52 px.
+    NodeField f = linear_field(30, 30, 0, 0, 5, kA, kB);
+    auto need = [&](float x, float y) { return anchor_need(f, gap_distance(f), x, y, 21); };
+    CHECK(need(75.0f, 75.0f) == AnchorNeed::kDrop);      // nothing missing near
+    CHECK(need(75.0f, 20.0f) == AnchorNeed::kRefresh);   // the grid ends 25 px up
+    CHECK(need(75.0f, 5.0f) == AnchorNeed::kRefresh);    // off the grid is not a hole
+    f.valid[(size_t)23 * 30 + 15] = 0;                   // a gap 40 px below
+    CHECK(need(75.0f, 75.0f) == AnchorNeed::kRefresh);
+    f.valid[(size_t)17 * 30 + 15] = 0;                   // a hole in its own subset
+    CHECK(need(75.0f, 75.0f) == AnchorNeed::kKeep);
+}
+
+namespace {
+
+// Smooth random texture, 8-bit, the scale of a DIC speckle.
+cv::Mat texture(int w, int h, unsigned seed) {
+    cv::Mat noise(h, w, CV_32F);
+    cv::RNG rng(seed);
+    rng.fill(noise, cv::RNG::NORMAL, 0.0, 1.0);
+    cv::GaussianBlur(noise, noise, cv::Size(0, 0), 2.0);
+    cv::normalize(noise, noise, 30.0, 225.0, cv::NORM_MINMAX);
+    cv::Mat out;
+    noise.convertTo(out, CV_8U);
+    return out;
+}
+
+} // namespace
+
+TEST_CASE(IncrementalMath, Anchor_MatchesTheNodeWhereItMoved) {
+    const cv::Mat ref = texture(200, 200, 7);
+    // A whole-pixel shift, so resampling the texture adds no error of its own
+    // (a cubic sub-pixel warp of it is off by ~0.05 px); the node's sub-pixel
+    // offset from its anchor pixel is still exercised.
+    const float tx = 12.0f, ty = -7.0f;
+    const cv::Mat M = (cv::Mat_<double>(2, 3) << 1, 0, tx, 0, 1, ty);
+    cv::Mat def;
+    cv::warpAffine(ref, def, M, ref.size(), cv::INTER_CUBIC, cv::BORDER_REFLECT);
+    Semper::Image img(def.cols, def.rows, def.data);
+    img.prepare_data(false);
+
+    CoastAnchor a;
+    REQUIRE(make_anchor(ref, 100.4f, 90.7f, 21, a));
+    CHECK(a.ax == 100);
+    CHECK(a.ay == 91);
+    CHECK_NEAR(a.dx, 0.4, 1e-5);
+    CHECK_NEAR(a.dy, -0.3, 1e-5);
+
+    // Started where coasting left it, 1 px off: matched to where it is.
+    float x = 0, y = 0, corr = 0;
+    const float gx = 100.4f + tx + 0.8f, gy = 90.7f + ty - 0.6f;
+    REQUIRE(match_anchor(a, img, 21, false, gx, gy, 2.0f, x, y, corr));
+    CHECK_NEAR(x, 100.4 + tx, 0.05);
+    CHECK_NEAR(y, 90.7 + ty, 0.05);
+    CHECK(corr < 0.05f);
+    // The same match, further from the guess than allowed.
+    CHECK(!match_anchor(a, img, 21, false, gx, gy, 0.5f, x, y, corr));
+    // Nothing like it here.
+    const cv::Mat other = texture(200, 200, 8);
+    Semper::Image img2(other.cols, other.rows, other.data);
+    img2.prepare_data(false);
+    CHECK(!match_anchor(a, img2, 21, false, gx, gy, 2.0f, x, y, corr));
+    // A patch that would leave the image is not cut.
+    CoastAnchor edge;
+    CHECK(!make_anchor(ref, 12.0f, 100.0f, 21, edge));
+}
+
 TEST_CASE(IncrementalMath, NodeField_DropsUnsolvedAndOutliers) {
     FieldCapture cap;
     cap.gridW = 7; cap.gridH = 7; cap.rect_x = 0; cap.rect_y = 0; cap.step = 10;
