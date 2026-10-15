@@ -74,6 +74,7 @@ set(DIC_DICE_TESTS
         dice/test_strain_gradients.cpp
         dice/test_strain_vsg.cpp
         dice/test_field_agreement.cpp
+        dice/test_incremental_oht.cpp
 )
 set(DIC_PERF_TESTS
         perf/test_throughput.cpp
