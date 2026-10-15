@@ -72,8 +72,35 @@ inline constexpr float kStrainFailSentinel = -999.0f;
 /** Path B queue wait cancel-poll interval (ms). */
 inline constexpr int kCancelPollMs = 20;
 
+/**
+ * Path B flood fill: solved nodes expanded per round (full_field_path_b.cpp).
+ * A fixed number, not the core count, so the field does not depend on the
+ * device. Larger rounds give the workers more cells at once but follow the
+ * reliability order less strictly. Changing it changes the field.
+ */
+inline constexpr int kPathBBatchNodes = 32;
+
 /** Floating-point radius fudge used in VSG window membership. */
 inline constexpr double kVsgRadiusTiny = 1.0e-5;
+
+/** Displacement median test: neighbourhood half-width in grid points (5x5). */
+inline constexpr int kOutlierRadius = 2;
+
+/** Displacement median test: noise floor added to the residual median, px. */
+inline constexpr float kOutlierEpsPx = 0.1f;
+
+/**
+ * Displacement median test: normalized residual above which a point is
+ * rejected. Westerweel & Scarano use 2 on 3x3; 3 on 5x5 rejects the same
+ * wrong matches on real bending data and leaves more room for noise.
+ */
+inline constexpr float kOutlierThreshold = 3.0f;
+
+/** Displacement median test: fewer accepted neighbours than this, no test. */
+inline constexpr int kOutlierMinNeighbours = 3;
+
+/** Displacement median test: pass limit (it stops early once stable). */
+inline constexpr int kOutlierMaxPasses = 5;
 
 } // namespace tuning
 } // namespace Semper

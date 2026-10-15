@@ -223,7 +223,14 @@ struct DisplacementField { int width, height, step;       // grid dims + px spac
                            std::vector<bool> valid; };
 
 static StrainField compute_vsg_strain (const DisplacementField&, int window_pixels);
+static int reject_displacement_outliers(DisplacementField&);   // clears valid[], returns count
 ```
+
+`pack_full_field_output` runs `reject_displacement_outliers` on the solved grid
+before `compute_vsg_strain`. It is a normalized median test (MATHEMATICS §9.4)
+on u and v over each point's 5x5 neighbours, repeated until nothing new fails.
+Rejected points feed no strain window and are not written to the output, so they
+count in metrics slot 2 (rejected = attempted − solved) like any other drop.
 
 Outputs **Green-Lagrange strain**:
 `exx = ∂u/∂x + ½((∂u/∂x)² + (∂v/∂x)²)`, etc.
@@ -233,6 +240,7 @@ Outputs **Green-Lagrange strain**:
 | Method | least-squares plane fit over a circular window |
 | Exact for | any linear displacement field |
 | Rejection | < 90% window fill or `rcond < 1e-12` → sentinel `−1000.0f` |
+| Displacement outliers | normalized median test, 5x5, ε 0.1 px, threshold 3, repeated (`tuning::kOutlier*`) → point dropped before the fit |
 
 **Consumer warning:** VSG failures are marked with `−1000.0f`. Check before
 rendering/statistics.
@@ -271,8 +279,8 @@ Where it is polled, and why there:
 | Site | Shape |
 |---|---|
 | Hessian pre-pass, Path A mesh execution | `if (cancel_requested()) continue;` — OpenMP forbids breaking out of a parallel `for`, so a cancel skips the remaining iterations |
-| Path B queue workers | `return` at the top of the work loop, plus the flag in the condition-variable predicate |
-| Path B's CV wait | bounded (`wait_for`, 20 ms) — a worker parked on an empty queue has no one to notify it of a cancel, so it re-checks on a timer |
+| Path B workers | the flag in the condition-variable predicate, then `return` |
+| Path B's CV wait | bounded (`wait_for`, 20 ms) — a worker waiting for the next round has no one to notify it of a cancel, so it re-checks on a timer |
 | After Path A, after Path B | `return kCancelled` — a cancelled field is partial, so strain and packing are never run on it |
 
 `run_full_field` returns `kCancelled` (**-99**), which is deliberately the same

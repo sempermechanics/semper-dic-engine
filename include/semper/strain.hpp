@@ -32,6 +32,13 @@ namespace Semper {
          * than duplicated so the guard and the calculator cannot drift apart.
          */
         static int vsg_window_node_count(int step, int window_pixels);
+
+        // Normalized median test (Westerweel & Scarano 2005) on u and v over
+        // each point's 5x5 neighbours, repeated until no new point fails.
+        // Rejected points drop out of later passes, so a cluster of wrong
+        // matches is peeled from its edge inward. Clears valid[] at each
+        // rejected point and returns how many were rejected.
+        static int reject_displacement_outliers(DisplacementField& disp);
     };
 
 }

@@ -231,8 +231,12 @@ translation ≤ 0.02 px, displacement gradients ≤ 2×10⁻³.
 What "the same result" means across builds, and when a difference is a bug.
 
 **Same APK, same device, same inputs → bit-identical results.**
-Guarded by `Engine.RepeatSolve_BitIdentical`. Any run-to-run variation on
-identical inputs is a defect (threading race, uninitialized memory).
+Guarded by `Engine.RepeatSolve_BitIdentical` (one ICGN solve) and
+`FullFieldDeterminism.*` (the whole parallel `run_full_field`). Any run-to-run
+variation on identical inputs is a defect (threading race, uninitialized
+memory). The field does not depend on the core count either: the Path B flood
+fill claims cells in fixed-size rounds (`tuning::kPathBBatchNodes`), not
+per-thread.
 
 **Different builds / ABIs / dependency versions → small drift is expected.**
 The engine compiles with `-ffast-math` and uses FMA-based SIMD reductions, so
@@ -367,6 +371,11 @@ precision, not "close enough".
 | `VsgRecoversGeneralLinearField` | All three strain components for a general 4-coefficient field, at multiple interior points |
 | `VsgRigidBodyTranslationGivesZeroStrain` | Constant displacement → zero strain (the classic false-strain bug) |
 | `VsgLeavesSentinelWhereWindowUnsupported` | Corner points (<90% window fill) and invalidated points keep the `−1000` sentinel |
+| `OutlierTestLeavesSmoothNoisyFieldAlone` | A general linear field with ±0.1 px noise loses no point to the median test |
+| `OutlierTestRejectsASingleSpike` | One point 3 px off is the only one rejected |
+| `OutlierTestRejectsAWholeCluster` | A 4x4 block 20 px off is rejected whole (its inner points only on a later pass), and strain beside it is the field's again |
+| `OutlierTestKeepsAStraightJump` | A 5 px step along a column (a crack) is not an outlier on either side |
+| `OutlierTestSkipsSparseAndInvalidPoints` | Under 3 neighbours, no test; an already invalid point is neither counted nor used |
 
 ## Suite: `CancelToken` — `unit/test_cancel_token.cpp`
 
@@ -583,6 +592,18 @@ SEMPER_RUN_SEEDBENCH=1 SEMPER_SEEDBENCH_REPEATS=5 \
   SEMPER_SEEDBENCH_CSV=sweep.csv ./build/full/bin/dic_tests SeedBench.CandidateSweep
 ```
 
+## Suite: `FullFieldDeterminism` — `integration/test_full_field_determinism.cpp`
+
+Solves the same inputs four times in one process, each time from a fresh
+reference cache as the app does, and compares the packed output byte for byte.
+App default grid (subset 21, step 5, strain window 15). OpenCV-gated.
+Synthetic speckle, because TIFF decoding crashes in the MinGW host build.
+
+| Test | Proves | Failure would mean |
+|---|---|---|
+| `TwoFrameBatch_BitIdentical` | Two load steps against one cache: every output byte and the Path A / Path B point counts repeat | A parallel phase (pre-pass, Path A, Path B flood) depends on thread timing |
+| `MaskedHole_BitIdentical` | Same under a ROI mask with a hole, where Path B solves most of the field | As above; this case exposed the Path B claim race (app TD-65) |
+
 ### C ABI contract — `tests/c/contract.c` (built with `SEMPER_BUILD_C_SDK`)
 
 Where `c/smoke.c` proves the happy path runs, `c/contract.c` pins the **Frozen
@@ -639,8 +660,8 @@ tests/
                             test_optimization_engine, test_robustness,
                             test_full_field_contracts,
                             test_full_field_golden, test_seeding_bench,
-                            test_reference_cache
-                            (the last four OpenCV-gated)
+                            test_full_field_determinism, test_reference_cache
+                            (the last five OpenCV-gated)
   dice/                   DICe golden comparisons
   perf/                   throughput gates
 ```
@@ -648,8 +669,8 @@ tests/
 `tests/CMakeLists.txt` lists sources under `DIC_UNIT_TESTS` /
 `DIC_INTEGRATION_TESTS` / `DIC_DICE_TESTS` / `DIC_PERF_TESTS`, plus
 `DIC_PIPELINE_TESTS` for the OpenCV-gated suites (`test_full_field_contracts`,
-`test_full_field_golden`, `test_seeding_bench`, `test_image_codec`,
-`test_reference_cache`) — attached only when OpenCV is present.
+`test_full_field_golden`, `test_seeding_bench`, `test_full_field_determinism`,
+`test_image_codec`, `test_reference_cache`) — attached only when OpenCV is present.
 
 ## Adding a new test
 

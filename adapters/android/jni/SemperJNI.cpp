@@ -31,7 +31,7 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
 extern "C" {
 
 JNIEXPORT void JNICALL
-Java_com_indicvision_semper_SemperNativeLib_setDebugOutputDir(
+Java_com_sempermechanics_semper_SemperNativeLib_setDebugOutputDir(
         JNIEnv* env, jobject, jstring debugDir) {
     std::lock_guard<std::mutex> lock(g_cache.mutex);
     if (debugDir == nullptr) {
@@ -51,7 +51,7 @@ Java_com_indicvision_semper_SemperNativeLib_setDebugOutputDir(
  * is the entire point of the call.
  */
 JNIEXPORT void JNICALL
-Java_com_indicvision_semper_SemperNativeLib_setCancelRequested(
+Java_com_sempermechanics_semper_SemperNativeLib_setCancelRequested(
         JNIEnv*, jobject, jboolean cancel) {
     if (cancel == JNI_TRUE) {
         Semper::pipeline::request_cancel();
@@ -61,7 +61,7 @@ Java_com_indicvision_semper_SemperNativeLib_setCancelRequested(
 }
 
 JNIEXPORT jobject JNICALL
-Java_com_indicvision_semper_SemperNativeLib_getPreviewFromBytes(
+Java_com_sempermechanics_semper_SemperNativeLib_getPreviewFromBytes(
         JNIEnv* env, jobject, jbyteArray fileData, jint targetWidth) {
     if (fileData == nullptr) return nullptr;
     jsize len = env->GetArrayLength(fileData);
@@ -96,7 +96,7 @@ Java_com_indicvision_semper_SemperNativeLib_getPreviewFromBytes(
 }
 
 JNIEXPORT jintArray JNICALL
-Java_com_indicvision_semper_SemperNativeLib_getImageDimensions(
+Java_com_sempermechanics_semper_SemperNativeLib_getImageDimensions(
         JNIEnv* env, jobject, jbyteArray fileData) {
     int w = 0, h = 0;
     if (fileData != nullptr) {
@@ -114,7 +114,7 @@ Java_com_indicvision_semper_SemperNativeLib_getImageDimensions(
 }
 
 JNIEXPORT void JNICALL
-Java_com_indicvision_semper_SemperNativeLib_initializeReference(
+Java_com_sempermechanics_semper_SemperNativeLib_initializeReference(
         JNIEnv* env, jobject, jbyteArray refBytes, jbyteArray maskBytes,
         jint width, jint height) {
     std::lock_guard<std::mutex> lock(g_cache.mutex);
@@ -143,7 +143,7 @@ Java_com_indicvision_semper_SemperNativeLib_initializeReference(
 }
 
 JNIEXPORT jint JNICALL
-Java_com_indicvision_semper_SemperNativeLib_computeFullFieldDirect(
+Java_com_sempermechanics_semper_SemperNativeLib_computeFullFieldDirect(
         JNIEnv* env, jobject, jbyteArray refBytes, jbyteArray defBytes,
         jbyteArray maskBytes, jint rectX, jint rectY, jint rectWidth,
         jint rectHeight, jint step, jint subsetSize, jint strainWindow,
@@ -245,6 +245,57 @@ Java_com_indicvision_semper_SemperNativeLib_computeFullFieldDirect(
         env->SetFloatArrayRegion(out_metrics, 0, ncopy, metrics_buf);
     }
     return result;
+}
+
+// Legacy package (com.indicvision.semper). The app is moving to
+// com.sempermechanics.semper; these forwarders let a build under either package
+// link against this engine during the move. Remove them once no app or fork
+// ships SemperNativeLib under the old package.
+
+JNIEXPORT void JNICALL
+Java_com_indicvision_semper_SemperNativeLib_setDebugOutputDir(
+        JNIEnv* env, jobject self, jstring debugDir) {
+    Java_com_sempermechanics_semper_SemperNativeLib_setDebugOutputDir(env, self, debugDir);
+}
+
+JNIEXPORT void JNICALL
+Java_com_indicvision_semper_SemperNativeLib_setCancelRequested(
+        JNIEnv* env, jobject self, jboolean cancel) {
+    Java_com_sempermechanics_semper_SemperNativeLib_setCancelRequested(env, self, cancel);
+}
+
+JNIEXPORT jobject JNICALL
+Java_com_indicvision_semper_SemperNativeLib_getPreviewFromBytes(
+        JNIEnv* env, jobject self, jbyteArray fileData, jint targetWidth) {
+    return Java_com_sempermechanics_semper_SemperNativeLib_getPreviewFromBytes(
+            env, self, fileData, targetWidth);
+}
+
+JNIEXPORT jintArray JNICALL
+Java_com_indicvision_semper_SemperNativeLib_getImageDimensions(
+        JNIEnv* env, jobject self, jbyteArray fileData) {
+    return Java_com_sempermechanics_semper_SemperNativeLib_getImageDimensions(env, self, fileData);
+}
+
+JNIEXPORT void JNICALL
+Java_com_indicvision_semper_SemperNativeLib_initializeReference(
+        JNIEnv* env, jobject self, jbyteArray refBytes, jbyteArray maskBytes,
+        jint width, jint height) {
+    Java_com_sempermechanics_semper_SemperNativeLib_initializeReference(
+            env, self, refBytes, maskBytes, width, height);
+}
+
+JNIEXPORT jint JNICALL
+Java_com_indicvision_semper_SemperNativeLib_computeFullFieldDirect(
+        JNIEnv* env, jobject self, jbyteArray refBytes, jbyteArray defBytes,
+        jbyteArray maskBytes, jint rectX, jint rectY, jint rectWidth,
+        jint rectHeight, jint step, jint subsetSize, jint strainWindow,
+        jboolean use6x6Interpolator, jobject outputBuffer, jobject callbackObj,
+        jfloatArray out_metrics) {
+    return Java_com_sempermechanics_semper_SemperNativeLib_computeFullFieldDirect(
+            env, self, refBytes, defBytes, maskBytes, rectX, rectY, rectWidth, rectHeight,
+            step, subsetSize, strainWindow, use6x6Interpolator, outputBuffer, callbackObj,
+            out_metrics);
 }
 
 }  // extern "C"

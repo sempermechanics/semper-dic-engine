@@ -111,6 +111,7 @@ set(DIC_PIPELINE_TESTS
         integration/test_full_field_contracts.cpp
         integration/test_full_field_golden.cpp
         integration/test_seeding_bench.cpp
+        integration/test_full_field_determinism.cpp
         unit/test_image_codec.cpp
         integration/test_reference_cache.cpp
 )
