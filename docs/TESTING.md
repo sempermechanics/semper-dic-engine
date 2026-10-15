@@ -624,6 +624,7 @@ error, an error map and a bias fit. OpenCV-gated.
 | `FirstFrame_BitIdenticalToRunFullField` | With N = 1 the first frame equals `run_full_field` | Turning incremental on changes frames that never used a moved reference |
 | `UpdateSchedule_FollowsInterval` | `reference_frame` / `reference_updated` follow 0,0,0,3,3,3,… for N = 3 | The reference moves on the wrong frame |
 | `StretchRotation_TracksWhereFixedReferenceDegrades` | 448², 20 frames to 40% stretch and 30° rotation: N = 1 keeps ≥ 98% of frame-0 nodes, rms U ≤ 0.10 px, rms strain ≤ 5e-3, and more nodes within 0.2 px than the fixed reference. Measured: 196/196 nodes, rms 0.047 px | Composition or the mask warp broke, or incremental no longer helps where it should |
+| `Rotation90_200Frames_TracksTheTurningRoi` | 256², steady rotation at 0.45° per frame, no stretch. N = 5 (6×6) and N = 10 (4×4) to 90°, N = 1 (6×6) to 45°. Every frame solves, ≥ 98% of frame-0 nodes are still tracked, and ≥ 95% / 95% / 90% of frame 1's points are within 0.5 px. Rms U ≤ 0.08 / 0.20 / 0.40 px; the rms carries one weakly textured corner of this speckle that drifts over 100+ updates. Measured: 482/484 tracked, 391/397 within 0.5 px, rms 0.047 (N = 5); 483/484, 392/397, 0.134 (N = 10); 483/484, 390/397, 0.292 (N = 1, 45°) | Edge nodes of a turning ROI fall out of the ref-k scan (material padded by `half` instead of `half·√2`), or the mask warp blanks bands of rows (the old per-pixel Newton inverse followed false branches). Before the fixes, every mode lost the chain between 50° and 85° |
 | `MaskedSequence_TracksMaterialInsideMask` | Ring mask with a hole, 10 frames to 15% stretch and 8°: every reported point is a frame-0 node inside the mask, ≥ 85% of frame-1's points remain, rms U ≤ 0.15 px | The mask is not carried with the material, so subsets cross the hole edge after an update |
 | `LostNodesNeverReturn` | A 70 px drift carries part of the ROI past the image-edge margin: `tracked_points` never increases and ends below the frame-0 count | A lost node comes back with a stale base |
 | `RepeatRun_BitIdentical` | The same sequence twice gives the same bytes | Run-to-run nondeterminism in composition or the mask warp |
@@ -637,6 +638,28 @@ one sign, so it adds up roughly linearly with the number of updates. That is
 the known cost of incremental DIC, not a defect; see MATHEMATICS.md §9.5 and
 INCREMENTAL_BENCHMARK.md.
 
+## Suite: `IncBench` — `integration/test_incremental_bench.cpp`
+
+A **measurement harness**, not a gate: `FixedVsIncremental` early-returns unless
+`SEMPER_RUN_INCBENCH=1`, prints per-scenario tables, optionally writes a
+per-frame CSV, and asserts nothing about which mode wins. It produces
+[INCREMENTAL_BENCHMARK.md](INCREMENTAL_BENCHMARK.md). Scenarios S1–S9 are
+synthetic sequences of 200–300 frames (static, slow stretch, translation,
+rotation, large stretch, combined, non-affine, increment size, ring mask); S10
+is DICe's OHT ladder. Fixed, N = 1, 2, 5 and 10 run in lockstep on the same
+frames.
+
+```bash
+SEMPER_RUN_INCBENCH=1 SEMPER_INCBENCH_CSV=incbench.csv ./build/full/bin/dic_tests IncBench
+SEMPER_RUN_INCBENCH=1 SEMPER_INCBENCH_QUICK=1 ./build/full/bin/dic_tests IncBench   # T = 160, σ = 2, one seed
+SEMPER_RUN_INCBENCH=1 SEMPER_INCBENCH_ONLY=S4 ./build/full/bin/dic_tests IncBench
+python tools/plot_incremental_bench.py incbench.csv docs/images/incremental
+```
+
+The full run takes about 32 minutes on a 20-thread desktop (peak RSS 48 MB). `tools/cache_bench.c`
+times the fixed-reference cache (first frame vs the rest) against any
+`libsemper_c.so` build: `gcc -O2 -o cache_bench tools/cache_bench.c -ldl -lm`.
+
 ## Suite: `IncrementalMath` — `unit/test_incremental_math.cpp`
 
 | Test | Proves |
@@ -646,7 +669,8 @@ INCREMENTAL_BENCHMARK.md.
 | `Sample_TooFarFromAnyNode_IsInvalid` | Beyond 1.5 cells from any valid node the sample fails |
 | `Sample_CorrIsWorstContributor` | The reported ZNSSD is the max of the contributing nodes |
 | `NodeField_DropsUnsolvedAndOutliers` | Unsolved nodes, negative ZNSSD and median-test outliers are not sampled |
-| `MaskWarp_ZeroDisplacement_IsIdentity` / `_Translation_ShiftsMask` / `_Stretch_ScalesArea` | The inverse mask warp is exact for identity and translation, and the area of a stretched mask is within 1% |
+| `MaskWarp_ZeroDisplacement_IsIdentity` / `_Translation_ShiftsMask` / `_Stretch_ScalesArea` | The forward mask warp is exact for identity and translation, and the area of a stretched mask is within 1% |
+| `MaskWarp_LargeRotation_IsTheRotatedMask` | An 84° turn, with the material reaching 16 px past the outer nodes: area within 2%, no pixel set more than 1 px outside the analytically rotated square, none missing more than 1 px inside it |
 | `MaskWarp_NoValidNode_IsEmpty` | No tracked node, no material |
 
 ## Suite: `DiceIncremental` — `dice/test_incremental_oht.cpp`

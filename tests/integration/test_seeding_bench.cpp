@@ -30,6 +30,7 @@
 
 #if DIC_HAVE_OPENCV
 
+#include "framework/bench_util.h"
 #include "framework/synthetic.h"
 #include "framework/synthetic_cv.h"
 #include "framework/image_io.h"
@@ -39,25 +40,6 @@
 #include <semper/seeding.hpp>
 
 #include <opencv2/imgproc.hpp>
-
-// Cost accounting below needs process CPU time and resident set size, which
-// have no portable spelling. CI and every published measurement in
-// docs/SEEDING_BENCHMARK.md are Linux; Windows is a developer host, so it gets
-// working equivalents rather than a stub -- an unbuildable test file takes the
-// whole dic_tests binary down with it, benchmark or not.
-#ifdef _WIN32
-#  ifndef WIN32_LEAN_AND_MEAN
-#    define WIN32_LEAN_AND_MEAN
-#  endif
-#  ifndef NOMINMAX          // else the min/max macros shadow std::min/std::max
-#    define NOMINMAX
-#  endif
-#  include <windows.h>
-#  include <psapi.h>
-#else
-#  include <sys/resource.h>
-#  include <unistd.h>
-#endif
 
 #include <algorithm>
 #include <chrono>
@@ -79,79 +61,9 @@ using Semper::SubsetPrecomputer;
 
 namespace {
 
-// ---------------------------------------------------------------------------
-// Cost accounting. Wall time alone can hide a CPU regression: the anchor
-// lattice is OpenMP-parallel while AKAZE's detectAndCompute is largely serial,
-// so a wall-clock win may cost more total CPU — which on a phone is battery.
-// ---------------------------------------------------------------------------
-struct CpuClock {
-    double user_ms = 0.0, sys_ms = 0.0;
-    static CpuClock now() {
-        CpuClock c;
-#ifdef _WIN32
-        // GetProcessTimes reports both in 100 ns units and, like getrusage,
-        // sums across all threads of the process -- which is the property the
-        // OpenMP-vs-serial comparison depends on.
-        FILETIME created{}, exited{}, kernel{}, user{};
-        if (GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) {
-            const auto to_ms = [](const FILETIME &ft) {
-                return (double)(((unsigned long long)ft.dwHighDateTime << 32) |
-                                ft.dwLowDateTime) / 1e4;
-            };
-            c.user_ms = to_ms(user);
-            c.sys_ms  = to_ms(kernel);
-        }
-#else
-        rusage ru{};
-        getrusage(RUSAGE_SELF, &ru);
-        c.user_ms = ru.ru_utime.tv_sec * 1e3 + ru.ru_utime.tv_usec / 1e3;
-        c.sys_ms  = ru.ru_stime.tv_sec * 1e3 + ru.ru_stime.tv_usec / 1e3;
-#endif
-        return c;
-    }
-    double total_ms() const { return user_ms + sys_ms; }
-};
-
-// ru_maxrss is a process-wide high-water mark: monotonic, so differencing it
-// across candidates in one process reports the run order, not the candidate.
-// Current RSS from /proc/self/statm can be differenced — it gives the memory a
-// candidate *retains* (descriptor matrices, scale-space pyramids), which is the
-// comparable quantity. For a true per-candidate peak, run one method per
-// process via SEMPER_SEEDBENCH_ONLY and read the peak printed at the end.
-double current_rss_mb() {
-#ifdef _WIN32
-    // WorkingSetSize is the Windows analogue of the statm resident count:
-    // pages currently backed by physical memory, and it can be differenced.
-    PROCESS_MEMORY_COUNTERS pmc{};
-    pmc.cb = sizeof(pmc);
-    if (!GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) return -1.0;
-    return (double)pmc.WorkingSetSize / (1024.0 * 1024.0);
-#else
-    std::ifstream f("/proc/self/statm");
-    if (!f) return -1.0;
-    long total_pages = 0, rss_pages = 0;
-    f >> total_pages >> rss_pages;
-    if (!f) return -1.0;
-    return (double)rss_pages * (double)sysconf(_SC_PAGESIZE) / (1024.0 * 1024.0);
-#endif
-}
-
-double process_peak_rss_mb() {
-#ifdef _WIN32
-    PROCESS_MEMORY_COUNTERS pmc{};
-    pmc.cb = sizeof(pmc);
-    if (!GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) return -1.0;
-    return (double)pmc.PeakWorkingSetSize / (1024.0 * 1024.0);
-#else
-    rusage ru{};
-    getrusage(RUSAGE_SELF, &ru);
-#  ifdef __APPLE__
-    return (double)ru.ru_maxrss / (1024.0 * 1024.0);
-#  else
-    return (double)ru.ru_maxrss / 1024.0;
-#  endif
-#endif
-}
+using dictest::CpuClock;
+using dictest::current_rss_mb;
+using dictest::process_peak_rss_mb;
 
 // ---------------------------------------------------------------------------
 // Ground truth as a callable, so a scenario need not be a single affine. The
