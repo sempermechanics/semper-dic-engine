@@ -82,6 +82,8 @@ add_library(semper_pipeline STATIC
         src/pipeline/full_field_path_c.cpp
         src/pipeline/full_field_solver_stats.cpp
         src/pipeline/full_field_debug_export.cpp
+        src/pipeline/incremental_math.cpp
+        src/pipeline/incremental_session.cpp
 )
 target_include_directories(semper_pipeline
         PUBLIC

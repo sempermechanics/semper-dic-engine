@@ -101,6 +101,8 @@ set(DIC_PIPELINE_SOURCES
         ${NATIVE_ROOT}/src/pipeline/full_field_debug_export.cpp
         ${NATIVE_ROOT}/src/pipeline/reference_cache.cpp
         ${NATIVE_ROOT}/src/pipeline/phase_correlate.cpp
+        ${NATIVE_ROOT}/src/pipeline/incremental_math.cpp
+        ${NATIVE_ROOT}/src/pipeline/incremental_session.cpp
 )
 
 # OpenCV-gated tests. test_image_codec / test_reference_cache exercise the image
@@ -114,6 +116,8 @@ set(DIC_PIPELINE_TESTS
         integration/test_full_field_determinism.cpp
         unit/test_image_codec.cpp
         integration/test_reference_cache.cpp
+        integration/test_incremental.cpp
+        unit/test_incremental_math.cpp
 )
 
 add_executable(dic_tests

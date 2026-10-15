@@ -21,6 +21,8 @@
 // fully deterministic across platforms.
 // =====================================================================
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <random>
 #include <vector>
@@ -51,6 +53,41 @@ namespace dictest {
                 inv2s2_.push_back(1.0f / (2.0f * s * s));
                 amp_.push_back(uamp(rng));
             }
+            build_buckets(width, height);
+        }
+
+        // Same value as sample(), bit for bit, without visiting every blob.
+        // sample() only adds blobs with r² < 40 (r < 6.33 px), in index order;
+        // those all sit in the 3x3 block of 8 px cells around the point, and
+        // they are summed here in the same index order. For rendering long
+        // frame sequences, where sample() would dominate the test time.
+        float sample_fast(float x, float y) const {
+            const int qx = (int)std::floor(x / kBucket);
+            const int qy = (int)std::floor(y / kBucket);
+            int idx[kMaxGather];
+            int n = 0;
+            for (int by = std::max(qy - 1, 0); by <= std::min(qy + 1, bh_ - 1); ++by) {
+                for (int bx = std::max(qx - 1, 0); bx <= std::min(qx + 1, bw_ - 1); ++bx) {
+                    const int c = by * bw_ + bx;
+                    for (int k = bstart_[c]; k < bstart_[c + 1]; ++k) {
+                        if (n == kMaxGather) return sample(x, y);   // pathological density
+                        idx[n++] = bidx_[k];
+                    }
+                }
+            }
+            std::sort(idx, idx + n);
+            float v = 128.0f;
+            for (int k = 0; k < n; ++k) {
+                const int i = idx[k];
+                float dx = x - cx_[i];
+                float dy = y - cy_[i];
+                float r2 = dx * dx + dy * dy;
+                if (r2 < 40.0f)
+                    v += amp_[i] * std::exp(-r2 * inv2s2_[i]);
+            }
+            if (v < 5.0f) v = 5.0f;
+            if (v > 250.0f) v = 250.0f;
+            return v;
         }
 
         // Sample the continuous pattern at an arbitrary (sub-pixel) location.
@@ -70,7 +107,30 @@ namespace dictest {
         }
 
     private:
+        static constexpr float kBucket = 8.0f;   // >= sqrt(40), see sample_fast
+        static constexpr int kMaxGather = 256;
+
+        void build_buckets(int width, int height) {
+            bw_ = std::max(1, (int)std::ceil(width / kBucket));
+            bh_ = std::max(1, (int)std::ceil(height / kBucket));
+            std::vector<int> cell(cx_.size());
+            std::vector<int> count((size_t)bw_ * bh_, 0);
+            for (size_t i = 0; i < cx_.size(); ++i) {
+                const int bx = std::min(bw_ - 1, std::max(0, (int)std::floor(cx_[i] / kBucket)));
+                const int by = std::min(bh_ - 1, std::max(0, (int)std::floor(cy_[i] / kBucket)));
+                cell[i] = by * bw_ + bx;
+                count[cell[i]]++;
+            }
+            bstart_.assign(count.size() + 1, 0);
+            for (size_t c = 0; c < count.size(); ++c) bstart_[c + 1] = bstart_[c] + count[c];
+            std::vector<int> fill(bstart_.begin(), bstart_.end() - 1);
+            bidx_.assign(cx_.size(), 0);
+            for (size_t i = 0; i < cx_.size(); ++i) bidx_[fill[cell[i]]++] = (int)i;
+        }
+
         std::vector<float> cx_, cy_, inv2s2_, amp_;
+        int bw_ = 1, bh_ = 1;
+        std::vector<int> bstart_, bidx_;
     };
 
     // 6-DOF affine deformation about a center point (matches the engine's

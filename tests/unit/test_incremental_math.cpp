@@ -1,0 +1,197 @@
+// Incremental DIC building blocks on exact fields: increment sampling, the
+// node field built from a solve capture, and the material-mask warp.
+#include "framework/test_framework.h"
+
+#if defined(DIC_HAVE_OPENCV)
+
+#include "pipeline/incremental_internal.hpp"
+
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
+
+#include <cmath>
+#include <vector>
+
+using namespace Semper::pipeline::internal;
+
+namespace {
+
+// A lattice carrying u = a0 + a1 x + a2 y, v = b0 + b1 x + b2 y exactly, with
+// the matching gradients.
+NodeField linear_field(int gw, int gh, int rx, int ry, int step,
+                       const double a[3], const double b[3]) {
+    NodeField f;
+    f.gridW = gw; f.gridH = gh; f.rect_x = rx; f.rect_y = ry; f.step = step;
+    const size_t n = f.size();
+    f.u.resize(n); f.v.resize(n); f.ux.resize(n); f.uy.resize(n);
+    f.vx.resize(n); f.vy.resize(n); f.corr.assign(n, 0.01f); f.valid.assign(n, 1);
+    for (int j = 0; j < gh; ++j)
+        for (int i = 0; i < gw; ++i) {
+            const size_t k = (size_t)j * gw + i;
+            const double x = f.node_x(i), y = f.node_y(j);
+            f.u[k] = (float)(a[0] + a[1] * x + a[2] * y);
+            f.v[k] = (float)(b[0] + b[1] * x + b[2] * y);
+            f.ux[k] = (float)a[1]; f.uy[k] = (float)a[2];
+            f.vx[k] = (float)b[1]; f.vy[k] = (float)b[2];
+        }
+    return f;
+}
+
+const double kA[3] = {1.5, 0.02, -0.01};
+const double kB[3] = {-0.75, 0.015, 0.03};
+
+double lin(const double c[3], double x, double y) { return c[0] + c[1] * x + c[2] * y; }
+
+} // namespace
+
+TEST_CASE(IncrementalMath, Sample_OnNode_ReturnsNodeExactly) {
+    NodeField f = linear_field(6, 5, 20, 30, 10, kA, kB);
+    f.valid[(size_t)1 * 6 + 3] = 0;   // a missing neighbour must not matter on a node
+    const IncrementSample s = sample_increment(f, f.node_x(2), f.node_y(1));
+    REQUIRE(s.ok);
+    CHECK(!s.taylor);
+    CHECK(s.u == f.u[(size_t)1 * 6 + 2]);
+    CHECK(s.v == f.v[(size_t)1 * 6 + 2]);
+}
+
+TEST_CASE(IncrementalMath, Sample_Bilinear_ReproducesLinearField) {
+    const NodeField f = linear_field(6, 5, 20, 30, 10, kA, kB);
+    for (double x : {21.3, 37.9, 64.5}) {
+        for (double y : {30.2, 55.5, 69.9}) {
+            const IncrementSample s = sample_increment(f, (float)x, (float)y);
+            REQUIRE(s.ok);
+            CHECK(!s.taylor);
+            CHECK_NEAR(s.u, lin(kA, x, y), 1e-4);
+            CHECK_NEAR(s.v, lin(kB, x, y), 1e-4);
+        }
+    }
+}
+
+TEST_CASE(IncrementalMath, Sample_TaylorFallback_ReproducesLinearField) {
+    NodeField f = linear_field(6, 5, 20, 30, 10, kA, kB);
+    // Knock out one corner of the cell around (44, 47): bilinear is impossible,
+    // the nearest valid node's expansion still reproduces a linear field.
+    f.valid[(size_t)2 * 6 + 3] = 0;   // node (50, 50)
+    const IncrementSample s = sample_increment(f, 44.0f, 47.0f);
+    REQUIRE(s.ok);
+    CHECK(s.taylor);
+    CHECK_NEAR(s.u, lin(kA, 44, 47), 1e-4);
+    CHECK_NEAR(s.v, lin(kB, 44, 47), 1e-4);
+}
+
+TEST_CASE(IncrementalMath, Sample_TooFarFromAnyNode_IsInvalid) {
+    const NodeField f = linear_field(4, 4, 100, 100, 10, kA, kB);
+    // Within 1.5 cells of the corner node (100, 100): taylor.
+    CHECK(sample_increment(f, 90.0f, 95.0f).ok);
+    // 2 cells out: nothing within reach.
+    CHECK(!sample_increment(f, 80.0f, 100.0f).ok);
+    CHECK(!sample_increment(f, 100.0f, 160.0f).ok);
+}
+
+TEST_CASE(IncrementalMath, Sample_CorrIsWorstContributor) {
+    NodeField f = linear_field(4, 4, 0, 0, 10, kA, kB);
+    f.corr[(size_t)1 * 4 + 2] = 0.09f;
+    const IncrementSample s = sample_increment(f, 15.0f, 15.0f);
+    REQUIRE(s.ok);
+    CHECK(s.corr == 0.09f);
+}
+
+TEST_CASE(IncrementalMath, NodeField_DropsUnsolvedAndOutliers) {
+    FieldCapture cap;
+    cap.gridW = 7; cap.gridH = 7; cap.rect_x = 0; cap.rect_y = 0; cap.step = 10;
+    cap.grid.assign(7, std::vector<GridPoint>(7));
+    for (int y = 0; y < 7; ++y)
+        for (int x = 0; x < 7; ++x) {
+            GridPoint &g = cap.grid[y][x];
+            g.x = x * 10.0f; g.y = y * 10.0f;
+            g.u = 1.0f + 0.01f * x; g.v = -0.5f + 0.01f * y;
+            g.corr = 0.02f; g.solved = true;
+        }
+    cap.grid[1][1].solved = false;          // never solved
+    cap.grid[2][5].corr = -1.0f;            // solved flag but no result
+    cap.grid[4][3].u += 6.0f;               // a wrong match
+    int rejected = -1;
+    const NodeField f = node_field_from_capture(cap, &rejected);
+    CHECK(!f.valid[1 * 7 + 1]);
+    CHECK(!f.valid[2 * 7 + 5]);
+    CHECK(!f.valid[4 * 7 + 3]);
+    CHECK(rejected == 1);
+    CHECK(f.valid[3 * 7 + 3]);
+}
+
+namespace {
+
+cv::Mat rect_mask(int w, int h, cv::Rect r) {
+    cv::Mat m = cv::Mat::zeros(h, w, CV_8U);
+    m(r).setTo(255);
+    return m;
+}
+
+GridGeom geom_over(cv::Rect r, int step) {
+    return GridGeom{r.width / step, r.height / step, r.x, r.y, step};
+}
+
+} // namespace
+
+TEST_CASE(IncrementalMath, MaskWarp_ZeroDisplacement_IsIdentity) {
+    const cv::Rect r(60, 50, 100, 80);
+    const cv::Mat m0 = rect_mask(240, 200, r);
+    const GridGeom g = geom_over(r, 10);
+    const size_t n = (size_t)g.gridW * g.gridH;
+    const cv::Mat w = warp_material_mask(m0, g, std::vector<float>(n, 0.0f),
+                                         std::vector<float>(n, 0.0f),
+                                         std::vector<unsigned char>(n, 1), 40);
+    CHECK(cv::norm(w, m0, cv::NORM_L1) == 0.0);
+}
+
+TEST_CASE(IncrementalMath, MaskWarp_Translation_ShiftsMask) {
+    const cv::Rect r(60, 50, 100, 80);
+    const cv::Mat m0 = rect_mask(240, 200, r);
+    const GridGeom g = geom_over(r, 10);
+    const size_t n = (size_t)g.gridW * g.gridH;
+    std::vector<unsigned char> valid(n, 1);
+    valid[5] = 0;   // a hole in the field is filled, not left empty
+    const cv::Mat w = warp_material_mask(m0, g, std::vector<float>(n, 7.0f),
+                                         std::vector<float>(n, -4.0f), valid, 40);
+    const cv::Mat expected = rect_mask(240, 200, cv::Rect(r.x + 7, r.y - 4, r.width, r.height));
+    CHECK(cv::norm(w, expected, cv::NORM_L1) == 0.0);
+}
+
+TEST_CASE(IncrementalMath, MaskWarp_Stretch_ScalesArea) {
+    // u = 0.2 (x - cx): a 20% stretch about the mask centre.
+    const cv::Rect r(80, 60, 120, 100);
+    const cv::Mat m0 = rect_mask(320, 240, r);
+    const GridGeom g = geom_over(r, 10);
+    const size_t n = (size_t)g.gridW * g.gridH;
+    std::vector<float> U(n), V(n, 0.0f);
+    const double cx = r.x + r.width / 2.0;
+    for (int j = 0; j < g.gridH; ++j)
+        for (int i = 0; i < g.gridW; ++i)
+            U[(size_t)j * g.gridW + i] = (float)(0.2 * (g.rect_x + i * g.step - cx));
+    const cv::Mat w = warp_material_mask(m0, g, U, V, std::vector<unsigned char>(n, 1), 60);
+    const double ratio = cv::countNonZero(w) / (double)cv::countNonZero(m0);
+    CHECK_NEAR(ratio, 1.2, 0.012);
+    // The mask edges went where the stretch sends them (to within a pixel).
+    const cv::Rect bb = cv::boundingRect(w);
+    CHECK(std::abs(bb.x - (cx - 1.2 * (cx - r.x))) <= 1.0);
+    CHECK(std::abs(bb.x + bb.width - (cx + 1.2 * (r.x + r.width - cx))) <= 1.5);
+}
+
+TEST_CASE(IncrementalMath, MaskWarp_NoValidNode_IsEmpty) {
+    const cv::Rect r(60, 50, 100, 80);
+    const cv::Mat m0 = rect_mask(240, 200, r);
+    const GridGeom g = geom_over(r, 10);
+    const size_t n = (size_t)g.gridW * g.gridH;
+    const cv::Mat w = warp_material_mask(m0, g, std::vector<float>(n, 0.0f),
+                                         std::vector<float>(n, 0.0f),
+                                         std::vector<unsigned char>(n, 0), 40);
+    CHECK(cv::countNonZero(w) == 0);
+}
+
+#else
+
+TEST_CASE(IncrementalMath, OpenCvRequired_SkippedWithoutOpenCV) {
+    CHECK(true);
+}
+
+#endif // DIC_HAVE_OPENCV

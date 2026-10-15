@@ -102,6 +102,28 @@ inline constexpr int kOutlierMinNeighbours = 3;
 /** Displacement median test: pass limit (it stops early once stable). */
 inline constexpr int kOutlierMaxPasses = 5;
 
+/**
+ * Incremental DIC: furthest a material point may sit from the nearest solved
+ * node (in grid cells) and still take that node's first-order expansion when
+ * bilinear interpolation lacks a corner. 1.5 covers a diagonal neighbour
+ * (sqrt(2) cells); beyond it the point is dropped.
+ */
+inline constexpr float kIncTaylorMaxCells = 1.5f;
+
+/** Incremental DIC mask warp: Newton iterations to invert X + U(X) = p. */
+inline constexpr int kIncMaskNewtonIters = 8;
+
+/** Incremental DIC mask warp: Newton stops once the residual is below this (px). */
+inline constexpr float kIncMaskNewtonTolPx = 0.01f;
+
+/**
+ * Incremental DIC mask warp: how far past the outermost frame-0 nodes (in
+ * grid cells) the displacement field is extended linearly before it is held
+ * constant. The mask reaches up to a cell plus half a subset past the last
+ * node, so this has to cover more than one cell.
+ */
+inline constexpr int kIncMaskExtrapCells = 3;
+
 } // namespace tuning
 } // namespace Semper
 
