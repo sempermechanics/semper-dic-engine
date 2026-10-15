@@ -1,6 +1,7 @@
 // C ABI implementation — a thin translation over the C++ core. No algorithm here.
 #include <semper/semper_c.h>
 
+#include <semper/incremental.hpp>
 #include <semper/io.hpp>
 #include <semper/pipeline.hpp>
 #include <semper/version.hpp>
@@ -10,6 +11,9 @@
 
 using Semper::pipeline::CancelToken;
 using Semper::pipeline::FullFieldParams;
+using Semper::pipeline::IncrementalFrameInfo;
+using Semper::pipeline::IncrementalParams;
+using Semper::pipeline::IncrementalSession;
 using Semper::pipeline::ReferenceCache;
 
 // One engine instance owns a reference cache and its own cancel token, so several
@@ -18,6 +22,37 @@ struct semper_engine {
     ReferenceCache cache;
     CancelToken cancel;
 };
+
+struct semper_incremental {
+    IncrementalSession session;
+    CancelToken cancel;
+    int width = 0, height = 0;   // frames are decoded against the first image's size
+};
+
+namespace {
+
+FullFieldParams to_params(const semper_params* params) {
+    FullFieldParams p;
+    p.rect_x = params->rect_x;
+    p.rect_y = params->rect_y;
+    p.rect_w = params->rect_w;
+    p.rect_h = params->rect_h;
+    p.step = params->step;
+    p.subset_size = params->subset_size;
+    p.strain_window = params->strain_window;
+    p.use_6x6_interpolator = params->use_6x6_interpolator != 0;
+    return p;
+}
+
+Semper::pipeline::ProgressCallback to_progress(semper_progress_cb cb, void* user) {
+    Semper::pipeline::ProgressCallback progress;
+    if (cb != nullptr) {
+        progress = [cb, user](int pct) { cb(pct, user); };
+    }
+    return progress;
+}
+
+} // namespace
 
 extern "C" {
 
@@ -61,28 +96,72 @@ SEMPER_C_API int semper_run(semper_engine* eng,
         roi = Semper::io::decode_gray(mask, mask_len, eng->cache.width, eng->cache.height);
     }
 
-    FullFieldParams p;
-    p.rect_x = params->rect_x;
-    p.rect_y = params->rect_y;
-    p.rect_w = params->rect_w;
-    p.rect_h = params->rect_h;
-    p.step = params->step;
-    p.subset_size = params->subset_size;
-    p.strain_window = params->strain_window;
-    p.use_6x6_interpolator = params->use_6x6_interpolator != 0;
-
-    Semper::pipeline::ProgressCallback progress;
-    if (cb != nullptr) {
-        progress = [cb, user](int pct) { cb(pct, user); };
-    }
-
     return Semper::pipeline::run_full_field(
-        eng->cache, def_gray, roi, p, out, out_capacity,
-        metrics, metrics_len, eng->cancel, progress);
+        eng->cache, def_gray, roi, to_params(params), out, out_capacity,
+        metrics, metrics_len, eng->cancel, to_progress(cb, user));
 }
 
 SEMPER_C_API void semper_cancel(semper_engine* eng) {
     if (eng != nullptr) eng->cancel.request();
+}
+
+SEMPER_C_API semper_incremental* semper_incremental_create(void) {
+    return new (std::nothrow) semper_incremental();
+}
+
+SEMPER_C_API void semper_incremental_destroy(semper_incremental* inc) {
+    delete inc;
+}
+
+SEMPER_C_API int semper_incremental_init(semper_incremental* inc,
+                         const uint8_t* ref, size_t ref_len,
+                         const uint8_t* mask, size_t mask_len,
+                         int expected_w, int expected_h,
+                         const semper_params* params,
+                         int32_t update_interval) {
+    if (inc == nullptr || ref == nullptr || ref_len == 0 || params == nullptr) return SEMPER_ERR_INIT;
+    cv::Mat ref_gray = Semper::io::decode_gray(ref, ref_len, expected_w, expected_h);
+    if (ref_gray.empty()) return SEMPER_ERR_INIT;
+    cv::Mat roi;
+    if (mask != nullptr && mask_len > 0) {
+        roi = Semper::io::decode_gray(mask, mask_len, ref_gray.cols, ref_gray.rows);
+    }
+    IncrementalParams ip;
+    ip.field = to_params(params);
+    ip.update_interval = update_interval;
+    const int rc = inc->session.init(ref_gray, roi, ip);
+    inc->width = rc == 0 ? ref_gray.cols : 0;
+    inc->height = rc == 0 ? ref_gray.rows : 0;
+    return rc;
+}
+
+SEMPER_C_API int semper_incremental_process(semper_incremental* inc,
+                         const uint8_t* def, size_t def_len,
+                         float* out, int out_capacity,
+                         float* metrics, int metrics_len,
+                         semper_incremental_info* info,
+                         semper_progress_cb cb, void* user) {
+    if (inc == nullptr || def == nullptr || def_len == 0 || out == nullptr) return SEMPER_ERR_INIT;
+    if (!inc->session.initialized()) return SEMPER_ERR_INIT;
+    cv::Mat def_gray = Semper::io::decode_gray(def, def_len, inc->width, inc->height);
+    if (def_gray.empty()) return SEMPER_ERR_INIT;
+
+    IncrementalFrameInfo fi;
+    const int rc = inc->session.process_frame(def_gray, out, out_capacity, metrics, metrics_len,
+                                              inc->cancel, to_progress(cb, user), &fi);
+    if (info != nullptr) {
+        info->reference_frame = fi.reference_frame;
+        info->reference_updated = fi.reference_updated ? 1 : 0;
+        info->tracked_points = fi.tracked_points;
+        info->frame0_points = fi.frame0_points;
+        info->taylor_fallbacks = fi.taylor_fallbacks;
+        info->lost_this_frame = fi.lost_this_frame;
+    }
+    return rc;
+}
+
+SEMPER_C_API void semper_incremental_cancel(semper_incremental* inc) {
+    if (inc != nullptr) inc->cancel.request();
 }
 
 SEMPER_C_API const char* semper_version(void) {

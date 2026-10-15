@@ -106,6 +106,67 @@ SEMPER_C_API void semper_cancel(semper_engine* eng);
 /* Semantic version string, "MAJOR.MINOR.PATCH" (e.g. "0.2.0"). Never NULL. */
 SEMPER_C_API const char* semper_version(void);
 
+/* ---------------------------------------------------------------------------
+ * Incremental DIC (added in v0.4.0)
+ *
+ * A session over a frame sequence that moves its reference to the latest
+ * solved frame every `update_interval` frames (0 = never: a fixed reference,
+ * identical to semper_run per frame). Results are always the TOTAL
+ * displacement from the first image, at the first image's grid points, in the
+ * same packed layout as semper_run: 8 floats per point
+ * [x0, y0, u, v, exx, eyy, exy, corr], strain being Green-Lagrange of the
+ * total displacement. A point that cannot be followed is dropped for good.
+ *
+ * The metrics array describes the solve against the current reference;
+ * frame-0 bookkeeping is in semper_incremental_info. Threading as for
+ * semper_engine: one call at a time per handle; semper_incremental_cancel is
+ * safe from another thread. A cancelled or failed frame leaves the session as
+ * it was, so the same frame can be submitted again.
+ * ------------------------------------------------------------------------- */
+typedef struct semper_incremental semper_incremental;
+
+/* Per-frame bookkeeping (layout Frozen: six int32, 24 bytes). */
+typedef struct semper_incremental_info {
+    int32_t reference_frame;   /* frame solved against (0 = first image; frames count from 1) */
+    int32_t reference_updated; /* 1 if this frame became the reference for the next one */
+    int32_t tracked_points;    /* first-image grid points with a total displacement now */
+    int32_t frame0_points;     /* first-image grid points that passed the ROI/mask scan */
+    int32_t taylor_fallbacks;  /* points sampled by first-order expansion near an edge */
+    int32_t lost_this_frame;   /* points dropped for good at this frame's reference update */
+} semper_incremental_info;
+
+SEMPER_C_API semper_incremental* semper_incremental_create(void);
+SEMPER_C_API void                semper_incremental_destroy(semper_incremental* inc);
+
+/*
+ * Start a sequence at the first image. `ref`/`mask` are decoded as for
+ * semper_set_reference; `params` describes the first image's grid (as for
+ * semper_run). Returns 0, SEMPER_ERR_ROI, SEMPER_ERR_INIT (decode failure,
+ * update_interval < 0) or SEMPER_ERR_STRAIN_WINDOW.
+ */
+SEMPER_C_API int semper_incremental_init(semper_incremental* inc,
+                         const uint8_t* ref, size_t ref_len,
+                         const uint8_t* mask, size_t mask_len,
+                         int expected_w, int expected_h,
+                         const semper_params* params,
+                         int32_t update_interval);
+
+/*
+ * Solve the next frame. `out` holds up to `out_capacity` floats; the most a
+ * frame can return is (rect_w / step) * (rect_h / step) points. `metrics`,
+ * `info` and `cb` may be NULL. Returns the point count (>= 0) or a
+ * SEMPER_ERR_* code (SEMPER_ERR_INIT also before a successful init).
+ */
+SEMPER_C_API int semper_incremental_process(semper_incremental* inc,
+                         const uint8_t* def, size_t def_len,
+                         float* out, int out_capacity,
+                         float* metrics, int metrics_len,
+                         semper_incremental_info* info,
+                         semper_progress_cb cb, void* user);
+
+/* Request cancellation of the frame in flight on `inc`. Thread-safe. */
+SEMPER_C_API void semper_incremental_cancel(semper_incremental* inc);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

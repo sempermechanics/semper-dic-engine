@@ -6,6 +6,7 @@
 #include <pybind11/functional.h>
 #include <pybind11/stl.h>
 
+#include <semper/incremental.hpp>
 #include <semper/io.hpp>
 #include <semper/pipeline.hpp>
 #include <semper/version.hpp>
@@ -26,6 +27,8 @@ using Semper::pipeline::ReferenceCache;
 using Semper::pipeline::run_full_field;
 
 namespace {
+
+ProgressCallback to_callback(const py::object& progress);
 
 // Accepts a 2-D uint8 ndarray (H, W) — wrapped as grayscale, copied so it owns
 // its pixels across the solve — or encoded bytes (PNG/JPEG) decoded via io.
@@ -85,14 +88,7 @@ public:
         std::vector<float> out(max_pts * 8, 0.0f);
         float metrics[23] = {0};
 
-        ProgressCallback cb;
-        if (!progress.is_none()) {
-            py::function fn = py::reinterpret_borrow<py::function>(progress);
-            cb = [fn](int pct) {
-                py::gil_scoped_acquire gil;  // re-enter Python to call back
-                fn(pct);
-            };
-        }
+        ProgressCallback cb = to_callback(progress);
 
         int n;
         {
@@ -119,6 +115,88 @@ private:
     CancelToken cancel_;
 };
 
+ProgressCallback to_callback(const py::object& progress) {
+    ProgressCallback cb;
+    if (!progress.is_none()) {
+        py::function fn = py::reinterpret_borrow<py::function>(progress);
+        cb = [fn](int pct) {
+            py::gil_scoped_acquire gil;  // re-enter Python to call back
+            fn(pct);
+        };
+    }
+    return cb;
+}
+
+// Incremental (updated-reference) DIC over a frame sequence; see
+// <semper/incremental.hpp>. Results are total displacement from the first
+// image, at its grid points, in the same (N, 8) layout as Engine.run.
+class Incremental {
+public:
+    Incremental() = default;
+
+    int init(const py::object& img, const py::object& mask, std::array<int, 4> rect,
+             int step, int subset, int strain_window, bool use_6x6, int update_interval,
+             int expected_w, int expected_h) {
+        cv::Mat ref = to_gray(img, expected_w, expected_h);
+        if (ref.empty()) throw std::runtime_error("failed to decode reference image");
+        cv::Mat roi;
+        if (!mask.is_none()) roi = to_gray(mask, ref.cols, ref.rows);
+        Semper::pipeline::IncrementalParams ip;
+        ip.field.rect_x = rect[0];
+        ip.field.rect_y = rect[1];
+        ip.field.rect_w = rect[2];
+        ip.field.rect_h = rect[3];
+        ip.field.step = step;
+        ip.field.subset_size = subset;
+        ip.field.strain_window = strain_window;
+        ip.field.use_6x6_interpolator = use_6x6;
+        ip.update_interval = update_interval;
+        const int rc = session_.init(ref, roi, ip);
+        width_ = rc == 0 ? ref.cols : 0;
+        height_ = rc == 0 ? ref.rows : 0;
+        return rc;
+    }
+
+    // Returns (code, points|None, metrics, info dict).
+    py::tuple process(const py::object& deformed, const py::object& progress) {
+        cv::Mat def = to_gray(deformed, width_, height_);
+        if (def.empty()) throw std::runtime_error("failed to decode deformed image");
+        std::vector<float> out(static_cast<size_t>(std::max(session_.max_points(), 1)) * 8, 0.0f);
+        float metrics[23] = {0};
+        Semper::pipeline::IncrementalFrameInfo fi;
+        ProgressCallback cb = to_callback(progress);
+
+        int n;
+        {
+            py::gil_scoped_release rel;  // long solve must not hold the GIL
+            n = session_.process_frame(def, out.data(), static_cast<int>(out.size()),
+                                       metrics, 23, cancel_, cb, &fi);
+        }
+
+        py::array_t<float> met(23);
+        std::memcpy(met.mutable_data(), metrics, sizeof(metrics));
+        py::dict info;
+        info["reference_frame"] = fi.reference_frame;
+        info["reference_updated"] = fi.reference_updated;
+        info["tracked_points"] = fi.tracked_points;
+        info["frame0_points"] = fi.frame0_points;
+        info["taylor_fallbacks"] = fi.taylor_fallbacks;
+        info["lost_this_frame"] = fi.lost_this_frame;
+        if (n < 0) return py::make_tuple(n, py::none(), met, info);
+        py::array_t<float> points({static_cast<py::ssize_t>(n), static_cast<py::ssize_t>(8)});
+        std::memcpy(points.mutable_data(), out.data(), static_cast<size_t>(n) * 8 * sizeof(float));
+        return py::make_tuple(n, points, met, info);
+    }
+
+    void cancel() { cancel_.request(); }
+    int frames_processed() const { return session_.frames_processed(); }
+
+private:
+    Semper::pipeline::IncrementalSession session_;
+    CancelToken cancel_;
+    int width_ = 0, height_ = 0;
+};
+
 }  // namespace
 
 PYBIND11_MODULE(_semper, m) {
@@ -136,4 +214,17 @@ PYBIND11_MODULE(_semper, m) {
              py::arg("strain_window"), py::arg("use_6x6") = false,
              py::arg("progress") = py::none())
         .def("cancel", &Engine::cancel);
+
+    py::class_<Incremental>(m, "IncrementalSession")
+        .def(py::init<>())
+        .def("init", &Incremental::init,
+             py::arg("image"), py::arg("mask") = py::none(),
+             py::arg("rect"), py::arg("step"), py::arg("subset"),
+             py::arg("strain_window"), py::arg("use_6x6") = false,
+             py::arg("update_interval") = 1,
+             py::arg("expected_w") = 0, py::arg("expected_h") = 0)
+        .def("process", &Incremental::process,
+             py::arg("deformed"), py::arg("progress") = py::none())
+        .def("cancel", &Incremental::cancel)
+        .def_property_readonly("frames_processed", &Incremental::frames_processed);
 }

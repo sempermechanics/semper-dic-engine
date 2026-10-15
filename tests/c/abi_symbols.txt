@@ -1,6 +1,11 @@
 semper_cancel
 semper_create
 semper_destroy
+semper_incremental_cancel
+semper_incremental_create
+semper_incremental_destroy
+semper_incremental_init
+semper_incremental_process
 semper_run
 semper_set_reference
 semper_version

@@ -199,7 +199,7 @@ jobs:
           LIB=$(find build/sdk -name 'libsemper_c.so' | head -n1)
           test -n "$LIB"
           echo "Inspecting $LIB"
-          # The six documented entry points are the ONLY symbols that may be
+          # The documented entry points are the ONLY symbols that may be
           # exported (visibility is hidden + explicit SEMPER_C_API). An accidental
           # export, or a dropped annotation, changes this set and fails the diff.
           nm -D --defined-only "$LIB" | awk '$2=="T"{print $3}' \

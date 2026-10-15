@@ -36,6 +36,15 @@ _Static_assert(offsetof(semper_params, subset_size) == 20, "subset_size offset F
 _Static_assert(offsetof(semper_params, strain_window) == 24, "strain_window offset Frozen");
 _Static_assert(offsetof(semper_params, use_6x6_interpolator) == 28, "use_6x6 offset Frozen");
 
+/* semper_incremental_info layout is Frozen from v0.4.0. */
+_Static_assert(sizeof(semper_incremental_info) == 6 * sizeof(int32_t), "semper_incremental_info size is Frozen");
+_Static_assert(offsetof(semper_incremental_info, reference_frame) == 0, "reference_frame offset Frozen");
+_Static_assert(offsetof(semper_incremental_info, reference_updated) == 4, "reference_updated offset Frozen");
+_Static_assert(offsetof(semper_incremental_info, tracked_points) == 8, "tracked_points offset Frozen");
+_Static_assert(offsetof(semper_incremental_info, frame0_points) == 12, "frame0_points offset Frozen");
+_Static_assert(offsetof(semper_incremental_info, taylor_fallbacks) == 16, "taylor_fallbacks offset Frozen");
+_Static_assert(offsetof(semper_incremental_info, lost_this_frame) == 20, "lost_this_frame offset Frozen");
+
 #define W 128
 #define H 128
 
@@ -242,6 +251,53 @@ static void test_version_format(void) {
     CHECK(other == 0);      /* nothing but digits and dots */
 }
 
+/* ---- Incremental session: guards and error codes (no solve quality) ---- */
+static void test_incremental_guards(uint8_t* ref, uint8_t* def) {
+    semper_params p = valid_params();
+    float out[8 * 64];
+    float metrics[SEMPER_METRICS_LEN];
+    semper_incremental_info info;
+
+    /* NULL handles are ignored / rejected, never dereferenced. */
+    semper_incremental_destroy(NULL);
+    semper_incremental_cancel(NULL);
+    CHECK(semper_incremental_init(NULL, ref, (size_t)W * H, NULL, 0, W, H, &p, 1) == SEMPER_ERR_INIT);
+    CHECK(semper_incremental_process(NULL, def, (size_t)W * H, out, 8 * 64, metrics,
+                                     SEMPER_METRICS_LEN, &info, NULL, NULL) == SEMPER_ERR_INIT);
+
+    semper_incremental* inc = semper_incremental_create();
+    CHECK(inc != NULL);
+
+    /* Before init. */
+    CHECK(semper_incremental_process(inc, def, (size_t)W * H, out, 8 * 64, metrics,
+                                     SEMPER_METRICS_LEN, &info, NULL, NULL) == SEMPER_ERR_INIT);
+
+    /* Init argument guards and codes. */
+    CHECK(semper_incremental_init(inc, NULL, 0, NULL, 0, W, H, &p, 1) == SEMPER_ERR_INIT);
+    CHECK(semper_incremental_init(inc, ref, (size_t)W * H, NULL, 0, W, H, NULL, 1) == SEMPER_ERR_INIT);
+    CHECK(semper_incremental_init(inc, ref, (size_t)W * H, NULL, 0, W, H, &p, -1) == SEMPER_ERR_INIT);
+    semper_params bad = p;
+    bad.rect_w = bad.step - 1;
+    CHECK(semper_incremental_init(inc, ref, (size_t)W * H, NULL, 0, W, H, &bad, 1) == SEMPER_ERR_ROI);
+    bad = p;
+    bad.strain_window = 5;
+    CHECK(semper_incremental_init(inc, ref, (size_t)W * H, NULL, 0, W, H, &bad, 1) == SEMPER_ERR_STRAIN_WINDOW);
+    /* A failed init leaves the handle uninitialized. */
+    CHECK(semper_incremental_process(inc, def, (size_t)W * H, out, 8 * 64, metrics,
+                                     SEMPER_METRICS_LEN, &info, NULL, NULL) == SEMPER_ERR_INIT);
+
+    CHECK(semper_incremental_init(inc, ref, (size_t)W * H, NULL, 0, W, H, &p, 1) == 0);
+    /* Process argument guards. */
+    CHECK(semper_incremental_process(inc, NULL, 0, out, 8 * 64, metrics,
+                                     SEMPER_METRICS_LEN, &info, NULL, NULL) == SEMPER_ERR_INIT);
+    CHECK(semper_incremental_process(inc, def, (size_t)W * H, NULL, 0, metrics,
+                                     SEMPER_METRICS_LEN, &info, NULL, NULL) == SEMPER_ERR_INIT);
+    /* metrics and info are optional. */
+    int rc = semper_incremental_process(inc, def, (size_t)W * H, out, 8 * 64, NULL, 0, NULL, NULL, NULL);
+    CHECK(rc >= 0 || rc == SEMPER_ERR_ROI);
+    semper_incremental_destroy(inc);
+}
+
 int main(void) {
     printf("semper_c contract — version %s\n", semper_version());
 
@@ -259,6 +315,7 @@ int main(void) {
     test_metrics_len_rule(ref, def);
     test_cancel_independence(ref, def);
     test_version_format();
+    test_incremental_guards(ref, def);
 
     free(ref);
     free(def);
