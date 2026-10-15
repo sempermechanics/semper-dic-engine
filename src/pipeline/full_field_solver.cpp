@@ -17,6 +17,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <opencv2/imgproc.hpp>
 #include <string>
@@ -65,6 +66,24 @@ int run_full_field(
     float* metrics,
     int metrics_len,
     ProgressCallback on_progress) {
+    return run_full_field_impl(cache, def_gray, roi_mask, params, output_ptr,
+                               output_capacity, metrics, metrics_len,
+                               std::move(on_progress), nullptr);
+}
+
+namespace internal {
+
+int run_full_field_impl(
+    ReferenceCache& cache,
+    const cv::Mat& def_gray,
+    const cv::Mat& roi_mask,
+    const FullFieldParams& params,
+    float* output_ptr,
+    int output_capacity,
+    float* metrics,
+    int metrics_len,
+    ProgressCallback on_progress,
+    FieldCapture* capture) {
 
         std::string local_debug_dir = cache.debug_dir;
         cache.debug_dir.clear();
@@ -100,7 +119,10 @@ int run_full_field(
             }
         }
 
-        Image defImg(defMat.cols, defMat.rows, defMat.data);
+        // Heap-allocated so incremental DIC can take it over as the next
+        // reference (FieldCapture::keep_deformed) instead of preparing it again.
+        auto defImgOwner = std::make_unique<Image>(defMat.cols, defMat.rows, defMat.data);
+        Image& defImg = *defImgOwner;
         defImg.prepare_data(false);
         timings.img_prep = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_prep_start).count();
 
@@ -140,6 +162,27 @@ int run_full_field(
 
         ResultGrid resultGrid(gridH, std::vector<GridPoint>(gridW));
         int total_valid_points = 0;
+
+        // The scan below and the Hessian pre-pass depend only on the reference,
+        // the grid and the mask, so a batch against one reference computes them
+        // once (RefPrecompute). A hit replays the stored per-node verdicts into
+        // the same initializer the scan uses.
+        if (!cache.precompute) cache.precompute = std::make_unique<RefPrecompute>();
+        RefPrecompute& pre = *cache.precompute;
+        const bool grid_cached = pre.grid_matches(params, roiMask) &&
+                                 pre.gridW == gridW && pre.gridH == gridH;
+        if (grid_cached) {
+            for (int y = 0; y < gridH; ++y) {
+                for (int x = 0; x < gridW; ++x) {
+                    const bool shouldSkip = pre.skip[(size_t)y * gridW + x] != 0;
+                    int realX = params.rect_x + x * params.step;
+                    int realY = params.rect_y + y * params.step;
+                    resultGrid[y][x] = {(float)realX, (float)realY, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, CORR_INVALID, shouldSkip, -1, -1, 0, false, 0};
+                }
+            }
+            total_valid_points = pre.total_valid_points;
+        } else {
+        pre.grid_valid = false;
 
         // === 🚀 100% STRICT RULE: PURE SUBSETS ONLY ===
         // We scan the ENTIRE subset bounding box before allowing a grid point to exist.
@@ -192,6 +235,7 @@ int run_full_field(
                 // workers will ignore it entirely, just like DICe's kd-tree ignores it.
                 resultGrid[y][x] = {(float)realX, (float)realY, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, CORR_INVALID, shouldSkip, -1, -1, 0, false, 0};
             }
+        }
         }
 
         if (total_valid_points == 0) return -2; // 🚀 PRIORITY 3: Return -2 for Empty Mask
@@ -253,7 +297,9 @@ int run_full_field(
         // Runs before seeding: the anchor lattice sits on grid nodes and reuses
         // this pool, so its solves cost little more than the field costs anyway.
         auto t_prepass_start = std::chrono::high_resolution_clock::now();
-        HessianPool hessian_pool(gridW * gridH);
+        if (!grid_cached) {
+        pre.hessian_pool.assign((size_t)gridW * gridH, CachedHessianData());
+        HessianPool& hessian_pool = pre.hessian_pool;
 
     #pragma omp parallel for schedule(static) num_threads(safe_cores)
         for (int pool_idx = 0; pool_idx < gridW * gridH; ++pool_idx) {
@@ -267,6 +313,25 @@ int run_full_field(
                 hessian_pool[pool_idx] = SubsetPrecomputer::compute_hessian_only(*cache.ref_img, realX, realY, params.subset_size);
             }
         }
+
+        // The cancel flag only ever goes up during a solve, so if it is still
+        // clear here every iteration above ran: the pool is complete and safe
+        // to reuse. Otherwise it stays marked stale for the next solve.
+        if (!cancel_requested()) {
+            pre.rect_x = params.rect_x; pre.rect_y = params.rect_y;
+            pre.rect_w = params.rect_w; pre.rect_h = params.rect_h;
+            pre.step = params.step; pre.subset_size = params.subset_size;
+            pre.roi_mask = roiMask.empty() ? cv::Mat() : roiMask.clone();
+            pre.gridW = gridW; pre.gridH = gridH;
+            pre.skip.assign((size_t)gridW * gridH, 0);
+            for (int y = 0; y < gridH; ++y)
+                for (int x = 0; x < gridW; ++x)
+                    pre.skip[(size_t)y * gridW + x] = resultGrid[y][x].solved ? 1 : 0;
+            pre.total_valid_points = total_valid_points;
+            pre.grid_valid = true;
+        }
+        }
+        const HessianPool& hessian_pool = pre.hessian_pool;
 
         timings.prepass = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_prepass_start).count();
 
@@ -352,6 +417,16 @@ int run_full_field(
         // partial, so there is nothing worth deriving strain from.
         if (cancel_requested()) return kCancelled;
 
+        if (capture) {
+            capture->gridW = gridW;
+            capture->gridH = gridH;
+            capture->rect_x = params.rect_x;
+            capture->rect_y = params.rect_y;
+            capture->step = params.step;
+            capture->attempted = total_valid_points;
+            capture->grid = resultGrid;
+        }
+
         auto packed = pack_full_field_output(
                 resultGrid, gridW, gridH, params.step, params.strain_window,
                 output_ptr, output_capacity);
@@ -385,7 +460,7 @@ int run_full_field(
         if (!local_debug_dir.empty()) {
             export_full_field_debug_suite(
                     local_debug_dir, gridW, gridH, params, roiMask,
-                    cache.width, cache.height, cache.ref_img,
+                    cache.width, cache.height, cache.ref_img.get(),
                     resultGrid, strainField, affTriangles);
         }
 
@@ -396,9 +471,16 @@ int run_full_field(
                             total_valid_points, valid_count,
                             packed.dropped_by_post_filter, seeds, mesh_quality);
 
+        if (capture && capture->keep_deformed) {
+            capture->deformed = std::move(defImgOwner);
+            capture->deformed_gray = def_gray.clone();
+        }
+
         defMat.release(); roiMask.release();
         return valid_count;
 }
+
+} // namespace internal
 
 
 } // namespace pipeline

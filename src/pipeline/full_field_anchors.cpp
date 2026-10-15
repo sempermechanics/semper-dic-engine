@@ -138,11 +138,19 @@ MeshSeedResult solve_anchor_seeds(
     double pu = 0.0, pv = 0.0, presp = 0.0;
     {
         ScopedTimer t(timings.phase_corr);
-        if (!cache.gray.empty()) {
-            out.phase_locked = seeding::phase_correlate_roi(
-                    cache.gray, defMat,
-                    cv::Rect(params.rect_x, params.rect_y, params.rect_w, params.rect_h),
-                    pu, pv, presp);
+        if (!cache.gray.empty() &&
+            defMat.cols == cache.gray.cols && defMat.rows == cache.gray.rows) {
+            // The reference half (crop, float conversion, Hann window) is
+            // reused across solves against this reference.
+            const cv::Rect roi(params.rect_x, params.rect_y, params.rect_w, params.rect_h);
+            if (!cache.precompute) cache.precompute = std::make_unique<RefPrecompute>();
+            RefPrecompute& pre = *cache.precompute;
+            if (!pre.phase_valid || pre.phase_roi != roi) {
+                pre.phase_ref = seeding::prepare_phase_correlate_ref(cache.gray, roi);
+                pre.phase_roi = roi;
+                pre.phase_valid = true;
+            }
+            out.phase_locked = seeding::phase_correlate_roi(pre.phase_ref, defMat, pu, pv, presp);
         }
     }
     out.globalU = (float)pu;

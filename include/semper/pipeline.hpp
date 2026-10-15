@@ -5,6 +5,7 @@
 #include <semper/image.hpp>
 #include <opencv2/core.hpp>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -14,24 +15,34 @@ namespace pipeline {
 
 using ProgressCallback = std::function<void(int percentage)>;
 
+namespace internal { struct RefPrecompute; }
+
 /**
  * Cached reference for multi-frame solves (decoded gray + Image).
  *
- * Owns a raw Image* (freed in reset()), so it is non-copyable/non-movable to
- * avoid a double-free — there is one process-wide instance (see the JNI layer).
- * The embedded `mutex` does NOT make the struct's methods thread-safe; it is
- * held by the JNI caller around a whole solve so a cancel can still interrupt.
+ * Non-copyable/non-movable: there is one process-wide instance in the JNI
+ * layer, and solves hold references into it. The embedded `mutex` does NOT
+ * make the struct's methods thread-safe; it is held by the JNI caller around a
+ * whole solve so a cancel can still interrupt.
+ *
+ * Besides the image it keeps what run_full_field derives from the reference
+ * alone (grid validity scan, Hessian pool, phase-correlation reference side),
+ * so frames 2..N of a fixed-reference batch skip that work. The values are
+ * produced by the same code on the same inputs, so results are bit-identical
+ * to recomputing them; any change of reference, params or ROI mask drops them.
  */
 struct ReferenceCache {
-    Image* ref_img = nullptr;
+    std::unique_ptr<Image> ref_img;
     int width = 0;
     int height = 0;
     cv::Mat gray;
     std::mutex mutex;
     std::string debug_dir;
+    // Reference-only work reused across solves. Internal; see the class comment.
+    std::unique_ptr<internal::RefPrecompute> precompute;
 
-    ReferenceCache() = default;
-    ~ReferenceCache() { reset(); }
+    ReferenceCache();
+    ~ReferenceCache();
     ReferenceCache(const ReferenceCache&) = delete;
     ReferenceCache& operator=(const ReferenceCache&) = delete;
     ReferenceCache(ReferenceCache&&) = delete;
@@ -39,6 +50,16 @@ struct ReferenceCache {
 
     void reset();
     void set_from_gray(const cv::Mat& gray_in, const cv::Mat& roi_mask);
+
+    /**
+     * Take an already-prepared image as the new reference instead of decoding
+     * and preparing it again. `prepared` must come from
+     * `Image(w, h, gray.data)` + `prepare_data(false)` over `gray` — exactly
+     * what run_full_field builds for its deformed image — so the result is
+     * bit-identical to set_from_gray(gray, roi_mask). Used by incremental DIC,
+     * where frame t's deformed image becomes frame t+1's reference.
+     */
+    void adopt(std::unique_ptr<Image> prepared, cv::Mat gray_in, const cv::Mat& roi_mask);
 };
 
 struct FullFieldParams {

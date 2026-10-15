@@ -370,6 +370,157 @@ TEST_CASE(FullField, MetricsPointCountsAccountForEverySolvedPoint) {
     CHECK(metrics[18] > 0.0f);
 }
 
+// ---------------------------------------------------------------------------
+// Reference precompute cache. A batch against one reference reuses the grid
+// scan, the Hessian pool and the reference side of the phase correlation.
+// Reuse must never change a result: every solve below is compared bit for bit
+// against a solve on a fresh cache, which recomputes everything.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct SolveOut {
+    int rc = 0;
+    std::vector<float> out;
+};
+
+SolveOut solve_on(ReferenceCache &cache, const cv::Mat &def_gray, const cv::Mat &mask,
+                  const FullFieldParams &p) {
+    SolveOut s;
+    const int cap = (p.rect_w / p.step) * (p.rect_h / p.step) * 8;
+    s.out.assign((size_t)std::max(cap, 1), 0.0f);
+    float metrics[23] = {};
+    s.rc = run_full_field(cache, def_gray, mask, p, s.out.data(), cap, metrics, 23, nullptr);
+    return s;
+}
+
+SolveOut solve_fresh(const cv::Mat &ref_gray, const cv::Mat &def_gray, const cv::Mat &mask,
+                     const FullFieldParams &p) {
+    ReferenceCache cache;
+    cache.set_from_gray(ref_gray, mask);
+    return solve_on(cache, def_gray, mask, p);
+}
+
+bool bit_equal(const SolveOut &a, const SolveOut &b) {
+    if (a.rc != b.rc) return false;
+    if (a.rc <= 0) return true;
+    return std::memcmp(a.out.data(), b.out.data(), (size_t)a.rc * 8 * sizeof(float)) == 0;
+}
+
+// Frames of a slowly growing affine deformation of one speckle field.
+std::vector<cv::Mat> affine_frames(cv::Mat &ref_gray, int frames) {
+    dictest::SpeckleField field(/*seed=*/23, W, H, /*blob_count=*/600);
+    ref_gray = dictest::gray8(dictest::make_reference_image(field, W, H));
+    std::vector<cv::Mat> out;
+    for (int f = 1; f <= frames; ++f) {
+        dictest::AffineDeformation d;
+        d.u = 1.3f * f;
+        d.v = -0.7f * f;
+        d.ux = 0.006f * f;
+        d.vy = -0.002f * f;
+        d.uy = 0.003f * f;
+        d.vx = -0.003f * f;
+        d.cx = W / 2.0f;
+        d.cy = H / 2.0f;
+        out.push_back(dictest::gray8(dictest::make_deformed_image(field, W, H, d)));
+    }
+    return out;
+}
+
+cv::Mat ring_mask() {
+    cv::Mat m(H, W, CV_8UC1, cv::Scalar(0));
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const float r2 = (x - W / 2.0f) * (x - W / 2.0f) + (y - H / 2.0f) * (y - H / 2.0f);
+            if (r2 < 110.0f * 110.0f && r2 > 20.0f * 20.0f) m.at<uchar>(y, x) = 255;
+        }
+    return m;
+}
+
+} // namespace
+
+TEST_CASE(FullField, RefCache_SequenceOnOneCache_BitIdenticalToFresh) {
+    cv::Mat ref_gray;
+    const std::vector<cv::Mat> frames = affine_frames(ref_gray, 4);
+
+    // 240 is a DFT-optimal size: cv::phaseCorrelate windows such inputs in
+    // place, which is exactly what a cached reference crop must survive.
+    FullFieldParams p = params_for(W, H);
+    p.rect_x = 8; p.rect_y = 8; p.rect_w = 240; p.rect_h = 240;
+    p.step = 8; p.strain_window = 2 * 8 + 1;
+    p.use_6x6_interpolator = true;
+
+    for (int with_mask = 0; with_mask <= 1; ++with_mask) {
+        const cv::Mat mask = with_mask ? ring_mask() : cv::Mat();
+        ReferenceCache shared;
+        shared.set_from_gray(ref_gray, mask);
+        for (size_t f = 0; f < frames.size(); ++f) {
+            const SolveOut fresh = solve_fresh(ref_gray, frames[f], mask, p);
+            REQUIRE(fresh.rc > 0);
+            // Twice on the shared cache: a hit after a previous frame, then a
+            // hit on the same frame.
+            for (int rep = 0; rep < 2; ++rep) {
+                const SolveOut hit = solve_on(shared, frames[f], mask, p);
+                CHECK(bit_equal(hit, fresh));
+            }
+        }
+    }
+}
+
+TEST_CASE(FullField, RefCache_InvalidatesOnParamsOrMask) {
+    cv::Mat ref_gray;
+    const std::vector<cv::Mat> frames = affine_frames(ref_gray, 1);
+    const cv::Mat &def = frames[0];
+
+    FullFieldParams a = params_for(W, H);
+    a.step = 8; a.strain_window = 17;
+    FullFieldParams b = a;
+    b.rect_x = 16; b.rect_w = W - 32;       // different grid origin and size
+    FullFieldParams c = a;
+    c.subset_size = 25;                      // different Hessian per node
+    const cv::Mat ring = ring_mask();
+
+    ReferenceCache shared;
+    shared.set_from_gray(ref_gray, cv::Mat());
+    CHECK(bit_equal(solve_on(shared, def, cv::Mat(), a), solve_fresh(ref_gray, def, cv::Mat(), a)));
+    CHECK(bit_equal(solve_on(shared, def, cv::Mat(), b), solve_fresh(ref_gray, def, cv::Mat(), b)));
+    CHECK(bit_equal(solve_on(shared, def, cv::Mat(), c), solve_fresh(ref_gray, def, cv::Mat(), c)));
+
+    // A mask passed to the solve (not the reference) changes the grid scan.
+    ReferenceCache plain;
+    plain.set_from_gray(ref_gray, cv::Mat());
+    const SolveOut no_mask = solve_on(plain, def, cv::Mat(), a);
+    const SolveOut masked = solve_on(plain, def, ring, a);
+    ReferenceCache plain_fresh;
+    plain_fresh.set_from_gray(ref_gray, cv::Mat());
+    CHECK(bit_equal(masked, solve_on(plain_fresh, def, ring, a)));
+    CHECK(masked.rc < no_mask.rc);
+    // And back again.
+    CHECK(bit_equal(solve_on(plain, def, cv::Mat(), a), no_mask));
+
+    // A new reference drops everything.
+    shared.set_from_gray(frames[0], cv::Mat());
+    CHECK(bit_equal(solve_on(shared, def, cv::Mat(), a), solve_fresh(frames[0], def, cv::Mat(), a)));
+}
+
+TEST_CASE(FullField, RefCache_CancelledSolveDoesNotPoisonCache) {
+    cv::Mat ref_gray;
+    const std::vector<cv::Mat> frames = affine_frames(ref_gray, 1);
+    FullFieldParams p = params_for(W, H);
+    p.step = 8; p.strain_window = 17;
+
+    ReferenceCache shared;
+    shared.set_from_gray(ref_gray, cv::Mat());
+    Semper::pipeline::CancelToken token;
+    std::vector<float> out((size_t)(W / 8) * (H / 8) * 8, 0.0f);
+    float metrics[23] = {};
+    // Cancel from the first progress tick: the pre-pass may be cut short.
+    const int rc = run_full_field(shared, frames[0], cv::Mat(), p, out.data(), (int)out.size(),
+                                  metrics, 23, token, [&](int) { token.request(); });
+    CHECK(rc == kCancelled || rc > 0);
+    CHECK(bit_equal(solve_on(shared, frames[0], cv::Mat(), p),
+                    solve_fresh(ref_gray, frames[0], cv::Mat(), p)));
+}
+
 #else
 
 TEST_CASE(FullField, OpenCvRequired_SkippedWithoutOpenCV) {

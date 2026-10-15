@@ -11,6 +11,7 @@
 // than one TU can name them.
 
 #include <semper/pipeline.hpp>
+#include <semper/seeding.hpp>
 #include <semper/solver.hpp>
 #include <semper/strain.hpp>
 #include <semper/subset.hpp>
@@ -21,6 +22,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -133,6 +135,57 @@ struct AffineTriangle {
 enum class MeshQuality { NONE, SPARSE, FULL };
 
 using HessianPool = std::vector<CachedHessianData, Eigen::aligned_allocator<CachedHessianData>>;
+
+// Work run_full_field derives from the reference alone, kept on the
+// ReferenceCache between solves (see ReferenceCache in pipeline.hpp). Each part
+// is keyed on every input it was computed from; a mismatch recomputes it.
+struct RefPrecompute {
+    // Grid validity scan + Hessian pool: keyed on the grid and the ROI mask.
+    bool grid_valid = false;
+    int rect_x = 0, rect_y = 0, rect_w = 0, rect_h = 0, step = 0, subset_size = 0;
+    cv::Mat roi_mask;                 // the (resized) mask the scan used; empty = none
+    int gridW = 0, gridH = 0;
+    std::vector<unsigned char> skip;  // per node: boundary- or mask-rejected
+    int total_valid_points = 0;
+    HessianPool hessian_pool;
+
+    // Reference side of the L0 phase correlation: keyed on the ROI rect.
+    bool phase_valid = false;
+    cv::Rect phase_roi;
+    seeding::PhaseCorrRef phase_ref;
+
+    bool grid_matches(const FullFieldParams &p, const cv::Mat &mask) const;
+};
+
+// What run_full_field_impl hands back besides the packed output, for callers
+// that build on the raw solve (incremental DIC). Taken after Path B and before
+// packing, so it still holds nodes the strain post-filter would drop.
+struct FieldCapture {
+    int gridW = 0, gridH = 0, rect_x = 0, rect_y = 0, step = 0;
+    int attempted = 0;               // nodes that passed the boundary + mask scan
+    ResultGrid grid;                 // a node holds a result iff solved && corr >= 0
+
+    // When set, the prepared deformed image and a copy of its gray are moved
+    // out instead of being destroyed, so the caller can adopt() them as the
+    // next reference without preparing the image again.
+    bool keep_deformed = false;
+    std::unique_ptr<Image> deformed;
+    cv::Mat deformed_gray;
+};
+
+// run_full_field with an optional capture. capture == nullptr is exactly
+// run_full_field.
+int run_full_field_impl(
+        ReferenceCache &cache,
+        const cv::Mat &def_gray,
+        const cv::Mat &roi_mask,
+        const FullFieldParams &params,
+        float *output_ptr,
+        int output_capacity,
+        float *metrics,
+        int metrics_len,
+        ProgressCallback on_progress,
+        FieldCapture *capture);
 
 // Everything the three solve paths read out of run_full_field's frame. Passed
 // by const reference so the extracted phases keep the same view of the solve
