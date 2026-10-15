@@ -25,9 +25,9 @@ usual. Respect the surface described here, and declare your change's
 | Tier | What it covers | Rule for contributors |
 |---|---|---|
 | **Frozen** | Binary/data formats: output packing, metrics layout, error codes, and the *meaning* of existing `FullFieldParams` fields | Never change in place. A change here is a **major** version bump and requires a coordinated change in the downstream app. |
-| **Stable** | Public function **signatures** in `include/semper/{pipeline,io,cancel,version}.hpp` and `include/semper/semper_c.h` | May be **extended additively** (new overloads / new functions). Existing signatures, parameter order, defaults, and semantics must not change without a **major** bump. |
+| **Stable** | Public function **signatures** in `include/semper/{pipeline,incremental,io,cancel,version}.hpp` and `include/semper/semper_c.h` | May be **extended additively** (new overloads / new functions). Existing signatures, parameter order, defaults, and semantics must not change without a **major** bump. |
 | **Additive-only** | Deliberate growth points: trailing `FullFieldParams` fields, unused metrics slots | Append only, each with a default that reproduces prior behavior. Never reorder or repurpose an existing entry. |
-| **Internal** | Everything in `src/`, `tuning.hpp` constants, `types.hpp`, `seeding.hpp`, algorithm internals, private headers. Living under `include/semper/` does **not** make a header Stable — only the four named above and `semper_c.h` are. | Change freely. Behavior is guarded by the golden test, not by this contract. |
+| **Internal** | Everything in `src/`, `tuning.hpp` constants, `types.hpp`, `seeding.hpp`, algorithm internals, private headers. Living under `include/semper/` does **not** make a header Stable — only the five named above and `semper_c.h` are. | Change freely. Behavior is guarded by the golden test, not by this contract. |
 
 **Semantic versioning** (`include/semper/version.hpp` / `SEMPER_VERSION`):
 
@@ -99,6 +99,67 @@ struct ReferenceCache {                 // non-copyable, non-movable
 
 Must remain **non-copyable / non-movable**.
 
+`ReferenceCache` also keeps work that depends only on the reference and the
+grid: the node validity scan, the Hessian pool and the reference side of phase
+correlation. That cache is **Internal**. It is reused while `rect`, `step`,
+`subset_size` and the ROI mask are unchanged, and dropped by `reset`,
+`set_from_gray` and `adopt`. Outputs are bit-identical with or without it.
+`adopt(...)` (added v0.4.0) hands an already-prepared image to the cache; it
+exists for `IncrementalSession` and is **Internal** despite living in a Stable
+header.
+
+### `pipeline::IncrementalSession` — updated-reference sequences · *Stable (added v0.4.0)*
+
+```cpp
+// include/semper/incremental.hpp
+struct IncrementalParams {
+    FullFieldParams field;     // the frame-0 grid, exactly as for run_full_field
+    int update_interval = 1;   // 0 = fixed reference, N = move the reference every N frames
+};
+
+struct IncrementalFrameInfo {
+    int  reference_frame;      // frame this one was solved against (0 = first image)
+    bool reference_updated;    // this frame became the next reference
+    int  tracked_points;       // frame-0 nodes still followed
+    int  frame0_points;        // frame-0 nodes after the boundary + mask scan
+    int  taylor_fallbacks;     // nodes sampled by first-order expansion
+    int  lost_this_frame;      // nodes that stopped being followed on this frame
+};
+
+class IncrementalSession {     // move-only
+public:
+    int  init(const cv::Mat& ref_gray, const cv::Mat& roi_mask, const IncrementalParams&);
+    int  process_frame(const cv::Mat& def_gray, float* output, int output_capacity,
+                       float* metrics, int metrics_len,
+                       ProgressCallback on_progress = nullptr,
+                       IncrementalFrameInfo* info = nullptr);
+    int  process_frame(..., CancelToken& cancel, ProgressCallback = nullptr,
+                       IncrementalFrameInfo* = nullptr);
+    void reset();
+    bool initialized() const;
+    int  frames_processed() const;
+    int  max_points() const;   // frame-0 grid node count
+    void set_debug_dir(std::string dir);
+};
+```
+
+- **Output** *(Frozen)*: the same 8-float packing and capacity rule as
+  `run_full_field`. `x, y` are **frame-0 grid coordinates**, `u, v` the **total**
+  displacement from the first image, and the strains are Green-Lagrange strain
+  of that total. A frame-0 node that cannot be followed is dropped and never
+  returns.
+- **`update_interval = 0`** *(Frozen)*: every frame is bit-identical to
+  `run_full_field` against the first image. With any interval, the first frame
+  is too.
+- **Returns** *(Frozen)*: `init` returns `0`, `-2`, `-3` (empty image, negative
+  interval) or `-4`. `process_frame` returns the same codes as `run_full_field`;
+  `-3` also covers "not initialized" and a frame whose size differs from the
+  first image.
+- **Errors and cancellation** leave the session exactly as it was, so the same
+  frame can be submitted again.
+- **Metrics** describe the increment solve against the current reference. The
+  frame-0 bookkeeping is in `IncrementalFrameInfo`, not in new metric slots.
+
 ### `pipeline::FullFieldParams` — solve inputs · *Frozen fields + Additive-only tail*
 
 ```cpp
@@ -144,8 +205,34 @@ Empty `cv::Mat` = failure; do not switch to throwing.
 ### C ABI — `include/semper/semper_c.h` · *Stable (ABI)*
 
 `semper_create` / `destroy`, `semper_set_reference`, `semper_run`, `semper_cancel`,
-`semper_version`. Same Frozen return codes and 8-float packing. These six are the
-**only** exported symbols; the golden list in §A.6 fails CI if that set changes.
+`semper_version`. Same Frozen return codes and 8-float packing.
+
+Added in v0.4.0 (minor), the incremental session:
+
+```c
+typedef struct semper_incremental semper_incremental;      /* opaque */
+typedef struct semper_incremental_info {                    /* Frozen: six int32, 24 bytes */
+    int32_t reference_frame, reference_updated, tracked_points,
+            frame0_points, taylor_fallbacks, lost_this_frame;
+} semper_incremental_info;
+
+semper_incremental* semper_incremental_create(void);
+void semper_incremental_destroy(semper_incremental*);
+int  semper_incremental_init(semper_incremental*, const uint8_t* ref, size_t ref_len,
+                             const uint8_t* mask, size_t mask_len,
+                             int expected_w, int expected_h,
+                             const semper_params*, int32_t update_interval);
+int  semper_incremental_process(semper_incremental*, const uint8_t* def, size_t def_len,
+                                float* out, int out_capacity,
+                                float* metrics, int metrics_len,
+                                semper_incremental_info* info,   /* may be NULL */
+                                semper_progress_cb cb, void* user);
+void semper_incremental_cancel(semper_incremental*);           /* thread-safe */
+```
+
+`semper_params` is unchanged; the interval is a separate argument so its layout
+stays Frozen. These eleven functions are the **only** exported symbols; the
+golden list in §A.6 fails CI if that set changes.
 
 Every entry point is annotated `SEMPER_C_API`. The shared library is built with
 `-fvisibility=hidden` (and `/W…` on MSVC), so only the annotated symbols are
@@ -178,6 +265,14 @@ thread on Android.
 | `getPreviewFromBytes(byte[], int)` | `io::decode_bgr` |
 | `initializeReference(byte[], byte[]?, int, int)` | `io::decode_gray`, `ReferenceCache::set_from_gray` / `reset` |
 | `computeFullFieldDirect(…)` | `io::decode_gray`, `run_full_field` |
+| `initializeIncremental(byte[], byte[]?, int w, int h, rectX, rectY, rectW, rectH, step, subset, strainWindow, bool use6x6, int updateInterval)` (v0.4.0) | `io::decode_gray`, `IncrementalSession::init`; resets the fixed-reference cache |
+| `computeIncrementalFrame(byte[], ByteBuffer, callback, float[]?, int[]? info)` (v0.4.0) | `io::decode_gray`, `IncrementalSession::process_frame`; `info` (length ≥ 6) receives the `IncrementalFrameInfo` fields in declaration order, the bool as 0/1 |
+| `releaseIncremental()` (v0.4.0) | destroys the session |
+
+The fixed-reference and incremental paths share one lock and do not run at the
+same time: `initializeIncremental` drops the cached reference, and
+`initializeReference` should be called again before going back to
+`computeFullFieldDirect`.
 
 ---
 
@@ -259,6 +354,19 @@ anchor lattice runs a full IC-GN phase of its own, and its time was being
 dropped on the floor rather than added to these totals. Slot 8 ("Mean ICGN
 Iterations") was understated for the same reason — it divided a sum that
 excluded the anchor phase by a count that included it.
+
+**Prepass time on a reused reference (v0.4.0).** Slot values for the same
+inputs are unchanged, but the Hessian pre-pass time reads about `0` on the
+second and later frames against one reference with the same grid and mask:
+that work is now cached in `ReferenceCache` (§A.2). The other slots, and every
+output float, are bit-identical.
+
+**Incremental sessions.** Metrics from `IncrementalSession::process_frame`
+describe the solve against the current reference on that reference's own
+grid, so the counts (slots 0–4, 19, 20) are of that grid, not of the frame-0
+output. On the first frame against the first image they match the output
+exactly; after the reference has moved, the number of points written is the
+return value, and slot 1 is the increment solve's count.
 
 ### Return / error codes — Frozen
 

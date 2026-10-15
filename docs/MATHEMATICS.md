@@ -608,6 +608,81 @@ On a steel tensile series (40 frames) it rejects nothing. Threshold 2 rejects th
 same points on the PMMA series (and 8 on the steel's last frame, by the
 fracture); 3 leaves more room for noise.
 
+### 9.5 Incremental (Updated-Reference) DIC
+
+`include/semper/incremental.hpp`, `src/pipeline/incremental_session.cpp`,
+`src/pipeline/incremental_math.cpp`.
+
+By default every frame t is correlated against the first image. Under large
+rotation or strain the subsets of frame 0 stop matching frame t: the affine
+shape function covers less of the real deformation, and seeding is
+translation-only. Incremental DIC correlates frame t against a recent frame k
+instead and composes the result.
+
+**Composition.** Let `X0` be a frame-0 grid node and `U(X0, k)` its total
+displacement at the reference frame k, so the material point sits at
+`x_k = X0 + U(X0, k)` in image k. The increment field `u_k` is solved on a
+regular grid in image k. Then
+
+```
+U(X0, t) = U(X0, k) + u_k( X0 + U(X0, k) )
+```
+
+The output stays on the frame-0 grid, as total displacement, so the VSG and
+Green-Lagrange strain of §9.3 apply to `U(·, t)` unchanged.
+
+**Sampling `u_k` between nodes.** `x_k` is generally not a node of the frame-k
+grid:
+
+* If all four corners of the grid cell containing `x_k` are valid, `u_k` is
+  interpolated bilinearly. The ZNSSD reported for the point is the worst of
+  the four.
+* Otherwise, the nearest valid node `n` within `1.5` grid cells
+  (`tuning::kIncTaylorMaxCells`) gives a first-order expansion using its solved
+  displacement gradient, the same expansion Path B uses for its guesses:
+  `u_k(x) ≈ u_n + ∇u_n · (x − x_n)`. Ties go to the lowest row-major index, so
+  the result does not depend on thread timing.
+* Further away, the node is lost. A lost node never returns, since there is no
+  `U(X0, k)` to compose onto.
+
+Increment nodes go through the median test of §9.4 before they are sampled. The
+same test on the total field only drops points from that frame's output, and
+is not fed back into tracking: a false positive there would be permanent.
+
+**Moving the reference.** Every `N` frames (`update_interval`) frame t becomes
+the new reference. Its image is already prepared for correlation (intensities
+and gradients), so it is handed over without decoding or preparing it again.
+The ROI mask has to follow the material. For each pixel `p` of the new
+reference, solve `X + U(X) = p` for its frame-0 position with Newton's method
+(`kIncMaskNewtonIters` = 8, tolerance 0.01 px), where `U` is the bilinear total
+field with invalid nodes filled by neighbour averaging and extrapolated
+linearly up to `kIncMaskExtrapCells` = 3 cells. A pixel is material if it
+converged to within 0.5 px and the frame-0 mask is set at `X`. Rows warm-start
+from their left neighbour. The new reference's ROI is the bounding box of the
+warped mask, widened by one grid step.
+
+**Why the error grows, and what N does.** Each solve carries an interpolation
+bias that depends on the sub-pixel part of the displacement (§10.1). Against a
+fixed reference it is paid once. Incrementally it is paid once per reference
+update, and on slow, smooth loading the increments are small sub-pixel steps
+of similar size, so the bias has one sign and adds up roughly linearly. Image
+noise in each new reference adds a random-walk term on top. Measured on smooth
+synthetic speckle over 160 frames of 0.1% stretch: rms 0.25 px at N = 1 and
+0.15 px at N = 5 with Keys 4×4, 0.21 and 0.11 px with 6×6, against 0.03 px for
+the fixed reference. On DICe's OHT ladder the fixed reference also wins
+(0.003 vs 0.058 px after four updates; see TESTING.md, `DiceIncremental`).
+
+In practice:
+
+* For small or moderate deformation the **fixed reference is more accurate**.
+  Use incremental only when it stops correlating: rotation past a few degrees,
+  strain of tens of percent, or speckle that changes appearance.
+* A larger N means fewer updates, so less accumulated bias, as long as frame
+  t still correlates with frame t − N.
+* The 6×6 interpolator lowers the per-update bias.
+
+`docs/INCREMENTAL_BENCHMARK.md` measures these trade-offs across scenarios.
+
 ---
 
 ## 10. Error Analysis & Uncertainty

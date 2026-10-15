@@ -43,6 +43,15 @@ median test then runs over the whole lattice; and only then does
 confidently onto the wrong speckle blob is dropped by the median test before
 Path B can flood fill from it.
 
+**Work reused across frames.** `ReferenceCache` keeps what depends only on
+the reference and the grid: the node validity scan, the Hessian pool and the
+reference side of phase correlation (its float crop and Hann window). The
+second and later frames against one reference, with the same `rect`, `step`,
+`subset_size` and mask, skip those steps. The cache is internal, and outputs
+are bit-identical with or without it (`FullField.RefCache_*`). Steepest-descent
+images are not cached: at `dim² × 6` floats per node they would cost too much
+memory for a whole grid on a phone.
+
 Package layout and contributor rules: [`README.md`](../README.md).
 
 ---
@@ -247,6 +256,45 @@ rendering/statistics.
 
 ---
 
+## Module: `include/semper/incremental.hpp` — class `IncrementalSession`
+
+Multi-frame DIC that can move its reference forward. The maths is in
+[MATHEMATICS.md §9.5](MATHEMATICS.md#95-incremental-updated-reference-dic);
+the surface is in [CONTRACT.md](CONTRACT.md).
+
+```
+init(frame 0)        -> ReferenceCache::set_from_gray, frame-0 grid scan
+process_frame(t):
+  k == 0             -> run_full_field_impl into the caller's buffer (bit-identical)
+  k  > 0             -> run_full_field_impl on reference k's grid into scratch
+                        -> node_field_from_capture (solved, ZNSSD >= 0, median test)
+                        -> sample_increment at X0 + U(X0,k) for every tracked node
+                        -> frame-0 ResultGrid -> pack_full_field_output (VSG, packing)
+  every N frames     -> warp_material_mask, ReferenceCache::adopt(prepared image)
+```
+
+- **Hand-off without rework.** `run_full_field_impl` takes an optional
+  `FieldCapture`. It returns the solved grid and, on a frame that will become
+  the next reference, the prepared deformed `Image` and its gray `cv::Mat`.
+  `ReferenceCache::adopt` takes them over and stamps the mask, so the new
+  reference is never decoded or prepared twice, and at most two `Image`s are
+  alive at once.
+- **State.** Per frame-0 node: the base displacement `U(X0, k)` and an `alive`
+  flag. Also the reference index, the frames since the last update, and the
+  reference's mask and ROI.
+- **Errors and cancel.** Every state change happens after a successful solve,
+  so a negative return leaves the session as it was.
+- **Between updates (N > 1)** every frame after the first one on a reference
+  reuses that reference's cached grid scan, Hessian pool and phase-correlation
+  side.
+- **Metrics** are the increment solve's; frame-0 counts are in
+  `IncrementalFrameInfo`.
+
+Tunables: `tuning::kIncTaylorMaxCells`, `kIncMaskNewtonIters`,
+`kIncMaskNewtonTolPx`, `kIncMaskExtrapCells`.
+
+---
+
 ## Module: `bridge/SemperJNI.cpp`
 
 JNI surface (see `SemperNativeLib.kt` for the Kotlin declarations).
@@ -258,6 +306,11 @@ Key behaviors:
   (`schedule(dynamic, 32)`), reliability-guided seed propagation, and
   progress callbacks marshalled through a `NewGlobalRef` + `AttachCurrentThread`.
 - Results are written into a direct `ByteBuffer` (no copy back through JNI).
+- `initializeIncremental(...)` / `computeIncrementalFrame(...)` /
+  `releaseIncremental()` (v0.4.0) drive one `IncrementalSession` under the same
+  mutex. `initializeIncremental` drops the fixed-reference cache, since only one
+  of the two paths runs at a time. `computeIncrementalFrame` fills an optional
+  `int[6]` with the frame info.
 - `setCancelRequested(...)` sets the cooperative cancel flag. It takes **no
   lock** on purpose: `computeFullFieldDirect` holds the reference-cache mutex
   for the whole solve, so a cancel that waited for it could never arrive while
@@ -317,11 +370,11 @@ starts — a pending edit can never reach the engine uncommitted.
 
 | Path | Role |
 |---|---|
-| `include/semper/` | Public headers (`types`, `image`, `subset`, `solver`, `strain`, `simd`, `pipeline`, `io`, `seeding`, `semper_c.h`) |
+| `include/semper/` | Public headers (`types`, `image`, `subset`, `solver`, `strain`, `simd`, `pipeline`, `incremental`, `io`, `seeding`, `semper_c.h`) |
 | `src/math/` | Image / SubsetPrecomputer / OptimizationEngine |
 | `src/strain/` | StrainCalculator |
 | `src/io/` | Platform-agnostic OpenCV decode |
-| `src/pipeline/` | Anchor seeding (phase correlation + lattice) + full-field Path A/B/C + OpenMP |
+| `src/pipeline/` | Anchor seeding (phase correlation + lattice) + full-field Path A/B/C + OpenMP; incremental session (composition, mask warp) |
 | `adapters/android/` | JNI only → `libsemper_core.so` |
 | `adapters/c/` | Stable C ABI → `libsemper_c` |
 | `bindings/python/` | pybind11 module |

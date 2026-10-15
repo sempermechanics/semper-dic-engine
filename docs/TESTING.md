@@ -430,6 +430,8 @@ solver skips them. OpenCV-gated.
 | `Relifecycle_UpdatesDims` | Re-`set_from_gray` with a new size updates the cached dimensions | Stale dimension state leaks across references |
 | `EmptyInput_LeavesCacheCleared` | Empty gray clears the cache (`width == 0`, `ref_img == nullptr`) instead of retaining the old reference | A failed re-init silently solves against the previous frame |
 | `Reset_ClearsEverything` | `reset()` frees and zeroes all state | Double-free or leak on teardown |
+| `Adopt_EqualsSetFromGray_NoMask` / `_WithMask` | `adopt()` of an image prepared by the solver gives the same intensities and gradients, bit for bit, as `set_from_gray` of the same pixels, sentinels included | An incremental reference update would solve against a different image than a fresh reference would |
+| `Adopt_NullImage_LeavesCacheCleared` | Adopting nothing clears the cache rather than keeping the old reference | A failed hand-off silently solves against a stale reference |
 
 Compile-time `static_assert`s pin `ReferenceCache` as non-copyable/non-movable
 (§A.2 of the contract) regardless of OpenCV.
@@ -450,6 +452,9 @@ quality. OpenCV-gated.
 | `MetricsLayout_Contract` | attempted ≥ solved ≥ 0; `rejected == attempted − solved`; convergence % ∈ [0,100]; seed flag ∈ {0,1,2} | A downstream telemetry reader mis-parses the Frozen slots |
 | `MetricsLen16_LeavesSlot16Untouched` | `metrics_len == 16` fills 0..15 and never writes slot 16 | Write past a 16-float caller buffer |
 | `NullMetrics_DoesNotCrash` | `metrics == nullptr` is legal | Null-deref when a caller wants points only |
+| `RefCache_SequenceOnOneCache_BitIdenticalToFresh` | Five frames solved against one cache give the same bytes as five fresh caches, on a DFT-optimal ROI with the 6×6 interpolator | The per-reference cache (grid scan, Hessian pool, phase-correlation reference) changed a result. This test caught `cv::phaseCorrelate` windowing a cached input in place |
+| `RefCache_InvalidatesOnParamsOrMask` | Changing `step`, `subset_size`, `rect` or the mask between solves gives the same result as a fresh cache | A stale grid scan or Hessian pool reused for a different grid |
+| `RefCache_CancelledSolveDoesNotPoisonCache` | A solve cancelled during the pre-pass, then repeated, matches a fresh solve | A partly filled Hessian pool cached as complete |
 | `MetricsPointCountsAccountForEverySolvedPoint` | `metrics[3] + metrics[4] + metrics[19] == metrics[1] + metrics[20]`, anchors > 0, mean ICGN iters ≥ 1, slot 18 > 0 | A solving path or a post-filter drop stops being counted — the failure mode that hid the anchor lattice from slots 3/4 and the strain post-filter from everything |
 
 ## Suite: `GoldenCorpus` — `integration/test_golden_corpus.cpp`
@@ -604,6 +609,64 @@ Synthetic speckle, because TIFF decoding crashes in the MinGW host build.
 | `TwoFrameBatch_BitIdentical` | Two load steps against one cache: every output byte and the Path A / Path B point counts repeat | A parallel phase (pre-pass, Path A, Path B flood) depends on thread timing |
 | `MaskedHole_BitIdentical` | Same under a ROI mask with a hole, where Path B solves most of the field | As above; this case exposed the Path B claim race (app TD-65) |
 
+## Suite: `Incremental` — `integration/test_incremental.cpp`
+
+`IncrementalSession` on sequences with exact ground truth
+(`framework/sequence.h`): every frame is rendered from one analytic speckle
+(`SmoothSpeckleField`, Gaussian blobs truncated at 4σ so the texture is smooth)
+under a known motion, so total displacement and Green-Lagrange strain at each
+frame-0 node are known in closed form. `SEMPER_INC_TRACE=1` prints per-frame
+error, an error map and a bias fit. OpenCV-gated.
+
+| Test | Proves | Failure would mean |
+|---|---|---|
+| `IntervalZero_BitIdenticalToRunFullField` | `update_interval = 0` equals `run_full_field` per frame, byte for byte, with and without a mask | The "off" setting changes results |
+| `FirstFrame_BitIdenticalToRunFullField` | With N = 1 the first frame equals `run_full_field` | Turning incremental on changes frames that never used a moved reference |
+| `UpdateSchedule_FollowsInterval` | `reference_frame` / `reference_updated` follow 0,0,0,3,3,3,… for N = 3 | The reference moves on the wrong frame |
+| `StretchRotation_TracksWhereFixedReferenceDegrades` | 448², 20 frames to 40% stretch and 30° rotation: N = 1 keeps ≥ 98% of frame-0 nodes, rms U ≤ 0.10 px, rms strain ≤ 5e-3, and more nodes within 0.2 px than the fixed reference. Measured: 196/196 nodes, rms 0.047 px | Composition or the mask warp broke, or incremental no longer helps where it should |
+| `MaskedSequence_TracksMaterialInsideMask` | Ring mask with a hole, 10 frames to 15% stretch and 8°: every reported point is a frame-0 node inside the mask, ≥ 85% of frame-1's points remain, rms U ≤ 0.15 px | The mask is not carried with the material, so subsets cross the hole edge after an update |
+| `LostNodesNeverReturn` | A 70 px drift carries part of the ROI past the image-edge margin: `tracked_points` never increases and ends below the frame-0 count | A lost node comes back with a stale base |
+| `RepeatRun_BitIdentical` | The same sequence twice gives the same bytes | Run-to-run nondeterminism in composition or the mask warp |
+| `Contracts_ErrorCodes` | `-3` before `init`, for a wrong-size frame and for a null buffer; `-2` / `-4` / `-3` from `init` | The documented codes drifted |
+| `Cancel_LeavesSessionUnchanged` | A frame cancelled mid-solve, then resubmitted, gives the same bytes as an uncancelled run | A cancelled frame half-updates the session |
+| `LongHorizon_160Frames` | 256², 160 frames of 0.1% stretch (16% total), noise σ = 1, N = 1 and N = 5: ≥ 95% of nodes tracked, rms U ≤ 0.45 / 0.35 px, rms strain ≤ 3.5e-2, RSS growth < 16 MB. Measured: rms 0.31 (N = 1), 0.22 (N = 5), fixed 0.05 | Error growth over a long horizon got worse, or memory leaks per reference update |
+
+The long-horizon bounds are wide on purpose. On slow loading each increment is
+a small sub-pixel step, and the per-solve interpolation bias at that step has
+one sign, so it adds up roughly linearly with the number of updates. That is
+the known cost of incremental DIC, not a defect; see MATHEMATICS.md §9.5 and
+INCREMENTAL_BENCHMARK.md.
+
+## Suite: `IncrementalMath` — `unit/test_incremental_math.cpp`
+
+| Test | Proves |
+|---|---|
+| `Sample_OnNode_ReturnsNodeExactly` | Sampling at a node returns its value, not an interpolation |
+| `Sample_Bilinear_ReproducesLinearField` / `Sample_TaylorFallback_ReproducesLinearField` | Both sampling paths are exact for a linear increment field |
+| `Sample_TooFarFromAnyNode_IsInvalid` | Beyond 1.5 cells from any valid node the sample fails |
+| `Sample_CorrIsWorstContributor` | The reported ZNSSD is the max of the contributing nodes |
+| `NodeField_DropsUnsolvedAndOutliers` | Unsolved nodes, negative ZNSSD and median-test outliers are not sampled |
+| `MaskWarp_ZeroDisplacement_IsIdentity` / `_Translation_ShiftsMask` / `_Stretch_ScalesArea` | The inverse mask warp is exact for identity and translation, and the area of a stretched mask is within 1% |
+| `MaskWarp_NoValidNode_IsEmpty` | No tracked node, no material |
+
+## Suite: `DiceIncremental` — `dice/test_incremental_oht.cpp`
+
+DICe's open-hole tension images `oht_cfrp_00 → 01 → 03 → 06 → 11` through an
+`IncrementalSession` (N = 1, subset 27, Keys 6×6, step 7 so every DICe point is a
+grid node), compared with DICe's fixed-reference solutions. The fixed-reference
+full field on the same grid is logged next to it.
+
+| Rung | Incremental rms du / dv (px) | Fixed rms du / dv (px) |
+|---|---|---|
+| 01 | 0.0006 / 0.0006 | 0.0006 / 0.0006 |
+| 03 | 0.0124 / 0.0186 | 0.0011 / 0.0010 |
+| 06 | 0.0442 / 0.0230 | 0.0014 / 0.0017 |
+| 11 | 0.0584 / 0.0260 | 0.0024 / 0.0029 |
+
+All 230 points are compared on every rung. Most of the incremental error is a
+uniform u bias (mean du −0.054 px at rung 11), built up from u increments of
+about −0.2 px each. Bounds: ≥ 90% compared, rms < 0.1 px.
+
 ### C ABI contract — `tests/c/contract.c` (built with `SEMPER_BUILD_C_SDK`)
 
 Where `c/smoke.c` proves the happy path runs, `c/contract.c` pins the **Frozen
@@ -617,8 +680,11 @@ on. It runs in the `c-sdk-smoke` CI job and returns non-zero on any breach:
 - Runtime: null-argument guards → `INIT`, run-before-`set_reference` → `INIT`,
   degenerate ROI → `ROI`, the capacity-drop rule, the `metrics_len` rule,
   per-engine cancel independence, and the `MAJOR.MINOR.PATCH` version format.
+- Incremental session (v0.4.0): `sizeof`/`offsetof` of the six
+  `semper_incremental_info` fields, null guards, process-before-init → `INIT`.
+  `c/smoke.c` runs two 3 px frames and checks a 6 px total.
 - **Golden symbols** (`tests/c/abi_symbols.txt`): CI diffs `nm -D` of
-  `libsemper_c.so` against the six documented exports, so an accidental export or
+  `libsemper_c.so` against the documented exports, so an accidental export or
   a dropped `SEMPER_C_API` annotation fails the build.
 
 ## Coverage (report-only)

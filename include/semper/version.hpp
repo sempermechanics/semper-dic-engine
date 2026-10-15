@@ -14,7 +14,7 @@
 // under include/semper/ that A.1 lists as Internal (seeding.hpp, tuning.hpp,
 // types.hpp) are exempt.
 #define SEMPER_VERSION_MAJOR 0
-#define SEMPER_VERSION_MINOR 3
+#define SEMPER_VERSION_MINOR 4
 #define SEMPER_VERSION_PATCH 0
 
 #define SEMPER_STRINGIFY_(x) #x
