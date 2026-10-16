@@ -323,6 +323,8 @@ Only five real frames exist, and the fixed reference correlates through all of t
 
 ![accuracy against cost, every scenario with noise](images/incremental/accuracy_vs_cost.png)
 
+This plot predates the update floor: there S4 2°/f N = 5 and N = 10 (σ = 2) still sit at their failed values. The re-run for the floor shared the host with other benchmarks, which inflated its frame times by up to 1.4×, so it was not used for cost.
+
 On frames that keep the reference (N > 1), the per-reference cache (node scan and Hessian pool) is reused, so `hold ms` is at or below `upd ms`.
 
 **Rotation-aware seeding.** On the 110 px ROI here, the log-polar estimate costs about 0.55 ms per solve on top of the 0.25 ms translation correlation (0.8 ms against 0.25 ms; at 200 px it is 0.9 against 0.7 ms, and at 320 px it is cheaper than the translation correlation). The reference half is prepared once per reference. It runs on every solve, in every mode, because only its result decides whether the similarity is used. Its effects:
