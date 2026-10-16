@@ -61,8 +61,13 @@ inline constexpr float kAnchorFullCoverage = 0.30f;
 inline constexpr float kPhaseCorrMinResponse = 0.05f;
 
 /** Log-polar (Fourier-Mellin) rotation/scale estimate: peak response below
- *  which the estimate is not trusted and seeding stays translation-only. */
-inline constexpr float kLogPolarMinResponse = 0.05f;
+ *  which the estimate is not trusted and seeding stays translation-only.
+ *  A turn the estimate resolves scores 0.27-0.86 on a 110 px ROI at sigma
+ *  0-4 GL (0.24 at 80 px, sigma 2); a uniaxial stretch of 10% or more, which
+ *  a similarity cannot describe, scores 0.11-0.20. Below 0.2 such frames
+ *  would pass to the anchor lattice, fail kSimilarityKeepFraction and be
+ *  solved twice (docs/SEEDING_BENCHMARK.md 4.5.2). */
+inline constexpr float kLogPolarMinResponse = 0.2f;
 
 /** Log-polar estimate: the square crop it is taken from. Below the minimum
  *  side the spectrum is too coarse in angle to be worth correlating; above the

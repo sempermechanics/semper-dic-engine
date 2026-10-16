@@ -439,10 +439,10 @@ MeshSeedResult solve_anchor_seeds(
     out.scale = (float)gm.scale;
 
     LOGD("ROUTING: anchor lattice %d/%d kept (%d as output, cov %.2f, phase %s, "
-         "rot %.2f deg x%.4f %s) -> quality %d",
+         "rot %.2f deg x%.4f lp %.3f %s) -> quality %d",
          out.accepted, out.attempted, out.solved, (double)out.coverage,
          out.phase_locked ? "locked" : "none", (double)out.rotation_deg,
-         (double)out.scale,
+         (double)out.scale, gm.lp_response,
          out.similarity ? "applied"
                         : out.similarity_rejected ? "rejected, translation lattice used"
                                                   : "not applied",

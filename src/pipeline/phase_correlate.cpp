@@ -30,8 +30,8 @@ namespace {
 
 // Log-polar grid. Rows sample angle over [0, pi) -- the magnitude spectrum of a
 // real image is point-symmetric, so the other half repeats it and the angle
-// axis is exactly periodic, which is what the FFT inside phaseCorrelate
-// assumes. 256 rows is 0.70 deg per row before sub-pixel peak refinement.
+// axis is exactly periodic, which is what the FFT of the correlation assumes.
+// 256 rows is 0.70 deg per row before sub-pixel peak refinement.
 // Columns sample log-radius between kLpRadiusLo and kLpRadiusHi of the
 // Nyquist radius: the low end drops the DC and window leakage, where angle is
 // also barely resolved; the high end stays clear of the corners, which a
@@ -40,6 +40,15 @@ constexpr int kLpAngles = 256;
 constexpr int kLpRadii = 128;
 constexpr double kLpRadiusLo = 1.0 / 8.0;
 constexpr double kLpRadiusHi = 0.9;
+
+// The log-polar peak is located by its response, the sum of the correlation
+// surface over this window centred on it (cv::phaseCorrelate's definition),
+// and refined to sub-pixel by the weighted centroid over the same window.
+constexpr int kLpPeakWin = 5;
+
+// Within this many degrees of the +-90 deg wrap, the turn 180 deg away is
+// verified too (phase_correlate_similarity).
+constexpr double kLpWrapMarginDeg = 10.0;
 
 // |F| of the windowed, mean-removed crop, quadrant-swapped so DC sits at
 // (N/2, N/2). N is even, so the swap is its own inverse.
@@ -74,6 +83,67 @@ cv::Mat log_polar_of(const cv::Mat &img, const PhaseCorrRef &ref) {
     lp += 1.0;
     cv::log(lp, lp);
     return lp;
+}
+
+// DFT of the log-polar image times its window.
+cv::Mat lp_spectrum(const cv::Mat &lp, const cv::Mat &win) {
+    cv::Mat w, F;
+    cv::multiply(lp, win, w);
+    cv::dft(w, F, cv::DFT_COMPLEX_OUTPUT);
+    return F;
+}
+
+// Phase correlation of two log-polar images, given the reference's spectrum.
+// Same normalised cross-power spectrum, response and sign as
+// cv::phaseCorrelate(ref, def), except where the peak is looked for.
+// cv::phaseCorrelate takes the single highest sample of the correlation
+// surface. Whitening spreads the log-polar peak of a noisy ROI over several
+// samples, while the noise it whitens is a field of one-sample spikes: on a
+// 110 px ROI at sigma = 2 GL the true peak has a response near 0.45 and the
+// highest sample is still usually a spike with a response near zero. So the
+// peak is taken where the response itself is largest.
+cv::Point2d lp_phase_correlate(const cv::Mat &ref_F, const cv::Mat &def_lp,
+                               const cv::Mat &win, double &response) {
+    const cv::Mat def_F = lp_spectrum(def_lp, win);
+    cv::Mat P(def_F.size(), CV_32FC2);
+    for (int y = 0; y < P.rows; ++y) {
+        const cv::Vec2f *a = ref_F.ptr<cv::Vec2f>(y);
+        const cv::Vec2f *b = def_F.ptr<cv::Vec2f>(y);
+        cv::Vec2f *p = P.ptr<cv::Vec2f>(y);
+        for (int x = 0; x < P.cols; ++x) {
+            // a conj(b) / |a conj(b)|
+            const float re = a[x][0] * b[x][0] + a[x][1] * b[x][1];
+            const float im = a[x][1] * b[x][0] - a[x][0] * b[x][1];
+            const float m = std::sqrt(re * re + im * im);
+            p[x] = m > 0.0f ? cv::Vec2f(re / m, im / m) : cv::Vec2f(0.0f, 0.0f);
+        }
+    }
+    cv::Mat C;   // peak height 1 for identical inputs
+    cv::dft(P, C, cv::DFT_INVERSE | cv::DFT_REAL_OUTPUT | cv::DFT_SCALE);
+
+    // Response at every sample: the window sum, periodic in both axes as the
+    // DFT is.
+    const int H = C.rows, W = C.cols, h = kLpPeakWin / 2;
+    cv::Mat padded, sums;
+    cv::copyMakeBorder(C, padded, h, h, h, h, cv::BORDER_WRAP);
+    cv::boxFilter(padded, sums, CV_32F, cv::Size(kLpPeakWin, kLpPeakWin), cv::Point(-1, -1),
+                  false, cv::BORDER_CONSTANT);
+    cv::Point loc;
+    cv::minMaxLoc(sums(cv::Rect(h, h, W, H)), nullptr, &response, nullptr, &loc);
+
+    double sx = 0.0, sy = 0.0;
+    for (int dy = -h; dy <= h; ++dy)
+        for (int dx = -h; dx <= h; ++dx) {
+            const float v = C.at<float>((loc.y + dy + H) % H, (loc.x + dx + W) % W);
+            sx += v * dx;
+            sy += v * dy;
+        }
+    double py = loc.y, px = loc.x;
+    if (response != 0.0) { py += sy / response; px += sx / response; }
+    // C peaks at minus the shift of def against ref, modulo the size.
+    if (py > H / 2.0) py -= H;
+    if (px > W / 2.0) px -= W;
+    return cv::Point2d(-px, -py);
 }
 
 } // namespace
@@ -121,6 +191,7 @@ PhaseCorrRef prepare_phase_correlate_ref(const cv::Mat &ref, const cv::Rect &roi
     }
 
     out.lp_ref = log_polar_of(ref, out);
+    out.lp_ref_F = lp_spectrum(out.lp_ref, out.lp_win);
     return out;
 }
 
@@ -167,10 +238,9 @@ bool log_polar_rotation_scale(const PhaseCorrRef &ref, const cv::Mat &def,
     const cv::Rect &r = ref.lp_rect;
     if (r.x + r.width > def.cols || r.y + r.height > def.rows) return false;
 
-    cv::Mat lp_def = log_polar_of(def, ref);
-    cv::Mat lp_ref = ref.lp_ref.clone();   // phaseCorrelate windows in place
     double response = 0.0;
-    const cv::Point2d shift = cv::phaseCorrelate(lp_ref, lp_def, ref.lp_win, &response);
+    const cv::Point2d shift =
+            lp_phase_correlate(ref.lp_ref_F, log_polar_of(def, ref), ref.lp_win, response);
     out_response = response;
     if (!(response > (double)tuning::kLogPolarMinResponse)) return false;
 
@@ -211,30 +281,47 @@ void phase_correlate_similarity(const PhaseCorrRef &ref, const cv::Mat &def,
     // s R - I is itself a scaled rotation, so its operator norm is just the
     // length of its first column; times the half-diagonal, that is how far the
     // bare translation is off at the ROI corners.
-    const double a = s * std::cos(theta) - 1.0, b = s * std::sin(theta);
     const double arm = 0.5 * std::hypot((double)r.width, (double)r.height);
-    if (!(arm * std::hypot(a, b) > (double)tuning::kSimilarityMinCornerPx)) return;
+    if (!(arm * std::hypot(s * std::cos(theta) - 1.0, s * std::sin(theta)) >
+          (double)tuning::kSimilarityMinCornerPx))
+        return;
 
     // Undo the rotation and scale about the ROI centre: sample the deformed
     // image at c + s R (x - c). What remains is a pure translation t' with
     // t = s R t'. The source is the whole image, so a turned ROI still finds
     // the pixels that rotated out of its rectangle.
-    const double sc = s * std::cos(theta), ss = s * std::sin(theta);
     const double x0 = r.x - out.cx, y0 = r.y - out.cy;
-    const cv::Mat M = (cv::Mat_<double>(2, 3) <<
-            sc, -ss, out.cx + sc * x0 - ss * y0,
-            ss,  sc, out.cy + ss * x0 + sc * y0);
-    cv::Mat undone;
-    cv::warpAffine(def, undone, M, r.size(), cv::INTER_LINEAR | cv::WARP_INVERSE_MAP,
-                   cv::BORDER_REPLICATE);
-    cv::Mat und32;
-    undone.convertTo(und32, CV_32F);
-    cv::Mat ref32 = ref.ref32.clone();
+    const auto undo_and_correlate = [&](double th, double &resp) {
+        const double c_ = s * std::cos(th), s_ = s * std::sin(th);
+        const cv::Mat M = (cv::Mat_<double>(2, 3) <<
+                c_, -s_, out.cx + c_ * x0 - s_ * y0,
+                s_,  c_, out.cy + s_ * x0 + c_ * y0);
+        cv::Mat undone;
+        cv::warpAffine(def, undone, M, r.size(), cv::INTER_LINEAR | cv::WARP_INVERSE_MAP,
+                       cv::BORDER_REPLICATE);
+        cv::Mat und32;
+        undone.convertTo(und32, CV_32F);
+        cv::Mat ref32 = ref.ref32.clone();
+        return cv::phaseCorrelate(ref32, und32, ref.hann, &resp);
+    };
     double r1 = 0.0;
-    const cv::Point2d tp = cv::phaseCorrelate(ref32, und32, ref.hann, &r1);
+    cv::Point2d tp = undo_and_correlate(theta, r1);
+    // The spectrum cannot tell theta from theta + 180 deg. Within
+    // kLpWrapMarginDeg of the +-90 deg wrap both are plausible -- a 90.3 deg
+    // turn reads as -89.7 -- and the wrong one can still clear the checks
+    // below on a noisy frame, so the image decides between them there.
+    if (std::abs(theta) > CV_PI / 2.0 - kLpWrapMarginDeg * CV_PI / 180.0) {
+        const double alt = theta > 0.0 ? theta - CV_PI : theta + CV_PI;
+        double r_alt = 0.0;
+        const cv::Point2d tp_alt = undo_and_correlate(alt, r_alt);
+        if (r_alt > r1) { theta = alt; r1 = r_alt; tp = tp_alt; }
+    }
     if (!(r1 > (double)tuning::kPhaseCorrMinResponse) || !(r1 > r0)) return;
     if (!(std::abs(tp.x) < 1e6 && std::abs(tp.y) < 1e6)) return;
 
+    out.theta_rad = theta;
+    const double sc = s * std::cos(theta), ss = s * std::sin(theta);
+    const double a = sc - 1.0, b = ss;
     out.u = sc * tp.x - ss * tp.y;
     out.v = ss * tp.x + sc * tp.y;
     out.ux = a;  out.uy = -b;

@@ -480,7 +480,10 @@ Implementation details, each for a stated reason:
   $|F(\bm{k})| = |F(-\bm{k})|$, so $\phi$ is sampled over $[0, \pi)$ in 256
   rows. That makes the $\phi$ axis exactly periodic, which is what the FFT
   inside the correlation assumes, and it means $\theta$ is recovered modulo
-  $180°$, i.e. in $(-90°, 90°)$.
+  $180°$, i.e. in $(-90°, 90°)$. Within $10°$ of the wrap both readings are
+  plausible (a $90.3°$ turn reads $-89.7°$), so there the image decides:
+  both $\theta$ and $\theta \mp 180°$ are undone and correlated as below, and
+  the stronger translation peak wins. That extends the range to $\pm 100°$.
 * **Radial band.** $\rho$ is sampled in 128 columns, log-spaced between
   $N/16$ and $0.45N$. The low end excludes the DC term and the Hann window's
   leakage, where the angle is also barely resolved; the high end stays inside
@@ -488,6 +491,24 @@ Implementation details, each for a stated reason:
   since tapering the periodic $\phi$ axis would just discard signal.
 * **$\log(1 + |F|)$.** This compresses the dynamic range so the strongest low
   frequencies do not dominate the correlation.
+* **Peak by response.** The cross-power spectrum is normalised as in §8.1,
+  and the response of a peak is, as in `cv::phaseCorrelate`, the sum of the
+  correlation surface over the $5 \times 5$ window centred on it. But the peak
+  is placed where that sum is largest, not at the highest single sample.
+  Normalising the spectrum whitens it: noise becomes a field of one-sample
+  spikes, while the log-polar peak, which is smooth in $\phi$ at small radii
+  and blurred by the window, is spread over several samples. On a 110 px ROI
+  at $\sigma = 2$ the true peak has a response near 0.45, yet the highest
+  single sample is almost always a spike whose own response is between
+  $-0.1$ and $0.04$, so no peak was reported. Searching the $5\times 5$ box
+  sums finds the peak; the sub-pixel position is the same weighted centroid
+  over that window. The reference's half of the correlation (its windowed
+  log-polar DFT) is computed once per reference.
+* **Response floor.** The estimate is trusted only when that response exceeds
+  $k_{\text{LogPolarMinResponse}} = 0.2$, four times the translation's 0.05.
+  Turns on a 110 px ROI score 0.27–0.86 from $\sigma = 0$ to 4; uniaxial
+  stretch of 10% or more, which a similarity cannot describe, scores
+  0.11–0.20.
 
 With $\theta$ and $s$ known, the deformed image is resampled at
 $\bm{c} + sR(\bm{x} - \bm{c})$, which by the model above leaves a pure
@@ -525,28 +546,34 @@ against a spurious estimate on content the log-polar correlation reads poorly.
 
 The third is the one a benchmark had to find. A similarity has no way to
 describe an anisotropic stretch, yet under a strong one the log-polar
-correlation still returns a peak (−5.8° × 0.92 for a 45% uniaxial stretch; about
-90° once noise is added). The translation peak is already weakened by the
-stretch, so condition 2 lets it through. Anchors seeded from that wrong model
-can converge, as a cluster, onto the wrong speckle. Such a cluster agrees with
+correlation can still return a peak (−42° for a 40% uniaxial stretch on a
+110 px ROI). The translation peak is already weakened by the stretch, so
+condition 2 can let it through. Anchors seeded from that wrong model can
+converge, as a cluster, onto the wrong speckle. Such a cluster agrees with
 itself, so neither the ZNSSD gate nor a median test of residuals from that same
 model rejects it. Nor can counting kept anchors choose between the two
-lattices: in the case pinned by `SeedBench.SimilarityFallsBackUnderStretch` the
-wrong lattice keeps 123 anchors and the translation-only one 86. A lattice that
+lattices: on that frame the wrong lattice kept 24 anchors at a median vertex
+error of 31.6 px, and the translation-only one 16 at 0.008 px. A lattice that
 keeps almost every anchor is the evidence that the model fits; a rotation it
-fits keeps ~100%.
+fits keeps ~100%. Since the response floor above, that frame (response
+0.145) and nearly all stretched frames stop before the lattice, and condition 3
+is a second line that rarely fires.
 
 On pure translation the estimate is not free: one $N^2$ DFT and a 256×128
-correlation, about 1.3 ms serial on a 320 px ROI. When condition 3 fails the
+correlation per solve, about 1.3 ms serial on a 320 px ROI, plus the
+reference's log-polar DFT once per reference. When condition 3 fails the
 lattice is solved twice, which is the translation-only cost plus the rejected
 attempt.
 
-**Where the estimate does not reach.** The correlation needs spectral signal
-above the noise in both frames. On a 110 px ROI at $\sigma = 2$ grey-level
-noise it finds no peak at all (response ≈ 0 from 5° to 45°), while on a 200 px
-ROI at the same noise it is within 0.05° at every angle tested. Below that size
-noisy frames therefore stay translation-only: never worse than before, and not
-helped either.
+**Where the estimate reaches.** On IncBench S4's frames (a turn to 90° in
+0.45° steps, three noise seeds) the similarity is applied with the angle
+within 1° and the centre within 1 px in every solve from about 3° to 90°, on
+a 110 px ROI at $\sigma = 0$ and 2 grey levels and on a 200 px ROI; at
+$\sigma = 2$ on 110 px the angle error is 0.27° rms. Below about 3° the
+corner gate keeps the translation. At $\sigma = 4$, or on an 80 px ROI at
+$\sigma = 2$, 1–8% of the solves are 1–2.3° off, which is at most 2.2 px at
+the ROI corners. [SEEDING_BENCHMARK.md](SEEDING_BENCHMARK.md) §4.5.2 has the
+measurement and the alternatives that were tried.
 
 ### 8.2 Anchor Lattice
 

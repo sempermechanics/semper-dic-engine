@@ -274,8 +274,15 @@ noise-free frame the field went from 0.014 to 0.215 px rms, and with noise
 frames were lost outright: 27 against 14 dropped in the ring-mask scenario.
 Counting kept anchors cannot pick the better lattice, since the bad one keeps
 more (123 against 86). Only a lattice that keeps nearly everything shows that
-the model fits. `SeedBench.SimilarityFallsBackUnderStretch` pins that frame:
-0.2150 px with the condition disabled, 0.0137 px with it.
+the model fits. `SeedBench.SimilarityFallsBackUnderStretch` pinned that frame:
+0.2150 px with the condition disabled, 0.0137 px with it. (Since §4.5.2 the
+estimate reads that frame as −6.1 deg × 0.897, the corrected peak no longer
+beats the uncorrected one, and the frame stops at the second condition with
+the same 0.0137 px. The test then pinned a 40% stretch that still reached the
+third, −42.4 deg, whose lattice kept 24 anchors at a 31.6 px median vertex
+error against the translation lattice's 16 at 0.008 px. That frame's
+log-polar response is 0.145, so §4.5.2's response floor now stops it before
+the lattice; the test asserts that.)
 
 **Measured** on Ubuntu 22.04 (WSL2), GCC 11.4, `taskset -c 0-3`,
 `SEMPER_SEEDBENCH_REPEATS=11`, both columns on the same host. "Before" is
@@ -331,18 +338,184 @@ What it costs:
   regresses by the estimate's 1.3–1.6 ms; from 2 deg up, CPU is lower.**
 - **Limits.**
   - The magnitude spectrum repeats every 180 deg, so rotation is recovered in
-    (−90, 90) deg. Scale is accepted in (0.5, 2).
+    (−90, 90) deg; within 10 deg of the wrap both readings are checked
+    against the image (§4.5.2), which extends that to ±100 deg. Scale is
+    accepted in (0.5, 2).
   - An ROI whose short side is under 64 px gets no estimate and stays
     translation-only — a 1000×30 beam ROI, for example.
-  - **Small noisy ROIs get nothing from it.** At σ = 2 grey-level noise, the
-    log-polar correlation finds no peak on a 110 px ROI from 5 to 45 deg,
-    while on a 200 px ROI it is within 0.05 deg at every angle. Such frames
-    stay translation-only, as before. Dropping the log compression rescues
-    most of the noisy 110 px cases, but breaks noise-free ones at 20–45 deg,
-    so it is not a drop-in fix.
-  - Anisotropic stretch is outside the model. The third condition above
-    returns such frames to the translation-only result, at the cost of
-    solving the lattice twice.
+  - ~~Small noisy ROIs get nothing from it.~~ Fixed in §4.5.2. As first
+    measured: at σ = 2 grey-level noise the log-polar correlation found no
+    peak on a 110 px ROI from 5 to 45 deg, while on a 200 px ROI it was
+    within 0.05 deg at every angle. Dropping the log compression rescued most
+    of the noisy 110 px cases but broke noise-free ones at 20–45 deg. The
+    cause turned out to be where the peak was looked for, not the spectrum.
+  - Anisotropic stretch is outside the model. Since §4.5.2 most such frames
+    score under the log-polar response floor and stay translation-only at no
+    extra cost; the few that pass it are returned to the translation-only
+    result by the third condition above, at the cost of solving the lattice
+    twice.
+
+#### 4.5.2 Fixed: the log-polar peak on small noisy ROIs
+
+IncBench S4 ([INCREMENTAL_BENCHMARK.md](INCREMENTAL_BENCHMARK.md)) turns a
+256 px image about its centre and correlates a centred 110 px ROI. At
+σ = 2 GL, §4.5.1's estimate locked in only 0–7 of the 30 fixed-reference
+solves per 10 frames between 5° and 85°, so the fixed reference lost coverage
+from about 7° on, as it had without the estimate.
+
+**Cause: the peak search, not the spectrum.** `cv::phaseCorrelate` puts the
+peak at the highest single sample of the correlation surface and reports, as
+the response, the 5×5 sum around it. Normalising the cross-power spectrum
+whitens it, which turns noise into a field of one-sample spikes. The log-polar
+peak, on the other hand, is spread over several samples: the spectrum varies
+slowly in angle at small radii, and the window blurs it. On these frames the
+true peak's response is 0.35–0.55, far above the 0.05 the estimate requires.
+But the tallest single sample is almost always a spike elsewhere, whose own
+response is −0.1 to 0.04. So the estimate reported no peak. A 200 px ROI has
+a peak tall enough to win the single-sample search as well.
+
+**Fix.** The estimate now runs its own phase correlation (same normalised
+cross-power spectrum, response and sign convention) and puts the peak where
+the response is largest: it box-sums the surface over 5×5 (periodically, as
+the DFT is) and takes the maximum. The sub-pixel position is the same
+weighted centroid over that window. The reference's windowed log-polar DFT is
+computed once per reference instead of on every solve. The translation
+correlation is untouched, so the translation-only path stays bit-identical:
+`FullFieldGolden` passes without recapture, and `LogPolarRotationScale`'s
+small-motion cases still match `phase_correlate_roi` bit for bit.
+
+One related change: near ±90° the estimate wrapped to its 180° partner
+(a 90.0° turn read as −89.4°), and on a noisy frame that wrong turn could
+still beat the uncorrected translation peak. Within 10° of the wrap, both
+readings are now undone and correlated, and the stronger peak wins. That
+costs one more translation correlation on those frames only.
+
+**Measured** with `SeedBench.LogPolarS4Sweep` on IncBench S4's frames (turn
+to 90° in 0.45° steps, three noise seeds, the fixed reference: 600 solves, 300
+of them up to 45°). A solve counts as locked when the similarity is applied
+with the angle within 1° and the centre within 1 px:
+
+| ROI, noise | locked to 45° (of 300) | locked to 90° (of 600) | applied but off by ≥ 1° or ≥ 1 px | worst error when applied |
+|---|---|---|---|---|
+| 110 px, σ = 2 | 22 → **283** | 63 → **583** | 13 → **0** | 2.25° → 0.76° |
+| 110 px, σ = 0 | 204 → **282** | 456 → **582** | 3 → 0 | 1.13° → 0.31° |
+| 110 px, σ = 4 | 5 → **282** | 19 → **581** | 18 → 6 | 94.5° → 1.34° |
+| 200 px, σ = 2 | 291 → 291 | 591 → 591 | 0 → 0 | 0.27° → 0.25° |
+| 80 px, σ = 2 | 1 → **259** | 10 → **533** | 31 → 45 | 151.5° → 2.23° |
+| 80 px, σ = 0 | 18 → **273** | 33 → **573** | 30 → 0 | 110.4° → 0.72° |
+
+Locks per 10 frames on the 110 px ROI at σ = 2, of 30:
+
+| frames | 1–10 | 11–20 | 21–30 | 31–40 | 41–50 | 51–60 | 61–70 | 71–80 | 81–90 | 91–100 | 101–190 | 191–200 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| before | 5 | 2 | 2 | 2 | 4 | 2 | 2 | 1 | 2 | 0 | 0–7 | 14 |
+| after | 13 | 30 | 30 | 30 | 30 | 30 | 30 | 30 | 30 | 30 | 30 each | 30 |
+
+The first bucket cannot reach 30. Up to 2.7° (frame 6) the turn moves this
+ROI's corners by less than `kSimilarityMinCornerPx`, so the translation is
+kept by design. Locked angles are 0.27° rms off at σ = 2 on 110 px (0.12° at
+σ = 0, 0.08° on 200 px). At σ = 4 and on 80 px the old estimate applied
+similarities up to 94–152° off; the new one is never more than 2.3° off,
+which moves those ROIs' corners by at most 2.2 px.
+
+**Alternatives that were measured first**, on the same sweep (110 px,
+σ = 2). They were counted with a stricter 0.5° tolerance, under which the
+shipped fix locks 267 of 300 to 45°:
+
+| change to §4.5.1's estimate | locked to 45° (0.5° tol.) |
+|---|---|
+| none | 19 |
+| radially symmetric (raised-cosine disc) window instead of the separable Hann | 21 |
+| radius band ending at 0.25 N, where σ = 2 noise overtakes this speckle | 14 (20 with the disc window) |
+| no log compression, \|F\| | 114, with many of the rest applied 0.5–1° off |
+| each radius whitened (log spectrum to zero mean, unit variance over angle) | 31 |
+| … and weighted by its SNR/(1 + SNR), noise floor read beyond the Nyquist circle | 57 (71 with the disc window) |
+| whitened \|F\| × SNR weight, disc window | 160 |
+| four highest samples, ranked by response, each verified by the rotation-corrected translation peak | 192 (199 with the disc window) |
+| **peak by response (shipped)** | **267** |
+
+The partial gains fit the peak search being the problem: dropping the log
+or weighting by SNR concentrates the peak on fewer samples, and ranking
+candidates by response is the fix applied to four samples only. Once the
+peak is placed by response, the disc window, a band ending at 0.3 N instead
+of 0.45 N, SNR weighting and dropping the log each left the 1°-tolerance
+count within 3 of 300 (283 → 282–286), and verifying three candidates added
+nothing (283). None of them ships. A log-polar crop larger than the ROI was
+not tried. It is not needed here, and it would read material the user left
+out of the ROI, such as background or grips that do not turn with the
+specimen, which would add a 0° peak.
+
+**Stretch, and a response floor.** Placing the peak by response also finds
+a peak on stretched frames, where the old search mostly found a spike and
+gave up. A similarity cannot describe a stretch, so these peaks are weak but
+not absent. With the estimate's floor left at the translation's 0.05, they
+passed to the anchor lattice, failed the keep fraction (§4.5.1, third
+condition) and were solved twice. The seeds and fields came out unchanged,
+but CPU did not: IncBench's stretch scenarios (S2, S5, S6, S8, S9) solved the
+lattice twice on 11–74 of every 800 quick-mode solves. Over full-mode S2 that
+was 417 solves, against 6 before, and S2's fixed reference used 17–23% more
+CPU.
+
+The estimate now needs a response of 0.2 (`tuning::kLogPolarMinResponse`).
+The two families separate, measured on frames rendered like IncBench's
+(256 px image, 110 px ROI unless noted):
+
+| frames | log-polar response |
+|---|---|
+| turns, 110 px ROI, σ = 0–4 | 0.27–0.86 |
+| turns, 80 px ROI, σ = 2 | 0.24 and up |
+| uniaxial stretch ≥ 10%, with or without a turn | 0.11–0.20 |
+
+| floor | 110 px σ = 2 locked to 45° | 80 px σ = 4 locked to 45° | lattice solved twice, quick S2 / S5 / S8 / S6 / S9 (of 800 each) |
+|---|---|---|---|
+| 0.05 | 283 | 207 | 11 / 55 / 22 / 74 / 51 |
+| **0.20** | **283** | 199 | **1 / 0 / 2 / 2 / 3** |
+| 0.22 | 283 | 173 | 0 / 0 / 1 / 1 / 0 |
+| 0.25 | 283 | 100 | 0 / 0 / 0 / 0 / 0 |
+
+0.2 costs nothing on the 110 and 200 px rows of the table above, or on 80 px
+at σ = 2, and gives up 8 of 207 locks at 80 px σ = 4, the noisiest and
+smallest case measured. Higher floors cut into that case quickly.
+
+A frame can still reach the keep fraction. `SimilarityFallsBackUnderStretch`
+runs one: a 10% stretch turned by 15° reads +11.8° × 1.016 at response 0.214.
+Its similarity lattice keeps 435 of 484 anchors (89.9%, routed `FULL`), just
+under the 90% bar. The translation lattice that replaces it keeps 77 (routed
+`SPARSE`). The field is 0.0148 px rms either way. Here the fallback costs a
+second solve and keeps the poorer lattice, so 0.90 may now be stricter than
+it needs to be. That is left for IncBench to show (below); this change does
+not touch it.
+
+**Cost.** At 0–2°, where a 110 px ROI never applies the similarity and
+every solve pays for the estimate for nothing, the per-solve cost went down.
+Measured with `SeedBench.LogPolarCost` (`SEMPER_LP_COST=1`), one core
+(`taskset`), 400 calls per cell, median of five passes alternating the
+§4.5.1 and §4.5.2 builds. The host was loaded by other jobs on other cores.
+
+| ROI | L0 CPU per solve, µs (translation + estimate) | estimate alone | reference prep, once per reference |
+|---|---|---|---|
+| 110 px, σ = 0 and 2, 0/1/2° | 1707–1850 → 1586–1739 (−12% to +2%) | 1235–1397 → 1094–1256 | 827–842 → 1052–1125 |
+| 320 px, σ = 0 and 2, 0/1/2° | 6032–9975 → 5910–10078 (−4% to +1%) | 2519–6456 → 2241–6454 | 2546–2841 → 2767–2790 |
+
+The saving is the reference's log-polar DFT, now computed once per reference
+instead of on every solve. The box sum and the wider centroid cost less than
+that. Prep grows by 0.2–0.3 ms on 110 px, once per reference. At 320 px the
+1° and 2° cells apply the similarity in both builds and cost the same.
+`LargeMotionSweep`'s field CPU, three alternated runs each: 0.975× at 2° and
+0.985–0.998× on the translation rows, with identical field rms.
+
+**IncBench.** These are re-runs of S4 and the stretch scenarios against
+`5ea4fc0`; [INCREMENTAL_BENCHMARK.md](INCREMENTAL_BENCHMARK.md) has the tables.
+S4 at σ = 2 on the 110 px ROI now keeps the fixed reference at ≥ 90%
+coverage on all 600 solves at 0.45°/f (268 were below and 46 empty), and on
+every frame at 2°/f and 5°/f. Incremental steps of 10–50° track at σ = 2: at
+2°/f, N = 5 ends at 0.185 px / 95% instead of a wrong lock at 12.7 px, and
+N = 10 at 0.134 px / 97% instead of losing the chain. The lowest response of
+any similarity applied in S4 is 0.41, far above the floor. On S2, S5, S6, S8
+and S9 the printed cells are unchanged, or within 0.012 px and mostly lower.
+The exception is S6's fixed reference at frame 50, which improves from 0.233 to
+0.016 px. Summed CPU per frame is 0.976–0.994× `5ea4fc0`'s. S4's accuracy
+is identical, to every CSV column, at floors of 0.05 and 0.2.
 
 
 ## 5. Cost accounting
@@ -614,9 +787,13 @@ Seven gates now run unconditionally (four since 0.3.0, three since the rotation 
 - `SeedBench.AnchorSeedingRotationGate` promotes the 5 deg, 15 deg and combined
   10 deg + 5% + 20 px rows of LargeMotionSweep: similarity applied, `FULL`, hull
   coverage ≥ 0.90, mesh fraction ≥ 0.95, vertex error ≤ 0.05 px.
-- `SeedBench.SimilarityFallsBackUnderStretch` pins the fallback of §4.5.1 on
-  the IncBench frame that exposed it: the similarity is rejected and the field
-  stays at the translation-only 0.014 px, not 0.215 px.
+- `SeedBench.SimilarityFallsBackUnderStretch` pins the stretch guards of
+  §4.5.1 and §4.5.2: a 40% stretch the estimate once misread must score under
+  the log-polar response floor and seed from the translation alone, and a
+  10% stretch turned 15° that reaches the keep-fraction fallback must still
+  give a 0.015 px field.
+- `SeedBench.LogPolarNoisySmallRoi` pins §4.5.2: on IncBench S4's 110 px ROI
+  at σ = 2, twelve turns from 9.9° to 70.2° must lock within 1° and 1 px.
 
 Verified by perturbing the anchor stride by one in
 `src/pipeline/full_field_anchors.cpp`: the golden reports slots 3, 8, 19 and 22

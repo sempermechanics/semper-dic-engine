@@ -722,32 +722,42 @@ TEST_CASE(SeedBench, AnchorSeedingRotationGate) {
 }
 
 // ---------------------------------------------------------------------------
-// The similarity's failure mode, and its fallback. The log-polar estimate is
-// a rotation plus an isotropic scale; a strong uniaxial stretch is neither,
+// The similarity's failure mode, and its two guards. The log-polar estimate
+// is a rotation plus an isotropic scale; a strong uniaxial stretch is neither,
 // and IncBench found frames where it reported one anyway and the corrected
 // translation peak still beat a translation peak the stretch had already
-// weakened. This is the noise-free one: IncBench S5 ("stretch to 60%"),
-// frame 150, a 45% stretch with Poisson 0.3 on a 110 px ROI, which the
-// estimate reads as about -5.8 deg x 0.918. The lattice that seeds keeps
-// 123 of 484 anchors and publishes 114 of them; the field built on that
-// measured 0.215 px rms in IncBench against 0.014 px translation-only. The
-// fallback must hand this frame back to the translation-only lattice, which
-// keeps fewer anchors (86) -- so a rule that kept the larger lattice would
-// pick the wrong one.
+// weakened. This is a noise-free one, rendered like IncBench S5: a 40%
+// stretch with Poisson 0.3 on a 110 px ROI, which the estimate reads as about
+// -42 deg. Seeded from that, the lattice kept 24 of 484 anchors at a median
+// vertex error of 31.6 px: a self-consistent cluster on the wrong speckle.
 //
-// What the case does not fix: at 45% stretch the edge anchors' true
-// displacement is ~25 px, and from a zero-gradient seed some stick near zero
-// and still clear the loose vertex gate, in either lattice (p95 vertex error
-// ~25.7 px both ways). That is the translation-only seeder's behaviour too,
-// so it is reported here and not asserted.
+// The first guard is the log-polar response (tuning::kLogPolarMinResponse):
+// this frame scores 0.145, under the 0.2 floor, so the estimate is not
+// used and the frame is seeded from the translation alone (median vertex
+// error 0.008 px). The second, the lattice keep fraction
+// (tuning::kSimilarityKeepFraction), no longer sees this frame. The second
+// half of the case runs a frame that does reach it -- 10% stretch turned by
+// 15 deg, read as +11.8 deg x1.016 at response 0.214 -- and asserts only that
+// the field is right, whichever lattice seeds it: there the similarity lattice
+// keeps 435 of 484 (just under 90%) and the translation lattice that replaces
+// it keeps 77, yet the field comes out at 0.0148 px either way.
+//
+// History: the case first pinned S5 frame 150 (45% stretch), which the
+// estimate then read as -5.8 deg x 0.918 and whose similarity lattice made a
+// 0.215 px field against 0.014 px translation-only. Since the log-polar peak
+// is located by its response (docs/SEEDING_BENCHMARK.md 4.5.2) neither frame
+// reaches the lattice fallback.
+//
+// What the case does not fix: at 40% stretch the edge anchors' true
+// displacement is over 20 px, and from a zero-gradient seed some stick near
+// zero and still clear the loose vertex gate (p95 vertex error ~6.9 px). That
+// is the translation-only seeder's behaviour too, so it is reported here and
+// not asserted.
 // ---------------------------------------------------------------------------
 TEST_CASE(SeedBench, SimilarityFallsBackUnderStretch) {
     const int w = 384, h = 256;
     const dictest::SmoothSpeckleField field(101, w, h);
     const cv::Mat ref = dictest::render_frame(field, w, h, dictest::identity_motion(), 0.0f, 7919u);
-    const dictest::Motion m =
-            dictest::stretch_rotate(0.45, 0.3, 0.0, dictest::Vec2{}, dictest::Vec2{192, 128});
-    const cv::Mat def = dictest::render_frame(field, w, h, m, 0.0f, 7919u + 150u);
 
     FullFieldParams p;   // IncBench's grid: the app defaults, 110 px ROI centred
     p.rect_x = (w - 110) / 2;
@@ -758,40 +768,251 @@ TEST_CASE(SeedBench, SimilarityFallsBackUnderStretch) {
     p.subset_size = 21;
     p.strain_window = 15;
     p.use_6x6_interpolator = false;
+    const auto pre = Semper::seeding::prepare_phase_correlate_ref(
+            ref, cv::Rect(p.rect_x, p.rect_y, p.rect_w, p.rect_h));
+    REQUIRE(pre.lp_usable());
 
-    const TruthFn truth = [&m](float x, float y) {
-        const dictest::Vec2 d = m.displacement(x, y);
-        const dictest::Mat2 F = m.grad(x, y);
-        Truth t;
-        t.u = (float)d.x; t.v = (float)d.y;
-        t.ux = (float)(F.a - 1.0); t.uy = (float)F.b;
-        t.vx = (float)F.c; t.vy = (float)(F.d - 1.0);
-        return t;
+    struct Case { const char* name; double stretch, deg; };
+    for (const Case c : {Case{"stretch_40pct", 0.40, 0.0}, Case{"stretch_10pct_15deg", 0.10, 15.0}}) {
+        const dictest::Motion m = dictest::stretch_rotate(c.stretch, 0.3, c.deg * CV_PI / 180.0,
+                                                          dictest::Vec2{}, dictest::Vec2{192, 128});
+        const cv::Mat def = dictest::render_frame(field, w, h, m, 0.0f, 7919u + 150u);
+        const TruthFn truth = [&m](float x, float y) {
+            const dictest::Vec2 d = m.displacement(x, y);
+            const dictest::Mat2 F = m.grad(x, y);
+            Truth t;
+            t.u = (float)d.x; t.v = (float)d.y;
+            t.ux = (float)(F.a - 1.0); t.uy = (float)F.b;
+            t.vx = (float)F.c; t.vy = (float)(F.d - 1.0);
+            return t;
+        };
+
+        Semper::seeding::SimilarityShift gm;
+        Semper::seeding::phase_correlate_similarity(pre, def, gm);
+        Row row;
+        row.scenario = c.name;
+        measure_seed(row, truth, ref, def, p);
+        std::printf("    %-20s lp response %.3f: sim=%d rejected=%d kept %d/%d q=%d cov=%.3f "
+                    "vtx med %.4f p95 %.4f px\n",
+                    c.name, gm.lp_response, row.similarity ? 1 : 0,
+                    row.similarity_rejected ? 1 : 0, row.anchors_accepted,
+                    row.anchors_attempted, row.quality, (double)row.coverage, row.vtx_med_du,
+                    row.vtx_p95_du);
+        CHECK(row.phase_locked);
+
+        if (c.stretch > 0.3) {
+            // Stopped at L0: the response is under the floor (measured 0.145),
+            // so the lattice never sees the similarity and the seeds are the
+            // translation lattice's: 0.008 px median against 31.6 px.
+            CHECK(gm.lp_response < (double)Semper::tuning::kLogPolarMinResponse);
+            CHECK(!gm.similarity);
+            CHECK(!row.similarity);
+            CHECK(!row.similarity_rejected);
+            REQUIRE(row.vtx_med_du >= 0.0);
+            CHECK(row.vtx_med_du <= 0.05);
+        }
+
+        // And the field stays where translation-only seeding puts it
+        // (0.0151 px at 40%, 0.0148 px at 10% + 15 deg).
+        measure_full_field(row, truth, ref, def, p);
+        std::printf("    %-20s field: %d points, rms %.4f px\n", c.name, row.ff_rc, row.ff_rms_u);
+        REQUIRE(row.ff_rc > 0);
+        CHECK(row.ff_rms_u <= 0.05);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The small noisy ROI that the log-polar estimate used to miss: IncBench S4's
+// 110 px ROI at sigma = 2 GL, where locating the peak by its highest sample
+// locked in 0-7 of 30 solves per 10 frames between 5 and 85 deg
+// (docs/SEEDING_BENCHMARK.md 4.5.2). Twelve solves, always on; every one must
+// apply the similarity with the angle within 1 deg and the centre within 1 px
+// (measured: 0.27 deg rms, 0.76 deg worst over the full sweep below).
+// ---------------------------------------------------------------------------
+TEST_CASE(SeedBench, LogPolarNoisySmallRoi) {
+    const int w = 256, h = 256, side = 110;
+    const float sigma = 2.0f;
+    const dictest::SmoothSpeckleField field(101, w, h);
+    const cv::Rect roi((w - side) / 2, (h - side) / 2, side, side);
+    for (int seed = 0; seed < 3; ++seed) {
+        const unsigned nseed = 7919u * (unsigned)(seed + 1);
+        const cv::Mat ref = dictest::render_frame(field, w, h, dictest::identity_motion(),
+                                                  sigma, nseed);
+        const auto pre = Semper::seeding::prepare_phase_correlate_ref(ref, roi);
+        REQUIRE(pre.lp_usable());
+        for (const int t : {22, 56, 100, 156}) {   // 9.9, 25.2, 45.0, 70.2 deg
+            const double deg = 0.45 * t;
+            const dictest::Motion m = dictest::stretch_rotate(
+                    0.0, 0.0, deg * CV_PI / 180.0, dictest::Vec2{}, dictest::Vec2{128, 128});
+            const cv::Mat def = dictest::render_frame(field, w, h, m, sigma, nseed + (unsigned)t);
+            Semper::seeding::SimilarityShift gm;
+            Semper::seeding::phase_correlate_similarity(pre, def, gm);
+            const dictest::Vec2 d = m.displacement(gm.cx, gm.cy);
+            const double got = gm.theta_rad * 180.0 / CV_PI;
+            std::printf("    seed %d %5.1f deg -> %+7.3f deg x%.4f (lp resp %.3f) sim=%d, "
+                        "centre err %.3f px\n", seed, deg, got, gm.scale, gm.lp_response,
+                        gm.similarity ? 1 : 0, std::hypot(gm.u - d.x, gm.v - d.y));
+            CHECK(gm.similarity);
+            CHECK_NEAR(got, deg, 1.0);
+            CHECK_NEAR(gm.scale, 1.0, 0.02);
+            CHECK_NEAR(gm.u, d.x, 1.0);
+            CHECK_NEAR(gm.v, d.y, 1.0);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cost of L0 (translation + log-polar estimate) at 0-2 deg, where on a
+// 110 px ROI the similarity is never applied, so every solve pays for the
+// estimate and gets nothing back. Per cell, SEMPER_LP_COST_REPS calls
+// (default 400): process CPU per call (all threads, as getrusage counts it)
+// and, in brackets, the median wall time of one call. Pin with taskset.
+//
+//   SEMPER_LP_COST=1   run it
+// ---------------------------------------------------------------------------
+TEST_CASE(SeedBench, LogPolarCost) {
+    if (std::getenv("SEMPER_LP_COST") == nullptr) {
+        std::printf("    skipped: set SEMPER_LP_COST=1\n");
+        return;
+    }
+    const int reps = std::getenv("SEMPER_LP_COST_REPS")
+                             ? std::max(10, std::atoi(std::getenv("SEMPER_LP_COST_REPS")))
+                             : 400;
+    struct Cost { double cpu_us, wall_us; };
+    const auto cost = [reps](const std::function<void()> &f) {
+        std::vector<double> t((size_t)reps);
+        const CpuClock c0 = CpuClock::now();
+        for (int i = 0; i < reps; ++i) {
+            const auto t0 = std::chrono::steady_clock::now();
+            f();
+            t[(size_t)i] = std::chrono::duration<double, std::micro>(
+                    std::chrono::steady_clock::now() - t0).count();
+        }
+        const double cpu = (CpuClock::now().total_ms() - c0.total_ms()) * 1e3 / reps;
+        std::nth_element(t.begin(), t.begin() + reps / 2, t.end());
+        return Cost{cpu, t[(size_t)reps / 2]};
     };
+    for (const int side : {110, 320}) {
+        const int w = side + 146, h = side + 146;
+        const dictest::SmoothSpeckleField field(101, w, h);
+        const cv::Rect roi((w - side) / 2, (h - side) / 2, side, side);
+        for (const float sigma : {0.0f, 2.0f}) {
+            const cv::Mat ref = dictest::render_frame(field, w, h, dictest::identity_motion(),
+                                                      sigma, 7919u);
+            const auto pre = Semper::seeding::prepare_phase_correlate_ref(ref, roi);
+            const auto pre_t = Semper::seeding::prepare_phase_correlate_ref(ref, roi, false);
+            const Cost prep = cost([&] {
+                (void)Semper::seeding::prepare_phase_correlate_ref(ref, roi);
+            });
+            for (const double deg : {0.0, 1.0, 2.0}) {
+                const dictest::Motion m = dictest::stretch_rotate(
+                        0.0, 0.0, deg * CV_PI / 180.0, dictest::Vec2{1.3, -0.7},
+                        dictest::Vec2{w / 2.0, h / 2.0});
+                const cv::Mat def = dictest::render_frame(field, w, h, m, sigma, 7919u + 1u);
+                Semper::seeding::SimilarityShift gm;
+                const Cost l0 = cost(
+                        [&] { Semper::seeding::phase_correlate_similarity(pre, def, gm); });
+                double u, v, r;
+                const Cost tr = cost(
+                        [&] { Semper::seeding::phase_correlate_roi(pre_t, def, u, v, r); });
+                std::printf("    ROI %3d sigma %.0f %3.1f deg: L0 %7.1f us cpu (%7.1f wall); "
+                            "translation alone %6.1f (%6.1f); sim=%d; reference prep %7.1f "
+                            "(%7.1f)\n",
+                            side, (double)sigma, deg, l0.cpu_us, l0.wall_us, tr.cpu_us,
+                            tr.wall_us, gm.similarity ? 1 : 0, prep.cpu_us, prep.wall_us);
+            }
+        }
+    }
+}
 
-    Row row;
-    row.scenario = "stretch_45pct";
-    measure_seed(row, truth, ref, def, p);
-    std::printf("    lp %+.3f deg x%.4f: sim=%d rejected=%d kept %d/%d q=%d cov=%.3f "
-                "vtx med %.4f p95 %.4f px\n",
-                row.lp_rot_deg, row.lp_scale, row.similarity ? 1 : 0,
-                row.similarity_rejected ? 1 : 0, row.anchors_accepted,
-                row.anchors_attempted, row.quality, (double)row.coverage, row.vtx_med_du,
-                row.vtx_p95_du);
+// ---------------------------------------------------------------------------
+// The log-polar estimate on IncBench S4's frames: a 256 px image turning about
+// its centre at 0.45 deg/frame to 90 deg, three noise seeds, the fixed
+// reference. Each 10-frame bucket is 30 solves; a solve counts as locked when
+// the similarity is applied with the angle within 1 deg and the
+// centre within 1 px. That is the count INCREMENTAL_BENCHMARK.md S4 reports.
+// Only phase_correlate_similarity runs, so a full sweep takes seconds.
+//
+//   SEMPER_LP_SWEEP=1          run it
+//   SEMPER_LP_SWEEP_ROI=200    ROI side (default 110)
+//   SEMPER_LP_SWEEP_SIGMA=0    noise sigma in GL (default 2)
+//   SEMPER_LP_SWEEP_VERBOSE=1  one line per solve
+// ---------------------------------------------------------------------------
+TEST_CASE(SeedBench, LogPolarS4Sweep) {
+    if (std::getenv("SEMPER_LP_SWEEP") == nullptr) {
+        std::printf("    skipped: set SEMPER_LP_SWEEP=1\n");
+        return;
+    }
+    const auto env_or = [](const char *n, double f) {
+        const char *v = std::getenv(n);
+        return v ? std::atof(v) : f;
+    };
+    const int side = (int)env_or("SEMPER_LP_SWEEP_ROI", 110);
+    const float sigma = (float)env_or("SEMPER_LP_SWEEP_SIGMA", 2.0);
+    const bool verbose = std::getenv("SEMPER_LP_SWEEP_VERBOSE") != nullptr;
+    const int w = 256, h = 256, T = 200, seeds = 3;
+    const double rate = 0.45;
+    const dictest::SmoothSpeckleField field(101, w, h);
+    const cv::Rect roi((w - side) / 2, (h - side) / 2, side, side);
 
-    // The estimate must still be the misfire this case was chosen for, or the
-    // case no longer exercises the fallback.
-    REQUIRE(std::abs(row.lp_rot_deg) > 2.0);
-    CHECK(row.similarity_rejected);
-    CHECK(!row.similarity);
-    CHECK(row.phase_locked);
-
-    // The outcome that matters is the field: 0.215 px with the similarity
-    // lattice, 0.014 px translation-only. Bounded between the two.
-    measure_full_field(row, truth, ref, def, p);
-    std::printf("    field: %d points, rms %.4f px\n", row.ff_rc, row.ff_rms_u);
-    REQUIRE(row.ff_rc > 0);
-    CHECK(row.ff_rms_u <= 0.05);
+    int bucket_lock[T / 10] = {}, bucket_sim[T / 10] = {}, bucket_wrong[T / 10] = {};
+    double est_ms = 0.0, err2 = 0.0, err_max = 0.0, serr_max = 0.0, cerr_max = 0.0;
+    int n_est = 0;
+    for (int seed = 0; seed < seeds; ++seed) {
+        const unsigned nseed = 7919u * (unsigned)(seed + 1);
+        const cv::Mat ref = dictest::render_frame(field, w, h, dictest::identity_motion(),
+                                                  sigma, nseed);
+        const auto pre = Semper::seeding::prepare_phase_correlate_ref(ref, roi);
+        REQUIRE(pre.lp_usable());
+        for (int t = 1; t <= T; ++t) {
+            const double deg = rate * t;
+            const dictest::Motion m = dictest::stretch_rotate(
+                    0.0, 0.0, deg * CV_PI / 180.0, dictest::Vec2{}, dictest::Vec2{128, 128});
+            const cv::Mat def = dictest::render_frame(field, w, h, m, sigma, nseed + (unsigned)t);
+            Semper::seeding::SimilarityShift gm;
+            const auto t0 = std::chrono::steady_clock::now();
+            Semper::seeding::phase_correlate_similarity(pre, def, gm);
+            est_ms += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
+            ++n_est;
+            const dictest::Vec2 d = m.displacement(gm.cx, gm.cy);
+            const double err =
+                    std::fmod(gm.theta_rad * 180.0 / CV_PI - deg + 540.0, 360.0) - 180.0;
+            const double cerr = std::hypot(gm.u - d.x, gm.v - d.y);
+            const bool lock = gm.similarity && std::abs(err) < 1.0 && cerr < 1.0;
+            if (lock) {
+                err2 += err * err;
+                err_max = std::max(err_max, std::abs(err));
+                serr_max = std::max(serr_max, std::abs(gm.scale - 1.0));
+                cerr_max = std::max(cerr_max, cerr);
+            }
+            const int b = (t - 1) / 10;
+            bucket_sim[b] += gm.similarity ? 1 : 0;
+            bucket_lock[b] += lock ? 1 : 0;
+            bucket_wrong[b] += (gm.similarity && !lock) ? 1 : 0;
+            if (verbose)
+                std::printf("    s%d f%3d %5.2f deg: lp_ok=%d resp %.3f -> %+7.2f deg x%.4f "
+                            "sim=%d centre err %.2f px\n",
+                            seed, t, deg, gm.lp_ok ? 1 : 0, gm.lp_response,
+                            gm.theta_rad * 180.0 / CV_PI, gm.scale, gm.similarity ? 1 : 0,
+                            cerr);
+        }
+    }
+    std::printf("    ROI %d px, sigma %.1f: locked (similarity applied, wrong) of %d per 10 "
+                "frames\n", side, (double)sigma, 10 * seeds);
+    int total = 0, wrong = 0, total_45 = 0, n_45 = 0;
+    for (int b = 0; b < T / 10; ++b) {
+        std::printf("    f%3d-%3d %5.1f-%5.1f deg: %2d (%2d, %d)\n", 10 * b + 1, 10 * b + 10,
+                    rate * (10 * b + 1), rate * (10 * b + 10), bucket_lock[b], bucket_sim[b],
+                    bucket_wrong[b]);
+        total += bucket_lock[b];
+        wrong += bucket_wrong[b];
+        if (rate * (10 * b + 10) <= 45.0) { total_45 += bucket_lock[b]; n_45 += 10 * seeds; }
+    }
+    std::printf("    total %d/%d locked, %d wrong; to 45 deg %d/%d; locked angle err rms %.3f "
+                "max %.3f deg, |s-1| max %.4f, centre err max %.2f px; %.3f ms/solve\n",
+                total, T * seeds, wrong, total_45, n_45, total ? std::sqrt(err2 / total) : 0.0,
+                err_max, serr_max, cerr_max, est_ms / n_est);
 }
 
 // ---------------------------------------------------------------------------
