@@ -146,6 +146,15 @@ struct Variant {
     MotionAt motion;
 };
 
+// Named fields only: an aggregate initialised with just the first two
+// members trips -Wmissing-field-initializers (a CI error).
+Variant variant(std::string id, std::string name) {
+    Variant v;
+    v.id = std::move(id);
+    v.name = std::move(name);
+    return v;
+}
+
 cv::Rect centred(int w, int h, int rw, int rh) { return cv::Rect((w - rw) / 2, (h - rh) / 2, rw, rh); }
 
 std::vector<Variant> scenario_matrix() {
@@ -154,20 +163,20 @@ std::vector<Variant> scenario_matrix() {
     const std::vector<float> pair = {0.0f, 2.0f};
 
     {   // S1: nothing moves; error is noise and its accumulation.
-        Variant s{"S1", "static, noise only"};
+        Variant s = variant("S1", "static, noise only");
         s.T = 300; s.roi = centred(256, 256, 110, 110); s.sigmas = sweep;
         s.motion = [](int, int) { return dictest::identity_motion(); };
         v.push_back(s);
     }
     for (bool six : {false, true}) {   // S2: slow loading, 0.1% per frame.
-        Variant s{"S2", six ? "slow stretch 0.1%/f (6x6)" : "slow stretch 0.1%/f"};
+        Variant s = variant("S2", six ? "slow stretch 0.1%/f (6x6)" : "slow stretch 0.1%/f");
         s.roi = centred(256, 256, 110, 110); s.use_6x6 = six;
         s.sigmas = six ? pair : sweep;
         s.motion = [](int t, int) { return dictest::stretch_rotate(0.001 * t, 0.3, 0.0, Vec2{}, Vec2{128, 128}); };
         v.push_back(s);
     }
     for (int rate : {1, 5, 20}) {      // S3: rigid translation, 200 px in total.
-        Variant s{"S3", "translate " + std::to_string(rate) + " px/f"};
+        Variant s = variant("S3", "translate " + std::to_string(rate) + " px/f");
         s.w = 448; s.h = 192; s.T = 200 / rate; s.long_run = (rate == 1);
         s.roi = cv::Rect(48, 48, 96, 96); s.sigmas = pair;
         s.motion = [rate](int t, int) { return dictest::affine_motion(Mat2{}, Vec2{(double)rate * t, 0.0}, Vec2{}); };
@@ -176,7 +185,7 @@ std::vector<Variant> scenario_matrix() {
     for (double rate : {0.45, 2.0, 5.0}) {   // S4: rigid rotation to 90 degrees.
         char nm[48];
         std::snprintf(nm, sizeof nm, "rotate %.2g deg/f", rate);
-        Variant s{"S4", nm};
+        Variant s = variant("S4", nm);
         s.T = (int)std::lround(90.0 / rate); s.long_run = (rate < 1.0);
         s.roi = centred(256, 256, 110, 110); s.sigmas = pair;
         s.motion = [rate](int t, int) {
@@ -185,7 +194,7 @@ std::vector<Variant> scenario_matrix() {
         v.push_back(s);
     }
     for (double e : {0.6, 1.0}) {    // S5: large uniaxial stretch with Poisson contraction.
-        Variant s{"S5", e < 0.9 ? "stretch to 60%" : "stretch to 100%"};
+        Variant s = variant("S5", e < 0.9 ? "stretch to 60%" : "stretch to 100%");
         s.w = 384; s.roi = centred(384, 256, 110, 110); s.sigmas = pair;
         s.motion = [e](int t, int T) {
             return dictest::stretch_rotate(e * t / T, 0.3, 0.0, Vec2{}, Vec2{192, 128});
@@ -193,7 +202,7 @@ std::vector<Variant> scenario_matrix() {
         v.push_back(s);
     }
     {   // S6: stretch + rotation + translation together.
-        Variant s{"S6", "stretch 40% + rot 45 + 30 px"};
+        Variant s = variant("S6", "stretch 40% + rot 45 + 30 px");
         s.w = 384; s.h = 384; s.roi = centred(384, 384, 110, 110); s.sigmas = pair;
         s.motion = [](int t, int T) {
             const double f = (double)t / T;
@@ -203,7 +212,7 @@ std::vector<Variant> scenario_matrix() {
         v.push_back(s);
     }
     {   // S7: non-affine fields, ramped.
-        Variant b{"S7", "bump 8 px, s 30"};
+        Variant b = variant("S7", "bump 8 px, s 30");
         b.roi = centred(256, 256, 110, 110); b.sigmas = pair;
         b.motion = [](int t, int T) { return bump(8.0 * t / T, 30.0, Vec2{128, 128}); };
         v.push_back(b);
@@ -217,7 +226,7 @@ std::vector<Variant> scenario_matrix() {
         v.push_back(k);
     }
     for (int T : {5, 20, 50, 200}) {   // S8: the same deformation in fewer or more frames.
-        Variant s{"S8", "stretch 20% + rot 10 in " + std::to_string(T) + " f"};
+        Variant s = variant("S8", "stretch 20% + rot 10 in " + std::to_string(T) + " f");
         s.T = T; s.long_run = (T >= 200);
         s.roi = centred(256, 256, 110, 110); s.sigmas = pair;
         s.motion = [](int t, int TT) {
@@ -227,7 +236,7 @@ std::vector<Variant> scenario_matrix() {
         v.push_back(s);
     }
     {   // S9: a ROI with a hole, as an open-hole tension specimen.
-        Variant s{"S9", "ring mask, stretch 30%"};
+        Variant s = variant("S9", "ring mask, stretch 30%");
         s.w = 320; s.h = 320; s.roi = centred(320, 320, 150, 150); s.ring_mask = true; s.sigmas = pair;
         s.motion = [](int t, int T) {
             return dictest::stretch_rotate(0.3 * t / T, 0.3, 0.0, Vec2{}, Vec2{160, 160});
