@@ -156,6 +156,15 @@ dictest::AffineDeformation rotation(double deg) {
                   (float)( std::sin(t)),      (float)(std::cos(t) - 1.0));
 }
 
+// Rotation by theta and scale by s about the deformation centre, then a
+// translation (u, v): A = s R - I.
+dictest::AffineDeformation similarity(double deg, double s, float u = 0.f, float v = 0.f) {
+    const double t = deg * CV_PI / 180.0;
+    return affine(u, v,
+                  (float)(s * std::cos(t) - 1.0), (float)(-s * std::sin(t)),
+                  (float)(s * std::sin(t)),       (float)(s * std::cos(t) - 1.0));
+}
+
 // Large-motion sweep uses a smaller, centred ROI: a 100 px translation or a
 // 15 deg rotation moves the outer subsets a long way, and they must stay inside
 // the image or every candidate fails for reasons that have nothing to do with
@@ -203,6 +212,8 @@ struct Row {
     double mesh_med_du = -1.0;
     double mesh_med_dux = -1.0, mesh_p95_dux = -1.0;
     bool phase_locked = false;         // anchor lattice: did phaseCorrelate trust its peak
+    bool similarity = false;           // ... and seed with rotation/scale as well
+    double lp_rot_deg = 0.0, lp_scale = 1.0;  // the log-polar estimate, used or not
     int anchors_accepted = 0;
     int anchors_attempted = 0;
     double seed_cpu_ms = 0.0;          // user+sys across the seeding call
@@ -289,6 +300,9 @@ void measure_seed(Row &row, const TruthFn &truth,
     row.seed_precompute_ms = timings.phase_corr;
     row.seed_icgn_ms = timings.anchors;
     row.phase_locked = seeds.phase_locked;
+    row.similarity = seeds.similarity;
+    row.lp_rot_deg = seeds.rotation_deg;
+    row.lp_scale = seeds.scale;
     row.anchors_accepted = seeds.accepted;
     row.anchors_attempted = seeds.attempted;
     (void)solved_count; (void)order; (void)stats;
@@ -410,7 +424,10 @@ void print_table(const std::vector<Row> &rows) {
     std::printf("%s\n", std::string(200, '-').c_str());
     for (const Row &r : rows) {
         char lock[8];
-        if (r.anchors_attempted > 0) std::snprintf(lock, sizeof(lock), "%s", r.phase_locked ? "yes" : "NO");
+        // `sim`: locked, and the anchors were seeded with rotation/scale too.
+        if (r.anchors_attempted > 0)
+            std::snprintf(lock, sizeof(lock), "%s",
+                          r.similarity ? "sim" : r.phase_locked ? "yes" : "NO");
         else std::snprintf(lock, sizeof(lock), "-");
         std::printf("%-20s %-15s %6d %6.3f %3d %5s %8.2f %8.2f %11.4f %11.3e %7.3f %11.4f %10.1f %10.1f %6.2f %8.1f %8.2f %7.2f %11.5f\n",
                     r.scenario.c_str(), r.method.c_str(), r.vertices, (double)r.coverage,
@@ -433,11 +450,13 @@ void write_csv(const std::vector<Row> &rows, const char *path) {
                     "vtx_med_du,vtx_p95_du,mesh_frac,mesh_med_du,"
                     "mesh_med_dP,mesh_p95_dP,ff_total_ms,ff_cpu_ms,ff_par,"
                     "rss_retained_mb,ff_seed_ms,"
-                    "ff_conv_pct,ff_mean_iters,ff_simplex_calls,ff_rms_u,ff_rc\n");
+                    "ff_conv_pct,ff_mean_iters,ff_simplex_calls,ff_rms_u,ff_rc,"
+                    "similarity,lp_rot_deg,lp_scale\n");
     for (const Row &r : rows) {
         std::fprintf(f, "%s,%s,%d,%.6f,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,"
                         "%.6f,%.6f,%.6f,%.6f,%.6e,%.6e,"
-                        "%.3f,%.3f,%.4f,%.2f,%.3f,%.4f,%.4f,%d,%.8f,%d\n",
+                        "%.3f,%.3f,%.4f,%.2f,%.3f,%.4f,%.4f,%d,%.8f,%d,"
+                        "%d,%.4f,%.5f\n",
                      r.scenario.c_str(), r.method.c_str(), r.vertices,
                      (double)r.coverage, r.quality, r.phase_locked ? 1 : 0,
                      r.anchors_accepted, r.anchors_attempted, r.seed_ms, r.seed_cpu_ms,
@@ -445,7 +464,8 @@ void write_csv(const std::vector<Row> &rows, const char *path) {
                      r.vtx_p95_du, r.mesh_frac, r.mesh_med_du, r.mesh_med_dux,
                      r.mesh_p95_dux, r.ff_total_ms, r.ff_cpu_ms, r.ff_par,
                      r.rss_retained_mb, r.ff_seed_ms, r.ff_conv_pct,
-                     r.ff_mean_iters, r.ff_simplex_calls, r.ff_rms_u, r.ff_rc);
+                     r.ff_mean_iters, r.ff_simplex_calls, r.ff_rms_u, r.ff_rc,
+                     r.similarity ? 1 : 0, r.lp_rot_deg, r.lp_scale);
     }
     std::fclose(f);
     std::printf("    CSV written to %s\n", path);
@@ -582,6 +602,120 @@ TEST_CASE(SeedBench, PhaseCorrelateSignConvention) {
     CHECK_NEAR(v, V, 0.05);
     std::printf("    phaseCorrelate -> (%.4f, %.4f), truth (%.1f, %.1f), response %.4f\n",
                 u, v, (double)U, (double)V, resp);
+}
+
+// ---------------------------------------------------------------------------
+// The log-polar (Fourier-Mellin) half of L0: sign and magnitude of the
+// rotation and scale it reports, the translation re-measured once they are
+// undone, and the switch that keeps small motion on the translation-only path.
+// Always on: one DFT pair per case.
+// ---------------------------------------------------------------------------
+TEST_CASE(SeedBench, LogPolarRotationScale) {
+    using Semper::seeding::SimilarityShift;
+    dictest::SpeckleField field(/*seed=*/7, W, H, BLOBS);
+    const Image ref = dictest::make_reference_image(field, W, H);
+    const cv::Mat ref_gray = dictest::gray8(ref, 0.0f, 0);
+    const cv::Rect roi(BIG_ORIGIN, BIG_ORIGIN, BIG_RECT, BIG_RECT);
+    const auto pre = Semper::seeding::prepare_phase_correlate_ref(ref_gray, roi);
+    REQUIRE(pre.lp_usable());
+
+    struct Case { double deg, s; float u, v; };
+    const Case turned[] = {
+        {10.0, 1.00, 0.0f, 0.0f},
+        {-7.0, 1.04, 6.0f, -4.0f},   // the other way, zoomed in, and shifted
+        {3.0, 0.97, -2.5f, 1.5f},
+        {25.0, 1.00, 12.0f, 8.0f},
+    };
+    for (const Case &c : turned) {
+        const dictest::AffineDeformation d = similarity(c.deg, c.s, c.u, c.v);
+        const cv::Mat def_gray = dictest::gray8(
+                dictest::make_deformed_image(field, W, H, d), 0.0f, 0);
+        SimilarityShift gm;
+        Semper::seeding::phase_correlate_similarity(pre, def_gray, gm);
+        const Truth t = affine_truth(d)((float)gm.cx, (float)gm.cy);
+        std::printf("    %+6.1f deg x%.3f -> %+8.4f deg x%.5f (lp resp %.3f), "
+                    "centre (%.3f, %.3f) truth (%.3f, %.3f), sim=%d\n",
+                    c.deg, c.s, gm.theta_rad * 180.0 / CV_PI, gm.scale, gm.lp_response,
+                    gm.u, gm.v, (double)t.u, (double)t.v, gm.similarity ? 1 : 0);
+        REQUIRE(gm.lp_ok);
+        CHECK_NEAR(gm.theta_rad * 180.0 / CV_PI, c.deg, 0.15);
+        CHECK_NEAR(gm.scale, c.s, 0.005);
+        REQUIRE(gm.similarity);
+        CHECK(gm.locked);
+        CHECK_NEAR(gm.u, t.u, 0.25);
+        CHECK_NEAR(gm.v, t.v, 0.25);
+        CHECK_NEAR(gm.ux, d.ux, 3e-3);
+        CHECK_NEAR(gm.uy, d.uy, 3e-3);
+        CHECK_NEAR(gm.vx, d.vx, 3e-3);
+        CHECK_NEAR(gm.vy, d.vy, 3e-3);
+    }
+
+    // Below kSimilarityMinCornerPx the answer must be the translation-only
+    // one exactly -- this is what keeps small-motion fields bit-identical. The
+    // second case is FullFieldGolden's affine scenario, whose rotation and
+    // dilation move this ROI's corners by ~2.8 px.
+    const dictest::AffineDeformation small[] = {
+        affine(5.0f, -3.0f),
+        affine(2.0f, -1.5f, 0.012f, -0.006f, 0.005f, 0.010f),
+    };
+    for (const dictest::AffineDeformation &d : small) {
+        const cv::Mat def_gray = dictest::gray8(
+                dictest::make_deformed_image(field, W, H, d), 0.0f, 0);
+        SimilarityShift gm;
+        Semper::seeding::phase_correlate_similarity(pre, def_gray, gm);
+        double u = 0.0, v = 0.0, resp = 0.0;
+        const bool ok = Semper::seeding::phase_correlate_roi(pre, def_gray, u, v, resp);
+        std::printf("    small: lp %+.4f deg x%.5f -> sim=%d\n",
+                    gm.theta_rad * 180.0 / CV_PI, gm.scale, gm.similarity ? 1 : 0);
+        CHECK(!gm.similarity);
+        CHECK(gm.locked == ok);
+        CHECK(gm.u == u);
+        CHECK(gm.v == v);
+        CHECK(gm.response == resp);
+        CHECK(gm.ux == 0.0 && gm.uy == 0.0 && gm.vx == 0.0 && gm.vy == 0.0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The rotation half of the quality gate: LargeMotionSweep's rows that the
+// translation-only seeder lost (docs/SEEDING_BENCHMARK.md 4.5 -- 0.450 mesh
+// coverage at 5 deg, 0.152 and no lock at 15 deg), as always-on assertions.
+// Same bounds as AnchorSeedingQualityGate for coverage; vertex error is
+// bounded at 0.05 px against a measured ~0.009.
+// ---------------------------------------------------------------------------
+TEST_CASE(SeedBench, AnchorSeedingRotationGate) {
+    const struct { const char *name; dictest::AffineDeformation def; } gates[] = {
+        {"R_rot_5deg", rotation(5.0)},
+        {"R_rot_15deg", rotation(15.0)},
+        {"RST_10deg_1.05_20px", similarity(10.0, 1.05, 20.0f, -12.0f)},
+    };
+
+    dictest::SpeckleField field(/*seed=*/11, W, H, BLOBS);
+    const Image ref = dictest::make_reference_image(field, W, H);
+    const cv::Mat ref_gray = dictest::gray8(ref, 0.0f, 101);
+
+    for (const auto &g : gates) {
+        const Image def = dictest::make_deformed_image(field, W, H, g.def);
+        const cv::Mat def_gray = dictest::gray8(def, 0.0f, 202);
+
+        Row row;
+        row.scenario = g.name;
+        measure_seed(row, affine_truth(g.def), ref_gray, def_gray, big_motion_params());
+        std::printf("    %-20s lock=%s sim=%d rot=%+.3f x%.4f q=%d cov=%.3f "
+                    "vtx=%.4f px kept %d/%d meshfr=%.3f\n",
+                    g.name, row.phase_locked ? "yes" : "NO", row.similarity ? 1 : 0,
+                    row.lp_rot_deg, row.lp_scale, row.quality, (double)row.coverage,
+                    row.vtx_med_du, row.anchors_accepted, row.anchors_attempted,
+                    row.mesh_frac);
+
+        CHECK(row.phase_locked);
+        CHECK(row.similarity);
+        CHECK(row.quality == 2);
+        CHECK(row.coverage >= 0.90f);
+        CHECK(row.mesh_frac >= 0.95);
+        REQUIRE(row.vtx_med_du >= 0.0);
+        CHECK(row.vtx_med_du <= 0.05);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -976,7 +1110,12 @@ TEST_CASE(SeedBench, LargeMotionSweep) {
     std::vector<Scenario> sweep;
     sweep.push_back({"R_rot_2deg",    rotation(2.0),  0.0f});
     sweep.push_back({"R_rot_5deg",    rotation(5.0),  0.0f});
+    sweep.push_back({"R_rot_10deg",   rotation(10.0), 0.0f});
     sweep.push_back({"R_rot_15deg",   rotation(15.0), 0.0f});
+    sweep.push_back({"R_rot_30deg",   rotation(30.0), 0.0f});
+    // Handheld capture: the phone turns, steps closer and shifts at once.
+    sweep.push_back({"S_scale_1.05",  similarity(0.0, 1.05), 0.0f});
+    sweep.push_back({"RST_10deg_1.05_20px", similarity(10.0, 1.05, 20.0f, -12.0f), 0.0f});
     sweep.push_back({"T_trans_25px",  affine(25.0f, -15.0f),  0.0f});
     sweep.push_back({"T_trans_50px",  affine(50.0f, -30.0f),  0.0f});
     sweep.push_back({"T_trans_100px", affine(100.0f, -60.0f), 0.0f});

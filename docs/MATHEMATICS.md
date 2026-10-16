@@ -442,8 +442,84 @@ magnitude better than any keypoint detector.
 **Limitation.** The estimate is a *translation*. Under a rotation $\theta$ about
 the ROI centre the true displacement at radius $r$ is $2r\sin(\theta/2)$, so a
 single global shift is increasingly wrong away from the centre. Measured
-behaviour: usable to about $2°$, degraded by $5°$, no lock by $15°$
-(see [SEEDING_BENCHMARK.md](SEEDING_BENCHMARK.md) §4.5).
+behaviour of the translation alone: usable to about $2°$, degraded by $5°$, no
+lock by $15°$ (see [SEEDING_BENCHMARK.md](SEEDING_BENCHMARK.md) §4.5). §8.1.1
+removes it.
+
+#### 8.1.1 Rotation and Scale by Fourier–Mellin Correlation
+
+Model the global motion as a similarity about the ROI centre $\bm{c}$: a
+reference point $\bm{p}$ appears at
+
+$$ \bm{q} = \bm{c} + sR(\theta)(\bm{p} - \bm{c}) + \bm{t}, \qquad R(\theta) = \begin{pmatrix}\cos\theta & -\sin\theta\\ \sin\theta & \cos\theta\end{pmatrix} $$
+
+in image axes ($y$ down), so $g(\bm{x}) = f\big(\bm{c} + (sR)^{-1}(\bm{x} - \bm{c} - \bm{t})\big)$.
+Taking the Fourier transform, the translation only multiplies by a phase, and
+rotation and scale act on the frequency axis:
+
+$$ |G(\bm{k})| = s^2\,\big|F\big(s\,R(\theta)^{-1}\bm{k}\big)\big| $$
+
+The magnitude spectrum therefore sees $\theta$ and $s$ but not $\bm{t}$. In
+log-polar coordinates $(\phi, \rho) = (\arg\bm{k}, \ln|\bm{k}|)$ the rotation
+becomes a shift by $+\theta$ along $\phi$ and the scale a shift by $-\ln s$
+along $\rho$:
+
+$$ |G|(\phi, \rho) = s^2\,|F|(\phi - \theta,\ \rho + \ln s) $$
+
+so the phase correlation of §8.1, applied to the two log-polar images, returns
+$(\theta, \ln s)$ as an ordinary translation (Reddy & Chatterji, 1996).
+
+Implementation details, each for a stated reason:
+
+* **Square crop.** The DFT of a non-square crop has different frequency
+  spacing on the two axes, so an image rotation is not a rotation of the
+  discrete spectrum. The estimate uses the largest centred square in the ROI,
+  of even side $N$, capped at $k_{\text{LogPolarMaxSide}} = 512$ to bound the
+  cost; below $k_{\text{LogPolarMinSide}} = 64$ it is skipped.
+* **Half the angle range.** The spectrum of a real image is point-symmetric,
+  $|F(\bm{k})| = |F(-\bm{k})|$, so $\phi$ is sampled over $[0, \pi)$ in 256
+  rows. That makes the $\phi$ axis exactly periodic, which is what the FFT
+  inside the correlation assumes, and it means $\theta$ is recovered modulo
+  $180°$, i.e. in $(-90°, 90°)$.
+* **Radial band.** $\rho$ is sampled in 128 columns, log-spaced between
+  $N/16$ and $0.45N$. The low end excludes the DC term and the Hann window's
+  leakage, where the angle is also barely resolved; the high end stays inside
+  the Nyquist circle. The correlation window is a Hann taper along $\rho$ only,
+  since tapering the periodic $\phi$ axis would just discard signal.
+* **$\log(1 + |F|)$.** This compresses the dynamic range so the strongest low
+  frequencies do not dominate the correlation.
+
+With $\theta$ and $s$ known, the deformed image is resampled at
+$\bm{c} + sR(\bm{x} - \bm{c})$, which by the model above leaves a pure
+translation $\bm{t}' = (sR)^{-1}\bm{t}$ against the reference. The §8.1
+correlation then measures $\bm{t}'$, and $\bm{t} = sR\,\bm{t}'$. The resampling
+reads from the whole image, so pixels that rotated out of the ROI rectangle are
+still found.
+
+The seed is then the full first-order field
+
+$$ \bm{u}_0(\bm{p}) = \bm{t} + (sR - I)(\bm{p} - \bm{c}), \qquad \begin{pmatrix}u_x & u_y\\ v_x & v_y\end{pmatrix}_0 = sR - I $$
+
+which hands IC-GN both the displacement the rotation puts at each anchor and
+the matching gradients.
+
+**When the similarity is used.** $sR - I$ is itself a scaled rotation, so its
+operator norm is $\sqrt{(s\cos\theta - 1)^2 + (s\sin\theta)^2}$. Multiplied by
+the ROI half-diagonal, that is how far the bare translation is wrong at the ROI
+corners. The similarity seeds the anchors only when
+
+1. that corner error exceeds $k_{\text{SimilarityMinCornerPx}} = 4$ px, and
+2. the translation correlation on the rotation-corrected image has a higher
+   peak than the uncorrected one.
+
+Otherwise the seed is the §8.1 translation, exactly the values that path always
+produced, so small motion is bit-identical to the translation-only seeder. The
+4 px threshold sits above the 2.8 px that FullFieldGolden's affine scenario
+implies, where IC-GN pulls in from the translation alone, and below the ~8 px
+at which 2° on a 320 px ROI already cost CPU. The second condition guards
+against a spurious estimate on content the log-polar correlation reads poorly.
+On pure translation the estimate is not free: one $N^2$ DFT and a 256×128
+correlation, about 1.3 ms serial on a 320 px ROI.
 
 ### 8.2 Anchor Lattice
 
@@ -451,7 +527,8 @@ A regular lattice of ROI grid nodes with stride
 
 $$ s = \max\left(1,\ \operatorname{round}\sqrt{\frac{N_x N_y}{N_{\text{target}}}}\right) $$
 
-is solved by the engine's own IC-GN, initialised from §8.1, with the last row
+is solved by the engine's own IC-GN, initialised from §8.1 (under the
+similarity, at $\bm{u}_0(\bm{p})$ with gradients $sR - I$), with the last row
 and column always included so the convex hull reaches the ROI boundary. Because
 the anchors coincide with grid nodes they reuse the pooled Hessians of §6, and a
 node whose ZNSSD clears the result gate is retained as a **final** measurement
@@ -492,6 +569,16 @@ in preference to a global homography or affine fit because a deforming specimen
 does not have an affine displacement field — a global model rejects signal, not
 just blunders — whereas the median test assumes no field shape at all. The
 lattice makes the neighbourhood lookup $O(1)$.
+
+Under the similarity of §8.1.1 the test runs on the residual
+$u_i - u_0(\bm{p}_i)$, not on $u_i$. A rotation is a smooth field, but
+neighbours a lattice spacing $\ell$ apart differ by about $\ell\theta$: 5 px
+at $15°$ and $\ell = 20$ px. On the lattice edge every neighbour lies on one
+side, so the raw median is offset by that amount and an edge anchor fails a
+1 px tolerance however accurate it is. Subtracting the global model removes
+exactly that, and leaves the test free of assumptions about the deformation on
+top of it. Without the similarity the residual is the displacement itself and
+the test is unchanged.
 
 A rejected anchor is neither a mesh vertex nor an output point.
 

@@ -298,6 +298,11 @@ struct MeshSeedResult {
     int accepted = 0;      // kept as mesh vertices
     int solved = 0;        // also good enough to publish as output points
     bool phase_locked = false;
+    // Whether the anchors were seeded with the log-polar rotation/scale as
+    // well as the shift, and that estimate (reported even when not applied).
+    bool similarity = false;
+    float rotation_deg = 0.0f;
+    float scale = 1.0f;
 };
 
 // Per-axis sizing of the anchor lattice. Exposed rather than kept private in

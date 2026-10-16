@@ -60,6 +60,24 @@ inline constexpr float kAnchorFullCoverage = 0.30f;
 /** Phase-correlation peak response below which the global shift is not trusted. */
 inline constexpr float kPhaseCorrMinResponse = 0.05f;
 
+/** Log-polar (Fourier-Mellin) rotation/scale estimate: peak response below
+ *  which the estimate is not trusted and seeding stays translation-only. */
+inline constexpr float kLogPolarMinResponse = 0.05f;
+
+/** Log-polar estimate: the square crop it is taken from. Below the minimum
+ *  side the spectrum is too coarse in angle to be worth correlating; above the
+ *  maximum, the central square is used, which bounds the cost on large ROIs. */
+inline constexpr int kLogPolarMinSide = 64;
+inline constexpr int kLogPolarMaxSide = 512;
+
+/** Seed anchors with the rotation/scale model only when it moves the ROI
+ *  corners by more than this (px) relative to the bare translation. Below it,
+ *  IC-GN pulls in from the translation alone and seeding stays bit-identical
+ *  to the translation-only path. Set above the 2.8 px the FullFieldGolden
+ *  affine scenario implies, and below the ~8 px at which 2 deg on a 320 px
+ *  ROI already costs CPU (docs/SEEDING_BENCHMARK.md 4.5). */
+inline constexpr float kSimilarityMinCornerPx = 4.0f;
+
 /** Packed-field sentinel for "no valid correlation at this grid point". */
 inline constexpr float kCorrInvalid = -1.0f;
 

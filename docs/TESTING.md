@@ -577,11 +577,13 @@ Mostly a **measurement harness**, not a gate: `CandidateSweep`,
 `RealSpeckleSweep`, `Challenge5`, `Challenge14Sinusoid` and `LargeMotionSweep`
 all early-return unless `SEMPER_RUN_SEEDBENCH=1`, and the last three also need
 `SEMPER_DICE_REPO` pointed at a `dicengine/dice` checkout. They produce the
-tables in `docs/SEEDING_BENCHMARK.md`. Four cases are always on:
+tables in `docs/SEEDING_BENCHMARK.md`. Six cases are always on:
 
 | Test | Proves | Failure would mean |
 |---|---|---|
 | `PhaseCorrelateSignConvention` | `phase_correlate_roi` returns `(u, v)` such that reference point `p` appears at `p + (u, v)` | Every anchor is seeded with the sign of the motion inverted |
+| `LogPolarRotationScale` | The Fourier-Mellin estimate reports rotation (sign and size, within 0.15°) and scale (within 0.005) in the engine's shape-function convention, at −7° to +25° and 0.97–1.04 with translation; the similarity it returns carries the right centre displacement and `sR − I` gradients; and below `kSimilarityMinCornerPx` — including FullFieldGolden's affine scenario — the result is the translation-only one, bit for bit | Rotated frames are seeded with the turn inverted, or small motion silently leaves the translation-only path and every golden field moves |
+| `AnchorSeedingRotationGate` | At 5°, 15°, and 10° + 5% zoom + 20 px shift, the lattice locks, seeds with the similarity, routes `FULL`, keeps ≥ 90% hull coverage and ≥ 95% mesh fraction, and stays under 0.05 px vertex error | Handheld-capture rotation is back to the 0.45 / 0.15 coverage of the translation-only seeder (`SEEDING_BENCHMARK.md` §4.5) |
 | `AnchorSeedingQualityGate` | Three of the seven sweep scenarios — 0.4 px translation, 0.5° rotation, 12 px translation — hold a phase lock, route `FULL`, cover ≥ 90% of the ROI, and stay inside loose vertex- and gradient-error bounds | Seeding stopped working, rather than merely got slower |
 | `PublishAnchorResultsRespectsMedianTest` | `publish_anchor_results` writes only anchors that cleared the result gate *and* survived the universal median test, consumes one compute-order number per published point, and credits the thread that ran the IC-GN | A periodic-speckle blunder reaches the field and Path B floods from it — the failure the median test exists to prevent |
 | `AnchorLatticeSizing` | `plan_anchor_lattice` keeps the isotropic stride on a square ROI (64×64 → 289 anchors, the count the sweep reports), holds a 3-node floor on the short axis of a 1000×6 ROI without exceeding 2×`kAnchorTarget`, is symmetric under transpose, and returns an empty lattice for a degenerate grid | A long thin ROI — a beam, a weld seam — silently costs several times the intended seeding budget |

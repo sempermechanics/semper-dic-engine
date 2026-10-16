@@ -3,9 +3,14 @@
 // Two layers, neither of which uses a feature detector or a descriptor:
 //
 //   L0  cv::phaseCorrelate over the ROI gives the global rigid shift from every
-//       pixel, rather than from the median of sparse keypoint matches.
+//       pixel, rather than from the median of sparse keypoint matches. A
+//       log-polar (Fourier-Mellin) correlation of the magnitude spectra adds
+//       rotation and scale when they move the ROI corners by more than
+//       kSimilarityMinCornerPx (phase_correlate.cpp).
 //   L1  a regular lattice of ROI grid nodes is solved with the engine's own
-//       IC-GN, seeded from L0. The converged nodes become the mesh vertices.
+//       IC-GN, seeded from L0 -- under rotation, each node with the
+//       displacement and gradients the similarity puts there. The converged
+//       nodes become the mesh vertices.
 //
 // Anchors sit on grid nodes on purpose. They reuse the Hessian pool the solve
 // already builds, and a node good enough to keep is a *final* result for that
@@ -134,14 +139,18 @@ MeshSeedResult solve_anchor_seeds(
     MeshSeedResult out;
     if (cache.ref_img == nullptr || gridW <= 0 || gridH <= 0) return out;
 
-    // --- L0: global rigid shift ------------------------------------------
-    double pu = 0.0, pv = 0.0, presp = 0.0;
+    // --- L0: global motion ------------------------------------------------
+    // Translation, or translation plus rotation and scale about the ROI centre
+    // when the log-polar estimate says the corners are far enough off for it
+    // to matter. Translation-only, every value below is exactly what the
+    // translation-only seeder produced.
+    seeding::SimilarityShift gm;
     {
         ScopedTimer t(timings.phase_corr);
         if (!cache.gray.empty() &&
             defMat.cols == cache.gray.cols && defMat.rows == cache.gray.rows) {
-            // The reference half (crop, float conversion, Hann window) is
-            // reused across solves against this reference.
+            // The reference half (crop, float conversion, Hann window, log-polar
+            // spectrum) is reused across solves against this reference.
             const cv::Rect roi(params.rect_x, params.rect_y, params.rect_w, params.rect_h);
             if (!cache.precompute) cache.precompute = std::make_unique<RefPrecompute>();
             RefPrecompute& pre = *cache.precompute;
@@ -150,11 +159,23 @@ MeshSeedResult solve_anchor_seeds(
                 pre.phase_roi = roi;
                 pre.phase_valid = true;
             }
-            out.phase_locked = seeding::phase_correlate_roi(pre.phase_ref, defMat, pu, pv, presp);
+            seeding::phase_correlate_similarity(pre.phase_ref, defMat, gm);
         }
     }
-    out.globalU = (float)pu;
-    out.globalV = (float)pv;
+    out.phase_locked = gm.locked;
+    out.similarity = gm.similarity;
+    out.rotation_deg = (float)(gm.theta_rad * 180.0 / CV_PI);
+    out.scale = (float)gm.scale;
+    out.globalU = (float)gm.u;
+    out.globalV = (float)gm.v;
+    const float gux = (float)gm.ux, guy = (float)gm.uy;
+    const float gvx = (float)gm.vx, gvy = (float)gm.vy;
+    const float gcx = (float)gm.cx, gcy = (float)gm.cy;
+    // The similarity's displacement at a reference point. Only evaluated when
+    // out.similarity is set; the translation-only path never calls it.
+    const float model_u0 = out.globalU, model_v0 = out.globalV;
+    auto model_u = [=](float x, float y) { return model_u0 + gux * (x - gcx) + guy * (y - gcy); };
+    auto model_v = [=](float x, float y) { return model_v0 + gvx * (x - gcx) + gvy * (y - gcy); };
 
     ScopedTimer anchor_timer(timings.anchors);
 
@@ -236,9 +257,18 @@ MeshSeedResult solve_anchor_seeds(
             if (!subset.is_initialized) continue;
 
             const int simplex_before = engine.count_simplex;
-            AnalysisResult res = engine.calculate_deformation(
-                    subset, def_img, out.globalU, out.globalV,
-                    0.0f, 0.0f, 0.0f, 0.0f, init_mode);
+            // Under the similarity each anchor starts where the rotation puts
+            // it, with the rotation's gradients: the one global shift is off
+            // by 2 r sin(theta/2) at radius r.
+            AnalysisResult res = out.similarity
+                    ? engine.calculate_deformation(
+                            subset, def_img,
+                            model_u((float)realX, (float)realY),
+                            model_v((float)realX, (float)realY),
+                            gux, guy, gvx, gvy, init_mode)
+                    : engine.calculate_deformation(
+                            subset, def_img, out.globalU, out.globalV,
+                            0.0f, 0.0f, 0.0f, 0.0f, init_mode);
             reject_if_ghosted(res, params.subset_size);
             stats[tid].icgn_iters += res.iters;
             const bool needed_rescue = (engine.count_simplex > simplex_before);
@@ -274,6 +304,22 @@ MeshSeedResult solve_anchor_seeds(
     // field the displacements are not affine, so a global fit rejects signal.
     // The 8-neighbourhood median assumes no field shape, and the lattice makes
     // the lookup O(1).
+    //
+    // Under the similarity the test runs on the residual from it. Rotation is a
+    // smooth field, but at 15 deg lattice neighbours 20 px apart differ by
+    // 5 px, and on the lattice edge -- where every neighbour sits on one side
+    // -- the raw median lands that far off and each edge anchor fails a 1 px
+    // tolerance however good it is. Subtracting the model removes exactly that.
+    // Translation-only, the residual is the displacement itself and this is
+    // the original test.
+    std::vector<float> res_u((size_t)n_anchor, 0.0f), res_v((size_t)n_anchor, 0.0f);
+    for (size_t i = 0; i < anchors.size(); ++i) {
+        const AnchorResult& a = anchors[i];
+        if (!a.vertex) continue;
+        res_u[i] = out.similarity ? a.u - model_u(a.rx, a.ry) : a.u;
+        res_v[i] = out.similarity ? a.v - model_v(a.rx, a.ry) : a.v;
+    }
+
     std::vector<float> us, vs;
     us.reserve((size_t)n_anchor);
     vs.reserve((size_t)n_anchor);
@@ -294,15 +340,15 @@ MeshSeedResult solve_anchor_seeds(
                     if (ni < 0 || ni >= LW || nj < 0 || nj >= LH) continue;
                     const AnchorResult& nb = anchors[(size_t)nj * LW + ni];
                     if (!nb.vertex) continue;
-                    nu[nn] = nb.u;
-                    nv[nn] = nb.v;
+                    nu[nn] = res_u[(size_t)nj * LW + ni];
+                    nv[nn] = res_v[(size_t)nj * LW + ni];
                     ++nn;
                 }
             }
             if (nn >= 3) {
                 const float mu = median_of(nu.data(), nn), mv = median_of(nv.data(), nn);
-                if (std::abs(a.u - mu) > tuning::kAnchorMedianTol ||
-                    std::abs(a.v - mv) > tuning::kAnchorMedianTol) {
+                if (std::abs(res_u[idx] - mu) > tuning::kAnchorMedianTol ||
+                    std::abs(res_v[idx] - mv) > tuning::kAnchorMedianTol) {
                     // Withhold `kept` only. `vertex` stays set, so a rejected
                     // node still votes in its neighbours' medians -- dropping it
                     // from the sample would let one blunder cascade along a row.
@@ -344,9 +390,12 @@ MeshSeedResult solve_anchor_seeds(
         out.quality = MeshQuality::NONE;
     }
 
-    LOGD("ROUTING: anchor lattice %d/%d kept (%d as output, cov %.2f, phase %s) -> quality %d",
+    LOGD("ROUTING: anchor lattice %d/%d kept (%d as output, cov %.2f, phase %s, "
+         "rot %.2f deg x%.4f %s) -> quality %d",
          out.accepted, out.attempted, out.solved, (double)out.coverage,
-         out.phase_locked ? "locked" : "none", (int)out.quality);
+         out.phase_locked ? "locked" : "none", (double)out.rotation_deg,
+         (double)out.scale, out.similarity ? "applied" : "not applied",
+         (int)out.quality);
     out.anchors = std::move(anchors);
     return out;
 }
