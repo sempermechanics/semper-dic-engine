@@ -964,7 +964,9 @@ increment has outgrown what the images still correlate over, as with fast
 loading, necking or whitening. On the tensile video it lifts the late-test
 minimum at N = 20 from 337 to 397 points, and changes nothing at N = 5.
 Neither the early nor the scheduled update moves the reference to a frame that
-reports less than `kIncUpdateMinReported` = half of that first frame. Such a
+reports less than `kIncUpdateMinReported` = half of that first frame (before
+the first frame, and always with N = 1: half of what the reference itself
+reported when it was solved, so a failed first frame is caught too). Such a
 frame is a failed solve, not a grown increment: on a 110 px ROI at σ = 2
 turned 6–10° from its reference, the seed now and then locks onto a wrong
 solution and reports one or two points 20–40 px off. Moving onto it would keep

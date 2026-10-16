@@ -65,6 +65,7 @@ struct IncrementalSession::Impl {
     int ref_index = 0;            // frame index of the current reference
     int frames_since_update = 0;
     int ref_reported = -1;        // points reported on the first frame against this reference
+    int adopted_reported = -1;    // points the current reference reported when solved (-1: frame 0)
     int frame_count = 0;          // frames solved so far
 
     FullFieldParams params_k;     // grid on the current reference (k > 0)
@@ -85,6 +86,7 @@ struct IncrementalSession::Impl {
         ref_index = 0;
         frames_since_update = 0;
         ref_reported = -1;
+        adopted_reported = -1;
         frame_count = 0;
         params_k = FullFieldParams();
         mask_k.release();
@@ -430,15 +432,17 @@ int IncrementalSession::Impl::process(const cv::Mat& def_gray, float* output, in
     // the Taylor fallback but fails the median test and the strain window.
     // A frame below kIncUpdateMinReported of that count is a failed solve:
     // the reference does not move onto it, early or on schedule, and the next
-    // frame tries again against the same reference. (The first frame on a
-    // reference never updates with N > 1, so the count is always set first.)
-    if (N > 1) {
-        const float first = (float)s.ref_reported;
+    // frame tries again against the same reference. Until a frame on this
+    // reference has set the count (always, with N = 1), the count compared
+    // with is the one the reference itself reported when it was solved, so a
+    // failed first frame does not become the count either.
+    const int base = s.ref_reported >= 0 ? s.ref_reported : s.adopted_reported;
+    if (base > 0 && (float)written < tuning::kIncUpdateMinReported * (float)base) {
+        will_update = false;
+    } else if (N > 1) {
         if (s.ref_reported < 0) {
             s.ref_reported = written;
-        } else if ((float)written < tuning::kIncUpdateMinReported * first) {
-            will_update = false;
-        } else if ((float)written < (1.0f - tuning::kIncEarlyUpdateDrop) * first) {
+        } else if ((float)written < (1.0f - tuning::kIncEarlyUpdateDrop) * (float)s.ref_reported) {
             will_update = true;
         }
     }
@@ -461,6 +465,7 @@ int IncrementalSession::Impl::process(const cv::Mat& def_gray, float* output, in
             }
         }
         s.move_reference(cap, U, V, carried, s.frame_count);
+        s.adopted_reported = written;
         fi.reference_updated = true;
         fi.lost_this_frame = std::max(0, before - s.alive_count());
         LOGD("Reference moved to frame %d: %d of %d frame-0 nodes tracked (%d coasting, %d re-anchored)",

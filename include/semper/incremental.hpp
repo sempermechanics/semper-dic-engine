@@ -21,9 +21,11 @@ namespace pipeline {
  *   0   never — a fixed reference, identical to calling run_full_field per frame
  *   1   every frame (classic incremental DIC)
  *   N   every N frames, or as soon as a frame reports 5% fewer points than the
- *       first frame on the current reference; but never to a frame reporting
- *       less than half of that (a failed solve): the reference stays, and an
- *       update that was due falls to the next frame
+ *       first frame on the current reference
+ * In every mode the reference never moves to a frame reporting less than half
+ * the points of the first frame on the current reference (or of the reference
+ * itself, before that frame and with N = 1): such a frame is a failed solve,
+ * the reference stays, and the update falls to the next frame.
  * A node the solve cannot reach on a frame coasts, unreported, on the plane
  * through its neighbours' increments, and is reported again once measured
  * (after a long coast, once its earlier subset confirms it).

@@ -753,6 +753,54 @@ TEST_CASE(Incremental, FailedSolve_NeverBecomesTheReference) {
     }
 }
 
+TEST_CASE(Incremental, FailedSolve_FirstOnReferenceAndIntervalOne) {
+    // The same drift with unrelated frames where the count the floor compares
+    // with is not yet set. N = 5: frame 6, the first on the reference frame 5,
+    // and frame 10, the scheduled update. A failed frame 6 must not become
+    // that count, or frame 10 (as empty) would pass and become the reference.
+    // N = 1: frame 4, compared with what frame 3 reported; frame 5 is then
+    // solved against frame 3 and becomes the reference.
+    const int T = 14;
+    const dictest::SmoothSpeckleField other(977, 320, 320);
+    auto with_failures = [&](std::initializer_list<int> bad) {
+        Sequence s = stretch_rotate_sequence(320, 320, T, 0.0, 0.0, 0.3, 1.0f, 31, (double)T, 0.0);
+        for (int t : bad) {
+            s.frames[t - 1] = dictest::render_frame(other, 320, 320, dictest::identity_motion(), 1.0f, 5000 + t);
+        }
+        return s;
+    };
+    const FullFieldParams p = centred_params(320, 320, 160);
+    auto accurate_except = [&](const Sequence &s, const std::vector<Frame> &inc, std::initializer_list<int> bad) {
+        const int first = inc[0].rc;
+        for (int t = 1; t <= T; ++t) {
+            if (std::find(bad.begin(), bad.end(), t) != bad.end()) {
+                CHECK(inc[t - 1].rc < first / 2);
+                CHECK(!inc[t - 1].info.reference_updated);
+                continue;
+            }
+            const Accuracy a = evaluate(inc[t - 1], s.motion[t - 1], 0.2);
+            CHECK(a.points >= (int)(0.95 * first));
+            CHECK(a.within >= (int)(0.95 * a.points));
+        }
+    };
+
+    const Sequence s5 = with_failures({6, 10});
+    const std::vector<Frame> n5 = run_session(s5, cv::Mat(), p, 5);
+    REQUIRE((int)n5.size() == T);
+    accurate_except(s5, n5, {6, 10});
+    CHECK(n5[10].info.reference_frame == 5);   // frame 11: still on frame 5 ...
+    CHECK(n5[10].info.reference_updated);      // ... and takes the update
+
+    const Sequence s1 = with_failures({4});
+    const std::vector<Frame> n1 = run_session(s1, cv::Mat(), p, 1);
+    REQUIRE((int)n1.size() == T);
+    accurate_except(s1, n1, {4});
+    CHECK(n1[3].info.reference_frame == 3);    // frame 4 against frame 3
+    CHECK(n1[4].info.reference_frame == 3);    // frame 5 too ...
+    CHECK(n1[4].info.reference_updated);       // ... and it becomes the reference
+    CHECK(n1[5].info.reference_frame == 5);
+}
+
 TEST_CASE(Incremental, Rotation2DegNoisy_N5_KeepsTheChainThroughFailedSolves) {
     // IncBench S4 "rotate 2 deg/f", sigma 2, N = 5 (10 deg between references),
     // noise seeds 0 and 1, as rendered there. A 110 px noisy ROI turned 6-10

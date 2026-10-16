@@ -46,7 +46,7 @@ The tables below are the new build's. Tables other than S4 also differ in places
 
 ## Update floor: what changed
 
-With N > 1 the reference no longer moves, early or on schedule, to a frame that reports less than half the points of the first frame on the current reference (`kIncUpdateMinReported`). Such a frame is a failed solve. The reference stays, and an update that was due falls to the next frame.
+The reference no longer moves, early or on schedule, to a frame that reports less than half the points of the first frame on the current reference (`kIncUpdateMinReported`). Before that first frame, and always with N = 1, the comparison is with what the reference itself reported. Such a frame is a failed solve. The reference stays, and an update that was due falls to the next frame.
 
 `045a500` made this matter. Its early update fires on any frame that reports 5% fewer points, so a frame whose solve collapsed always became the reference, kept only the one or two points it had (20–40 px off), and lost every other node for good. Before it, only a collapse that happened to land on a scheduled update did that.
 
@@ -56,7 +56,7 @@ With N > 1 the reference no longer moves, early or on schedule, to a frame that 
   - The solves still collapse on 1–2 frames per run (seeding a 110 px ROI at σ = 2 turned 6–10°), and those frames still count as failed. The chain survives them.
 - **S4, 5°/f, σ = 2, N = 10:** 0.070 / 60 → 0.107 / 89. One seed used to adopt a collapsed frame 13.
 - **S3, 5 and 20 px/f, N ≥ 5:** the frame due for update is out of seeding range and reports nothing in either build. Accuracy is identical, and these runs still fail.
-- **Every other run is bit-identical,** frame by frame, in all of S1–S10. Only these 19 runs (scenario, mode, σ, seed) contain a frame below the floor.
+- **Every other run is bit-identical,** frame by frame, in all of S1–S10. Only these 19 runs (scenario, mode, σ, seed) contain a frame below the floor. No run here has a failed first frame on a moved reference, or a failed frame at N = 1. Those cases are guarded by `Incremental.FailedSolve_FirstOnReferenceAndIntervalOne`.
 
 The first edition's 0.133 / 63 for S4 2°/f N = 5 was most likely one seed short as well. With the early update switched off, this build reads 0.137 / 63: seed 1 loses the chain at a scheduled update onto a collapsed frame 15, which the floor now defers.
 
@@ -323,7 +323,7 @@ Only five real frames exist, and the fixed reference correlates through all of t
 
 ![accuracy against cost, every scenario with noise](images/incremental/accuracy_vs_cost.png)
 
-This plot predates the update floor: there S4 2°/f N = 5 and N = 10 (σ = 2) still sit at their failed values. The re-run for the floor shared the host with other benchmarks, which inflated its frame times by up to 1.4×, so it was not used for cost.
+This plot predates the update floor, so its S4 2°/f N = 5 and N = 10 points (σ = 2) still show the failed runs. The S4 re-runs for the floor timed at 0.7–1.4× this run's frame times: one shared the host with other benchmarks, and one ran alone. That spread is host drift (see below), so they were not mixed into this plot.
 
 On frames that keep the reference (N > 1), the per-reference cache (node scan and Hessian pool) is reused, so `hold ms` is at or below `upd ms`.
 
