@@ -144,7 +144,9 @@ class IncrementalSession:
     onto the running total, so large deformation can be followed frame by
     frame. Every update adds a little error, so on slow loading a larger
     interval (or the fixed reference) is more accurate. With an interval above
-    1 the reference also moves as soon as a frame reports 5% fewer points.
+    1 the reference also moves as soon as a frame reports 5% fewer points, and
+    it never moves to a frame reporting less than half (a failed solve): an
+    update that was due falls to the next frame instead.
 
     A point the solve cannot reach on a frame (a band that does not correlate,
     such as glare or a background edge) coasts on its neighbours' motion and is

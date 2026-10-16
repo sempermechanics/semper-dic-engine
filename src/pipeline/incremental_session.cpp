@@ -428,10 +428,17 @@ int IncrementalSession::Impl::process(const cv::Mat& def_gray, float* output, in
     // Early update on a drop in the points reported (written), not in the
     // nodes sampled: a sparse loss of increment nodes still samples through
     // the Taylor fallback but fails the median test and the strain window.
-    if (!will_update && N > 1) {
+    // A frame below kIncUpdateMinReported of that count is a failed solve:
+    // the reference does not move onto it, early or on schedule, and the next
+    // frame tries again against the same reference. (The first frame on a
+    // reference never updates with N > 1, so the count is always set first.)
+    if (N > 1) {
+        const float first = (float)s.ref_reported;
         if (s.ref_reported < 0) {
             s.ref_reported = written;
-        } else if ((float)written < (1.0f - tuning::kIncEarlyUpdateDrop) * (float)s.ref_reported) {
+        } else if ((float)written < tuning::kIncUpdateMinReported * first) {
+            will_update = false;
+        } else if ((float)written < (1.0f - tuning::kIncEarlyUpdateDrop) * first) {
             will_update = true;
         }
     }

@@ -705,16 +705,95 @@ TEST_CASE(Incremental, EarlyUpdate_WhenReportedPointsDrop) {
         if (f.info.reference_updated) {
             updates++;
             CHECK(f.rc < 0.95 * first_on_ref);
+            CHECK(f.rc >= 0.5 * first_on_ref);   // never onto a failed solve
             if (t + 1 < T) CHECK(inc[t + 1].info.reference_frame == t + 1);
             first_on_ref = -1;
         } else {
-            CHECK(f.rc >= 0.95 * first_on_ref);
+            CHECK(f.rc >= 0.95 * first_on_ref || f.rc < 0.5 * first_on_ref);
         }
     }
     std::printf("  [early update N=100 T=%d] %d early updates\n", T, updates);
     CHECK(updates > 0);
     // A fixed reference never updates, early or not.
     for (const Frame &f : run_session(s, cv::Mat(), p, 0)) CHECK(!f.info.reference_updated);
+}
+
+TEST_CASE(Incremental, FailedSolve_NeverBecomesTheReference) {
+    // 1 px/frame drift, N = 5, with two frames replaced by a different speckle
+    // that nothing correlates with: frame 3, mid-interval, where the drop in
+    // points would trigger the early update, and frame 10, where the scheduled
+    // update falls. Moving onto either keeps only what that frame measured,
+    // which is next to nothing, and the chain is lost for good. The reference
+    // stays instead, and frame 11 takes the deferred update.
+    const int T = 14;
+    Sequence s = stretch_rotate_sequence(320, 320, T, 0.0, 0.0, 0.3, 1.0f, 31, (double)T, 0.0);
+    const dictest::SmoothSpeckleField other(977, 320, 320);
+    for (int t : {3, 10}) {
+        s.frames[t - 1] = dictest::render_frame(other, 320, 320, dictest::identity_motion(), 1.0f, 5000 + t);
+    }
+    const FullFieldParams p = centred_params(320, 320, 160);
+    const std::vector<Frame> inc = run_session(s, cv::Mat(), p, 5);
+    REQUIRE((int)inc.size() == T);
+    const int first = inc[0].rc;
+    REQUIRE(first > 0);
+    for (int t : {3, 10}) {
+        CHECK(inc[t - 1].rc < first / 2);
+        CHECK(!inc[t - 1].info.reference_updated);
+    }
+    CHECK(inc[3].info.reference_frame == 0);    // frame 4: still on frame 0
+    CHECK(inc[4].info.reference_updated);       // frame 5: on schedule
+    CHECK(inc[10].info.reference_frame == 5);   // frame 11: still on frame 5 ...
+    CHECK(inc[10].info.reference_updated);      // ... and becomes the reference
+    CHECK(inc[11].info.reference_frame == 11);
+    for (int t = 1; t <= T; ++t) {
+        if (t == 3 || t == 10) continue;
+        const Accuracy a = evaluate(inc[t - 1], s.motion[t - 1], 0.2);
+        CHECK(a.points >= (int)(0.95 * first));
+        CHECK(a.within >= (int)(0.95 * a.points));
+    }
+}
+
+TEST_CASE(Incremental, Rotation2DegNoisy_N5_KeepsTheChainThroughFailedSolves) {
+    // IncBench S4 "rotate 2 deg/f", sigma 2, N = 5 (10 deg between references),
+    // noise seeds 0 and 1, as rendered there. A 110 px noisy ROI turned 6-10
+    // deg now and then fails to seed and reports a point or two, 20-40 px off:
+    // seed 0 at frame 36 (8 deg from its reference, which the early update had
+    // moved off the 5-frame grid), seed 1 at frame 15 (a scheduled update).
+    // Both used to become the reference, and every later frame was lost or
+    // locked 38 px off. Now the next frame takes the update.
+    const int W = 256, T = 45;
+    const dictest::SmoothSpeckleField field(101, W, W);
+    FullFieldParams p;
+    p.rect_x = p.rect_y = (W - 110) / 2;
+    p.rect_w = p.rect_h = 110;
+    p.step = 5;
+    p.subset_size = 21;
+    p.strain_window = 15;
+    for (int seed : {0, 1}) {
+        const unsigned nseed = 7919u * (unsigned)(seed + 1);
+        Sequence s;
+        s.w = s.h = W;
+        s.ref = dictest::render_frame(field, W, W, dictest::identity_motion(), 2.0f, nseed);
+        for (int t = 1; t <= T; ++t) {
+            dictest::Motion m = dictest::stretch_rotate(0.0, 0.0, 2.0 * t * kPi / 180.0, dictest::Vec2{},
+                                                        dictest::Vec2{128, 128});
+            s.frames.push_back(dictest::render_frame(field, W, W, m, 2.0f, nseed + (unsigned)t));
+            s.motion.push_back(std::move(m));
+        }
+        const std::vector<Frame> inc = run_session(s, cv::Mat(), p, 5);
+        REQUIRE((int)inc.size() == T);
+        int failed = 0;
+        for (const Frame &f : inc) failed += (f.rc < inc[0].rc / 2) ? 1 : 0;
+        const Accuracy last = evaluate(inc[T - 1], s.motion[T - 1], 0.5);
+        std::printf("  [rotate 2 deg/f sigma 2 N=5 seed %d] %d failed solves; f45: %d points, %d within 0.5 px, "
+                    "rms %.3f px\n", seed, failed, last.points, last.within, last.rms_u);
+        // Measured: seed 0 1 failed solve, f45 370 points, 364 within 0.5 px,
+        // 0.162 px; seed 1 2, 400, 388, 0.195 px. Before: 10 failed solves and
+        // 1 point at 38 px (seed 0); 31 and nothing (seed 1).
+        CHECK(last.points >= (int)(0.9 * inc[0].rc));
+        CHECK(last.within >= (int)(0.9 * last.points));
+        CHECK(last.rms_u < 0.4);
+    }
 }
 
 #else

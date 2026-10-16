@@ -171,7 +171,8 @@ header.
 struct IncrementalParams {
     FullFieldParams field;     // the frame-0 grid, exactly as for run_full_field
     int update_interval = 1;   // 0 = fixed reference, N = move the reference every N frames
-                               // (sooner when a frame reports 5% fewer points, N > 1)
+                               // (sooner when a frame reports 5% fewer points, N > 1;
+                               // never onto a frame reporting under half, N > 1)
 };
 
 struct IncrementalFrameInfo {
