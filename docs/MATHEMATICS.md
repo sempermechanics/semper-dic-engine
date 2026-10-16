@@ -508,9 +508,13 @@ operator norm is $\sqrt{(s\cos\theta - 1)^2 + (s\sin\theta)^2}$. Multiplied by
 the ROI half-diagonal, that is how far the bare translation is wrong at the ROI
 corners. The similarity seeds the anchors only when
 
-1. that corner error exceeds $k_{\text{SimilarityMinCornerPx}} = 4$ px, and
+1. that corner error exceeds $k_{\text{SimilarityMinCornerPx}} = 4$ px,
 2. the translation correlation on the rotation-corrected image has a higher
-   peak than the uncorrected one.
+   peak than the uncorrected one, and
+3. the anchor lattice it seeds (§8.2–8.3) routes FULL and keeps at least
+   $k_{\text{SimilarityKeepFraction}} = 90\%$ of the anchors it attempts.
+   Otherwise the lattice is solved again from the translation alone, and that
+   one is used.
 
 Otherwise the seed is the §8.1 translation, exactly the values that path always
 produced, so small motion is bit-identical to the translation-only seeder. The
@@ -518,8 +522,31 @@ produced, so small motion is bit-identical to the translation-only seeder. The
 implies, where IC-GN pulls in from the translation alone, and below the ~8 px
 at which 2° on a 320 px ROI already cost CPU. The second condition guards
 against a spurious estimate on content the log-polar correlation reads poorly.
+
+The third is the one a benchmark had to find. A similarity has no way to
+describe an anisotropic stretch, yet under a strong one the log-polar
+correlation still returns a peak (−5.8° × 0.92 for a 45% uniaxial stretch; about
+90° once noise is added). The translation peak is already weakened by the
+stretch, so condition 2 lets it through. Anchors seeded from that wrong model
+can converge, as a cluster, onto the wrong speckle. Such a cluster agrees with
+itself, so neither the ZNSSD gate nor a median test of residuals from that same
+model rejects it. Nor can counting kept anchors choose between the two
+lattices: in the case pinned by `SeedBench.SimilarityFallsBackUnderStretch` the
+wrong lattice keeps 123 anchors and the translation-only one 86. A lattice that
+keeps almost every anchor is the evidence that the model fits; a rotation it
+fits keeps ~100%.
+
 On pure translation the estimate is not free: one $N^2$ DFT and a 256×128
-correlation, about 1.3 ms serial on a 320 px ROI.
+correlation, about 1.3 ms serial on a 320 px ROI. When condition 3 fails the
+lattice is solved twice, which is the translation-only cost plus the rejected
+attempt.
+
+**Where the estimate does not reach.** The correlation needs spectral signal
+above the noise in both frames. On a 110 px ROI at $\sigma = 2$ grey-level
+noise it finds no peak at all (response ≈ 0 from 5° to 45°), while on a 200 px
+ROI at the same noise it is within 0.05° at every angle tested. Below that size
+noisy frames therefore stay translation-only: never worse than before, and not
+helped either.
 
 ### 8.2 Anchor Lattice
 
@@ -840,8 +867,10 @@ the fixed reference. On DICe's OHT ladder the fixed reference also wins
 In practice:
 
 * For small or moderate deformation the **fixed reference is more accurate**.
-  Use incremental only when it stops correlating: rotation past a few degrees,
-  strain of tens of percent, or speckle that changes appearance.
+  Use incremental only when it stops correlating: rigid motion past the seeding
+  capture range, rotation past ~5–15° on noisy images with a small ROI (with a
+  clean pattern, rotation-aware seeding takes the fixed reference through 90°),
+  or speckle that changes appearance.
 * A larger N means fewer updates, so less accumulated bias, as long as frame
   t still correlates with frame t − N.
 * The 6×6 interpolator lowers the per-update bias.

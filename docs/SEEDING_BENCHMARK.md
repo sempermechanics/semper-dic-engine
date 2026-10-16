@@ -249,12 +249,33 @@ each edge anchor fails the 1 px `kAnchorMedianTol` however accurate it is. With
 better seeds alone the outer ring would still have been rejected, and the
 hull would have shrunk to about 0.77 of the ROI.
 
-The similarity is used only when it moves the ROI corners more than
-`kSimilarityMinCornerPx` = 4 px beyond the bare translation, **and** the
-rotation-corrected translation peak beats the uncorrected one. Otherwise every
-seed is the translation-only value, bit for bit. `FullFieldGolden` passes
-unchanged: its affine scenario implies 2.8 px at the corners and stays on the
-translation path, which `SeedBench.LogPolarRotationScale` asserts directly.
+The similarity is used only when all three of these hold:
+- it moves the ROI corners more than `kSimilarityMinCornerPx` = 4 px beyond
+  the bare translation;
+- the rotation-corrected translation peak beats the uncorrected one;
+- the lattice it seeds routes `FULL` and keeps at least
+  `kSimilarityKeepFraction` = 90% of its anchors.
+
+Otherwise every seed is the translation-only value, bit for bit. When the last
+condition fails, the lattice is re-solved from the translation alone.
+`FullFieldGolden` passes unchanged: its affine scenario implies 2.8 px at the
+corners and stays on the translation path, which
+`SeedBench.LogPolarRotationScale` asserts directly.
+
+The third condition was added after IncBench
+([INCREMENTAL_BENCHMARK.md](INCREMENTAL_BENCHMARK.md)) showed what happens
+without it. Under strong uniaxial stretch the log-polar correlation still
+returns a peak, though a similarity cannot describe a stretch: −5.8 deg × 0.92
+for a 45% stretch, and about 90 deg once noise is added. The stretch has
+already weakened the translation peak, so the second condition passes. The
+lattice that model seeds can hold a self-consistent cluster of wrong anchors
+that neither the ZNSSD gate nor the residual median test rejects. On that
+noise-free frame the field went from 0.014 to 0.215 px rms, and with noise
+frames were lost outright: 27 against 14 dropped in the ring-mask scenario.
+Counting kept anchors cannot pick the better lattice, since the bad one keeps
+more (123 against 86). Only a lattice that keeps nearly everything shows that
+the model fits. `SeedBench.SimilarityFallsBackUnderStretch` pins that frame:
+0.2150 px with the condition disabled, 0.0137 px with it.
 
 **Measured** on Ubuntu 22.04 (WSL2), GCC 11.4, `taskset -c 0-3`,
 `SEMPER_SEEDBENCH_REPEATS=11`, both columns on the same host. "Before" is
@@ -308,10 +329,20 @@ What it costs:
   identical work (same seeds, same iterations, same RMS), and the same rows
   spread 199.5–204.9 ms across repeats of the unchanged code. **Strictly, 0 deg
   regresses by the estimate's 1.3–1.6 ms; from 2 deg up, CPU is lower.**
-- **Limits.** The magnitude spectrum repeats every 180 deg, so rotation is
-  recovered in (−90, 90) deg. Scale is accepted in (0.5, 2). An ROI whose
-  short side is under 64 px gets no estimate and stays translation-only — a
-  1000×30 beam ROI, for example.
+- **Limits.**
+  - The magnitude spectrum repeats every 180 deg, so rotation is recovered in
+    (−90, 90) deg. Scale is accepted in (0.5, 2).
+  - An ROI whose short side is under 64 px gets no estimate and stays
+    translation-only — a 1000×30 beam ROI, for example.
+  - **Small noisy ROIs get nothing from it.** At σ = 2 grey-level noise, the
+    log-polar correlation finds no peak on a 110 px ROI from 5 to 45 deg,
+    while on a 200 px ROI it is within 0.05 deg at every angle. Such frames
+    stay translation-only, as before. Dropping the log compression rescues
+    most of the noisy 110 px cases, but breaks noise-free ones at 20–45 deg,
+    so it is not a drop-in fix.
+  - Anisotropic stretch is outside the model. The third condition above
+    returns such frames to the translation-only result, at the cost of
+    solving the lattice twice.
 
 
 ## 5. Cost accounting
@@ -557,7 +588,7 @@ sweep in `tests/integration/test_seeding_bench.cpp` early-returns unless
 
 is set, and three of them additionally need `SEMPER_DICE_REPO` pointed at an
 external checkout, so CI ran exactly one assertion-bearing case from the file.
-Six gates now run unconditionally (four since 0.3.0, two since the rotation fix of §4.5.1):
+Seven gates now run unconditionally (four since 0.3.0, three since the rotation fix of §4.5.1):
 
 - `SeedBench.AnchorSeedingQualityGate` promotes three of the seven synthetic
   scenarios — 0.4 px translation, 0.5° rotation, 12 px translation — to
@@ -583,6 +614,9 @@ Six gates now run unconditionally (four since 0.3.0, two since the rotation fix 
 - `SeedBench.AnchorSeedingRotationGate` promotes the 5 deg, 15 deg and combined
   10 deg + 5% + 20 px rows of LargeMotionSweep: similarity applied, `FULL`, hull
   coverage ≥ 0.90, mesh fraction ≥ 0.95, vertex error ≤ 0.05 px.
+- `SeedBench.SimilarityFallsBackUnderStretch` pins the fallback of §4.5.1 on
+  the IncBench frame that exposed it: the similarity is rejected and the field
+  stays at the translation-only 0.014 px, not 0.215 px.
 
 Verified by perturbing the anchor stride by one in
 `src/pipeline/full_field_anchors.cpp`: the golden reports slots 3, 8, 19 and 22

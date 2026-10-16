@@ -92,6 +92,10 @@ struct SimilarityShift {
     double response = 0.0;            // translation peak actually used
     bool locked = false;              // the translation is trusted
     bool similarity = false;          // the gradients above are in use
+    // The uncorrected translation, kept even when the similarity replaces it,
+    // so a caller can fall back to exactly the translation-only seeds.
+    double t_u = 0.0, t_v = 0.0, t_response = 0.0;
+    bool t_locked = false;
     // The log-polar estimate, reported whether or not it was used.
     double theta_rad = 0.0, scale = 1.0, lp_response = 0.0;
     bool lp_ok = false;

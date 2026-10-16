@@ -199,6 +199,7 @@ void phase_correlate_similarity(const PhaseCorrRef &ref, const cv::Mat &def,
     double u0 = 0.0, v0 = 0.0, r0 = 0.0;
     out.locked = phase_correlate_roi(ref, def, u0, v0, r0);
     out.u = u0; out.v = v0; out.response = r0;
+    out.t_u = u0; out.t_v = v0; out.t_response = r0; out.t_locked = out.locked;
 
     double theta = 0.0, s = 1.0, lp_resp = 0.0;
     out.lp_ok = log_polar_rotation_scale(ref, def, theta, s, lp_resp);

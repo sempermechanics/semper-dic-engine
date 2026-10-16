@@ -300,7 +300,10 @@ struct MeshSeedResult {
     bool phase_locked = false;
     // Whether the anchors were seeded with the log-polar rotation/scale as
     // well as the shift, and that estimate (reported even when not applied).
+    // similarity_rejected: the similarity was tried, its lattice came out
+    // weak, and the translation-only lattice re-solved after it was used.
     bool similarity = false;
+    bool similarity_rejected = false;
     float rotation_deg = 0.0f;
     float scale = 1.0f;
 };

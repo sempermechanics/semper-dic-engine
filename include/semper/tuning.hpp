@@ -78,6 +78,16 @@ inline constexpr int kLogPolarMaxSide = 512;
  *  ROI already costs CPU (docs/SEEDING_BENCHMARK.md 4.5). */
 inline constexpr float kSimilarityMinCornerPx = 4.0f;
 
+/** The similarity is trusted only if the anchor lattice it seeds routes FULL
+ *  and keeps at least this fraction of its attempted anchors; otherwise the
+ *  lattice is solved again from the translation alone and that one is used.
+ *  The log-polar estimate is a similarity; under strong anisotropic stretch it
+ *  can report a rotation that is not there (IncBench S5/S9: about 90 deg with
+ *  noise, -5.8 deg x 0.92 without), and the lattice it seeds can then hold a
+ *  self-consistent cluster of wrong anchors that no gate catches. Rotations
+ *  the similarity fits keep ~100%. */
+inline constexpr float kSimilarityKeepFraction = 0.90f;
+
 /** Packed-field sentinel for "no valid correlation at this grid point". */
 inline constexpr float kCorrInvalid = -1.0f;
 
