@@ -1,5 +1,6 @@
-// Path C — central-tendency fallback seeding, used when AKAZE could not
-// produce even a sparse mesh. Lifted verbatim out of full_field_solver.cpp.
+// Path C — central-tendency fallback seeding, used when the anchor
+// lattice could not produce even a sparse mesh. Lifted verbatim out of
+// full_field_solver.cpp.
 
 #include "full_field_internal.hpp"
 
@@ -24,7 +25,7 @@ namespace internal {
 // =========================================================
 int run_path_c(
         const SolveContext& ctx,
-        const std::vector<cv::Point2f>& akaze_ref_pts,
+        const std::vector<cv::Point2f>& seed_ref_pts,
         ResultGrid& resultGrid,
         int& path_c_seed_x,
         int& path_c_seed_y,
@@ -40,31 +41,31 @@ int run_path_c(
     int best_grid_x = -1;
     int best_grid_y = -1;
 
-    // 1. Try the user's suggested AKAZE Central Seeding first
-    if (!akaze_ref_pts.empty()) {
+    // 1. Seed from whichever mesh vertex sits nearest the grid centre.
+    if (!seed_ref_pts.empty()) {
         float grid_cx = params.rect_x + (gridW / 2.f) * params.step;
         float grid_cy = params.rect_y + (gridH / 2.f) * params.step;
         float min_dist = 1e9f;
-        int best_akaze_idx = -1;
+        int best_seed_idx = -1;
 
-        for (size_t i = 0; i < akaze_ref_pts.size(); ++i) {
-            float dx = akaze_ref_pts[i].x - grid_cx;
-            float dy = akaze_ref_pts[i].y - grid_cy;
+        for (size_t i = 0; i < seed_ref_pts.size(); ++i) {
+            float dx = seed_ref_pts[i].x - grid_cx;
+            float dy = seed_ref_pts[i].y - grid_cy;
             float dist = dx*dx + dy*dy;
             if (dist < min_dist) {
                 min_dist = dist;
-                best_akaze_idx = (int)i;
+                best_seed_idx = (int)i;
             }
         }
 
-        if (best_akaze_idx >= 0) {
-            best_grid_x = std::max(0, std::min(gridW - 1, (int)std::round((akaze_ref_pts[best_akaze_idx].x - params.rect_x) / params.step)));
-            best_grid_y = std::max(0, std::min(gridH - 1, (int)std::round((akaze_ref_pts[best_akaze_idx].y - params.rect_y) / params.step)));
+        if (best_seed_idx >= 0) {
+            best_grid_x = std::max(0, std::min(gridW - 1, (int)std::round((seed_ref_pts[best_seed_idx].x - params.rect_x) / params.step)));
+            best_grid_y = std::max(0, std::min(gridH - 1, (int)std::round((seed_ref_pts[best_seed_idx].y - params.rect_y) / params.step)));
         }
     }
 
-    // 2. THE ZERO-AKAZE / HOLE BYPASS (Mask-Aware Center Search)
-    // If AKAZE failed, OR if the chosen AKAZE point is inside a masked hole/dead zone
+    // 2. THE ZERO-SEED / HOLE BYPASS (Mask-Aware Center Search)
+    // If seeding produced nothing, OR the chosen vertex is inside a masked hole/dead zone
     if (best_grid_x == -1 || resultGrid[best_grid_y][best_grid_x].solved) {
         LOGD("PATH C: Blind searching for the nearest valid unmasked seed...");
         float min_dist = 1e9f;
@@ -108,7 +109,13 @@ int run_path_c(
     if (seed_subset.is_initialized) {
         OptimizationEngine seed_engine;
         seed_engine.use_6x6_interpolator = params.use_6x6_interpolator;
-        auto res = seed_engine.calculate_deformation(seed_subset, ctx.def_img, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, INIT_AUTO_SEARCH);
+        // Seed the search from the phase-correlation shift when there is one.
+        // INIT_AUTO_SEARCH honours a non-zero guess and otherwise falls back to
+        // its own +/-15 px scan, so passing the global shift both starts Path C
+        // closer and extends its reach past that scan window. globalU/globalV
+        // are overwritten below only on success, so a failure leaves the
+        // phase-correlation values intact for Path B.
+        auto res = seed_engine.calculate_deformation(seed_subset, ctx.def_img, globalU, globalV, 0.0f, 0.0f, 0.0f, 0.0f, INIT_AUTO_SEARCH);
 
         if (res.status == 0 && res.correlation_score <= tuning::kCorrAccept) {
             globalU = res.u; globalV = res.v;

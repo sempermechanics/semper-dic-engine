@@ -154,8 +154,8 @@ void commit_cell(const SolveContext& ctx, const CellTask& t, ResultGrid& resultG
 // ==========================================
 void run_path_b(
         const SolveContext& ctx,
-        const std::vector<cv::Point2f>& akaze_ref_pts,
-        const std::vector<cv::Point2f>& akaze_def_pts,
+        const std::vector<cv::Point2f>& seed_ref_pts,
+        const std::vector<cv::Point2f>& seed_def_pts,
         float globalU,
         float globalV,
         int path_c_seed_x,
@@ -202,12 +202,12 @@ void run_path_b(
         std::vector<SeedCandidate> candidates;
         float grid_cx = params.rect_x + (gridW / 2.f) * params.step, grid_cy = params.rect_y + (gridH / 2.f) * params.step;
 
-        for (size_t fi = 0; fi < akaze_ref_pts.size(); ++fi) {
-            float fx = akaze_ref_pts[fi].x, fy = akaze_ref_pts[fi].y;
+        for (size_t fi = 0; fi < seed_ref_pts.size(); ++fi) {
+            float fx = seed_ref_pts[fi].x, fy = seed_ref_pts[fi].y;
             int ix = (int)std::round((fx - params.rect_x) / (float)params.step);
             int iy = (int)std::round((fy - params.rect_y) / (float)params.step);
             if (ix < 0 || ix >= gridW || iy < 0 || iy >= gridH || resultGrid[iy][ix].solved) continue;
-            float du = akaze_def_pts[fi].x - fx, dv = akaze_def_pts[fi].y - fy;
+            float du = seed_def_pts[fi].x - fx, dv = seed_def_pts[fi].y - fy;
             float world_x = params.rect_x + ix * params.step, world_y = params.rect_y + iy * params.step;
             float dist_c = std::sqrt((world_x - grid_cx)*(world_x - grid_cx) + (world_y - grid_cy)*(world_y - grid_cy));
             candidates.push_back({ix, iy, du, dv, dist_c, std::sqrt(du*du + dv*dv)});
@@ -251,7 +251,6 @@ void run_path_b(
             for (size_t t = 0; t < engines.size(); ++t) {
                 stats[t].icgn_time_ms += engines[t].time_icgn_ms;
                 stats[t].simplex_time_ms += engines[t].time_simplex_ms;
-                stats[t].simplex_iters += engines[t].count_simplex;
             }
         }
     } flush{engines, stats_pathB};
@@ -331,7 +330,11 @@ void run_path_b(
     std::vector<std::thread> workers;
     struct WorkerGuard { std::vector<std::thread> &ws; ~WorkerGuard() { for (auto &w : ws) if (w.joinable()) w.join(); } } wg{workers};
 
-    for (int w = 0; w < safe_cores && !done; ++w) {
+    // Read once, before any worker exists: a started worker writes `done`
+    // under `mtx`, so the spawn loop must not read it unlocked. A worker
+    // started after the flood finished sees `done` and returns at once.
+    const bool flood_finished = done;
+    for (int w = 0; w < safe_cores && !flood_finished; ++w) {
         workers.emplace_back([&, w]() {
             try {
                 std::unique_lock<std::mutex> lk(mtx);

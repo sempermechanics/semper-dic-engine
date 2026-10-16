@@ -15,7 +15,7 @@ Downstream Android app (private)
        |
        v  adapters/android (JNI marshalling only)
 this repository
-  src/io + seeding + pipeline   (decode, AKAZE/mesh/RGDIC, OpenMP)
+  src/io + seeding + pipeline   (decode, anchors/mesh/RGDIC, OpenMP)
        |
        v
   src/math + strain
@@ -24,9 +24,33 @@ this repository
 ```
 
 **Data flow for one analysis:** decode images → `Image` (float intensities +
-gradients) → for each grid point: `SubsetPrecomputer` builds a `SubsetData` →
+gradients) → Hessian pre-pass → **anchor-lattice seeding** (phase correlation for
+the global rigid shift, then IC-GN on a lattice of grid nodes) → Delaunay mesh →
+for each remaining grid point: `SubsetPrecomputer` builds a `SubsetData` →
 `OptimizationEngine.calculate_deformation` solves the 6-DOF warp →
 displacement field → `StrainCalculator` → results buffer back through JNI.
+
+Seeding runs **after** the Hessian pre-pass on purpose: the anchors sit on grid
+nodes, so they reuse the pooled Hessians and a node that converges well enough
+is a final result for that node. Path A then skips it and Path B takes it as a
+boundary seed. See [SEEDING_BENCHMARK.md](SEEDING_BENCHMARK.md) for why this
+replaced AKAZE feature matching.
+
+"Converges well enough" is decided in two steps, not one. The lattice solve
+records every node's outcome and writes nothing to the field; the universal
+median test then runs over the whole lattice; and only then does
+`publish_anchor_results` mark the survivors solved. A node that correlates
+confidently onto the wrong speckle blob is dropped by the median test before
+Path B can flood fill from it.
+
+**Work reused across frames.** `ReferenceCache` keeps what depends only on
+the reference and the grid: the node validity scan, the Hessian pool and the
+reference side of phase correlation (its float crop and Hann window). The
+second and later frames against one reference, with the same `rect`, `step`,
+`subset_size` and mask, skip those steps. The cache is internal, and outputs
+are bit-identical with or without it (`FullField.RefCache_*`). Steepest-descent
+images are not cached: at `dim² × 6` floats per node they would cost too much
+memory for a whole grid on a phone.
 
 Package layout and contributor rules: [`README.md`](../README.md).
 
@@ -232,6 +256,53 @@ rendering/statistics.
 
 ---
 
+## Module: `include/semper/incremental.hpp` — class `IncrementalSession`
+
+Multi-frame DIC that can move its reference forward. The maths is in
+[MATHEMATICS.md §9.5](MATHEMATICS.md#95-incremental-updated-reference-dic);
+the surface is in [CONTRACT.md](CONTRACT.md).
+
+```
+init(frame 0)        -> ReferenceCache::set_from_gray, frame-0 grid scan
+process_frame(t):
+  k == 0             -> run_full_field_impl into the caller's buffer (bit-identical)
+  k  > 0             -> run_full_field_impl on reference k's grid into scratch
+                        -> node_field_from_capture (solved, ZNSSD >= 0, median test)
+                        -> sample_increment at X0 + U(X0,k) for every tracked node
+                           - nothing in reach: fit_increment (coast, unreported)
+                           - coasted far: match_anchor before it is reported again
+                        -> frame-0 ResultGrid -> pack_full_field_output (VSG, packing)
+  every N frames,    -> make_anchor for clean nodes near a gap (from this frame)
+  or on a 5% drop       warp_material_mask, ReferenceCache::adopt(prepared image)
+```
+
+- **Hand-off without rework.** `run_full_field_impl` takes an optional
+  `FieldCapture`. It returns the solved grid and, on a frame that will become
+  the next reference, the prepared deformed `Image` and its gray `cv::Mat`.
+  `ReferenceCache::adopt` takes them over and stamps the mask, so the new
+  reference is never decoded or prepared twice, and at most two `Image`s are
+  alive at once.
+- **State.** Per frame-0 node: the base displacement `U(X0, k)`, an `alive`
+  flag and the distance it has coasted. Anchors (a ~1.5 KB grey patch each)
+  only for nodes near a gap or coasting. Also the reference index, the frames
+  since the last update, the points reported on the first frame against the
+  reference, and the reference's mask and ROI.
+- **Errors and cancel.** Every state change happens after a successful solve,
+  so a negative return leaves the session as it was.
+- **Between updates (N > 1)** every frame after the first one on a reference
+  reuses that reference's cached grid scan, Hessian pool and phase-correlation
+  side.
+- **Metrics** are the increment solve's; frame-0 counts are in
+  `IncrementalFrameInfo`.
+
+Tunables: `tuning::kIncTaylorMaxCells`, `kIncMaskMaxSamplesPerPx`,
+`kIncMaskExtrapCells`, `kIncCoastRadiusCells`, `kIncCoastMinNodes`,
+`kIncCoastMaxTravelSubsets`, `kIncCoastTrustedTravelSubsets`,
+`kIncReanchorMaxShiftFraction`, `kIncReanchorMinShiftPx`, `kIncAnchorMarginPx`,
+`kIncEarlyUpdateDrop`.
+
+---
+
 ## Module: `bridge/SemperJNI.cpp`
 
 JNI surface (see `SemperNativeLib.kt` for the Kotlin declarations).
@@ -243,6 +314,11 @@ Key behaviors:
   (`schedule(dynamic, 32)`), reliability-guided seed propagation, and
   progress callbacks marshalled through a `NewGlobalRef` + `AttachCurrentThread`.
 - Results are written into a direct `ByteBuffer` (no copy back through JNI).
+- `initializeIncremental(...)` / `computeIncrementalFrame(...)` /
+  `releaseIncremental()` (v0.4.0) drive one `IncrementalSession` under the same
+  mutex. `initializeIncremental` drops the fixed-reference cache, since only one
+  of the two paths runs at a time. `computeIncrementalFrame` fills an optional
+  `int[6]` with the frame info.
 - `setCancelRequested(...)` sets the cooperative cancel flag. It takes **no
   lock** on purpose: `computeFullFieldDirect` holds the reference-cache mutex
   for the whole solve, so a cancel that waited for it could never arrive while
@@ -302,12 +378,11 @@ starts — a pending edit can never reach the engine uncommitted.
 
 | Path | Role |
 |---|---|
-| `include/semper/` | Public headers (`types`, `image`, `subset`, `solver`, `strain`, `simd`, `pipeline`, `io`, `seeding`, `semper_c.h`) |
+| `include/semper/` | Public headers (`types`, `image`, `subset`, `solver`, `strain`, `simd`, `pipeline`, `incremental`, `io`, `seeding`, `semper_c.h`) |
 | `src/math/` | Image / SubsetPrecomputer / OptimizationEngine |
 | `src/strain/` | StrainCalculator |
 | `src/io/` | Platform-agnostic OpenCV decode |
-| `src/seeding/` | AKAZE + RANSAC |
-| `src/pipeline/` | Full-field Path A/B/C + OpenMP |
+| `src/pipeline/` | Anchor seeding (phase correlation + lattice) + full-field Path A/B/C + OpenMP; incremental session (composition, mask warp) |
 | `adapters/android/` | JNI only → `libsemper_core.so` |
 | `adapters/c/` | Stable C ABI → `libsemper_c` |
 | `bindings/python/` | pybind11 module |
@@ -319,13 +394,28 @@ CMake targets: `semper_math`, `semper_pipeline`, `semper_android` (`OUTPUT_NAME 
 
 ## Dependencies (git submodules, built from source)
 
-Both libraries are **git submodules pinned to release tags**, not vendored
-binaries. Run `git submodule update --init --recursive` after cloning.
+Both libraries are **git submodules**, not vendored binaries. Run
+`git submodule update --init --recursive` after cloning.
 
-| Dependency | Path | Version | How it's used |
-|---|---|---|---|
-| **Eigen** | `third_party/eigen` | 5.0.1 | header-only; added via `include_directories` |
-| **OpenCV** | `third_party/opencv` | 4.13.0 | **compiled from source** in the engine build |
+`.gitmodules` records only `path` and `url` — there is no `branch` or tag entry.
+What pins the build is the **commit SHA the superproject records**, which is
+what `git submodule update` checks out. Those SHAs currently sit exactly on the
+upstream release tags below, so `git submodule status` prints the tag name, but
+that is a property of the commits chosen, not a constraint the repo enforces:
+bumping a submodule to an arbitrary commit would be accepted silently. Verify
+with `git submodule status` rather than trusting this table.
+
+| Dependency | Path | Recorded commit | Tag at that commit | How it's used |
+|---|---|---|---|---|
+| **Eigen** | `third_party/eigen` | `bc3b3987` | 5.0.1 | header-only; added via `include_directories` |
+| **OpenCV** | `third_party/opencv` | `fe38fc60` | 4.13.0 | **compiled from source** in the engine build |
+
+**OpenCV modules compiled:** `core,imgproc,imgcodecs` only
+(`SEMPER_OPENCV_BUILD_LIST` in `cmake/SemperOpenCV.cmake`, overridable from the
+cache). `features2d`, `flann` and `calib3d` were dropped in v0.2.2 along with the
+descriptor seeding front-end that used them; that removal is worth ~29% of the
+aarch64 `libsemper_c.so`. Nothing under `include/semper/` includes a header from
+the dropped modules, so re-adding one is a deliberate act, not an accident.
 
 **Sparse OpenCV checkout:** the full OpenCV repo includes `doc/`, `samples/`,
 `data/`, and `apps/` that this project never builds. After submodule init, run
@@ -377,3 +467,29 @@ configure.
   omit `-flto` (MinGW LTO + DLL is unstable).
 - 16 KB page alignment: `-Wl,-z,max-page-size=16384` on the Android shared lib for
   Android 15+ devices.
+
+### Platform support, and what CI actually gates
+
+| platform | status | gated by |
+|---|---|---|
+| Linux x86_64 (GCC, Clang) | supported | every CI job |
+| Android arm64-v8a | shipping target | not built in CI; built by the app |
+| Windows x86_64 (MinGW-w64) | **works, but ungated** | nothing |
+| aarch64 Linux cross | measurement only | nothing (see the toolchain header) |
+| MSVC | headers declare `dllexport`/`dllimport`, never built | nothing |
+
+Windows is a first-class *development* platform here — the engine, the C SDK
+and the full test suite all build and pass under MinGW-w64 — but no workflow
+builds it, so nothing stops a Windows break from landing. That is not
+hypothetical: `tests/integration/test_seeding_bench.cpp` shipped with an
+unguarded `<sys/resource.h>`, which broke not the benchmark but the whole
+`dic_tests` binary, and it survived review and a green CI run because CI is
+Linux.
+
+A Windows job is the real fix and is not currently justified: it would have to
+build the vendored OpenCV submodule on a Windows runner, which is the slowest
+part of the build and would dominate CI time for a platform nothing ships on.
+Until that changes, the rule is procedural: **a change that touches system
+headers, process/OS APIs or paths must be compiled on both hosts before
+merge**, and cross-host numeric results are covered separately by the
+tolerances documented in [TESTING.md](TESTING.md).

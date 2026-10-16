@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.22)
 # Version tracks include/semper/version.hpp (keep the two in sync).
 # C is required: vendored OpenCV and the C ABI smoke binary compile C sources.
-project(semper VERSION 0.2.3 LANGUAGES C CXX)
+project(semper VERSION 0.4.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -15,7 +15,7 @@ set(EIGEN_SRC_DIR "${SEMPER_ROOT}/third_party/eigen")
 
 if(SEMPER_ANDROID AND SEMPER_FORCE_RELEASE)
     # AGP passes -DCMAKE_BUILD_TYPE=Debug for debug APKs, which would compile
-    # OpenCV at -O0 (~10x slower AKAZE). Force Release like the prebuilt SDK.
+    # OpenCV at -O0. Force Release like the prebuilt SDK.
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
@@ -27,9 +27,6 @@ set(SEMPER_OPENCV_INCLUDE_DIRS
         ${OPENCV_SRC_DIR}/modules/core/include
         ${OPENCV_SRC_DIR}/modules/imgproc/include
         ${OPENCV_SRC_DIR}/modules/imgcodecs/include
-        ${OPENCV_SRC_DIR}/modules/features2d/include
-        ${OPENCV_SRC_DIR}/modules/calib3d/include
-        ${OPENCV_SRC_DIR}/modules/flann/include
         ${CMAKE_BINARY_DIR}
 )
 
@@ -74,17 +71,19 @@ endif()
 # ---------------------------------------------------------------------------
 add_library(semper_pipeline STATIC
         src/io/image_codec.cpp
-        src/seeding/akaze_seed.cpp
+        src/pipeline/phase_correlate.cpp
         src/pipeline/reference_cache.cpp
         src/pipeline/cancel.cpp
         src/pipeline/full_field_solver.cpp
-        src/pipeline/full_field_akaze.cpp
+        src/pipeline/full_field_anchors.cpp
         src/pipeline/full_field_mesh.cpp
         src/pipeline/full_field_path_a.cpp
         src/pipeline/full_field_path_b.cpp
         src/pipeline/full_field_path_c.cpp
         src/pipeline/full_field_solver_stats.cpp
         src/pipeline/full_field_debug_export.cpp
+        src/pipeline/incremental_math.cpp
+        src/pipeline/incremental_session.cpp
 )
 target_include_directories(semper_pipeline
         PUBLIC
@@ -102,9 +101,6 @@ target_link_libraries(semper_pipeline
             opencv_core
             opencv_imgproc
             opencv_imgcodecs
-            opencv_features2d
-            opencv_calib3d
-            opencv_flann
 )
 target_compile_definitions(semper_pipeline PRIVATE
         $<$<BOOL:${SEMPER_ANDROID}>:SEMPER_ANDROID_LOG=1>

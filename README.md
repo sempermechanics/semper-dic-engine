@@ -42,6 +42,28 @@ python examples/python/run_translation.py
 
 Details: [examples/README.md](examples/README.md) · [docs/EXAMPLES.md](docs/EXAMPLES.md).
 
+### Fixed or incremental reference
+
+By default every frame is correlated against the first image. For sequences
+with large rotation or strain, `IncrementalSession` moves the reference forward
+every `update_interval` frames and still reports total displacement from the
+first image, on its grid, in the same 8-float layout:
+
+```python
+import semper
+s = semper.IncrementalSession(frames[0], rect=(0, 0, 512, 512), step=10,
+                              subset=21, strain_window=21, update_interval=1)
+for frame in frames[1:]:
+    res = s.process(frame)        # res.points: (N, 8) totals from frames[0]
+    print(res.info["reference_frame"], res.info["tracked_points"])
+```
+
+`update_interval=0` is the fixed reference. On small or moderate deformation
+the fixed reference is more accurate, because every reference update adds a
+little interpolation bias; see
+[docs/INCREMENTAL_BENCHMARK.md](docs/INCREMENTAL_BENCHMARK.md). C++:
+`<semper/incremental.hpp>`; C: `semper_incremental_*` in `semper_c.h`.
+
 ## Build
 
 ### Host tests
@@ -115,9 +137,10 @@ Configure with `-DSEMPER_ANDROID=ON`. The shared library `OUTPUT_NAME` is
 | [docs/MATHEMATICS.md](docs/MATHEMATICS.md) | Formal DIC / ICGN / strain derivations |
 | [docs/TESTING.md](docs/TESTING.md) | Host / C / Python test catalog |
 | [docs/EXAMPLES.md](docs/EXAMPLES.md) | Beginner samples + verified results |
+| [docs/INCREMENTAL_BENCHMARK.md](docs/INCREMENTAL_BENCHMARK.md) | Fixed vs incremental reference: accuracy, precision, cost |
 | [docs/PERF_BASELINE_bd44af0.md](docs/PERF_BASELINE_bd44af0.md) | Non-regression speed/quality floor |
 
-Output packing (**8 floats/point**), metrics layout (**17 floats**), and return
+Output packing (**8 floats/point**), metrics layout (**23 floats**), and return
 codes are **Frozen**. Touching `include/semper/*` requires stating the semver
 tier in the PR.
 

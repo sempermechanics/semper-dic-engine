@@ -27,8 +27,38 @@ inline constexpr int kIcgnMaxIter = 50;
 /** Reject a subset if more than this fraction of ref pixels hit the ghost wall. */
 inline constexpr float kGhostRejectFraction = 0.05f;
 
-/** AKAZE inlier convex-hull coverage for SPARSE vs clustered routing. */
-inline constexpr float kAkazeSparseCoverage = 0.05f;
+/** Anchor convex-hull coverage for SPARSE vs clustered routing. */
+inline constexpr float kAnchorSparseCoverage = 0.05f;
+
+/** Anchor-lattice seeding: target number of lattice nodes over the ROI. */
+inline constexpr int kAnchorTarget = 256;
+
+/** Anchor-lattice seeding: minimum lattice stride in grid nodes. */
+inline constexpr int kAnchorStrideMin = 1;
+
+/** Anchor-lattice seeding: ZNSSD gate for keeping an anchor as a mesh vertex.
+ *  Deliberately looser than kCorrAccept: a seed only has to be approximately
+ *  right, and the universal median test below rejects the blunders. Gating
+ *  seeds at the final acceptance threshold discards usable vertices on noisy
+ *  images and collapses mesh coverage. */
+inline constexpr float kAnchorAcceptScore = 0.40f;
+
+/** Anchor-lattice seeding: universal-median-test rejection radius (px). */
+inline constexpr float kAnchorMedianTol = 1.0f;
+
+/** Anchor-lattice seeding: accepted/attempted fraction for a FULL mesh. */
+inline constexpr float kAnchorFullFraction = 0.60f;
+
+/** Anchor-lattice seeding: accepted vertices needed for a FULL mesh. Three is
+ *  enough for one Delaunay triangle; ten is the point past which the mesh is
+ *  dense enough to guide Path A over the whole ROI rather than a corner of it. */
+inline constexpr int kAnchorFullMinVertices = 10;
+
+/** Anchor-lattice seeding: convex-hull coverage of the ROI for a FULL mesh. */
+inline constexpr float kAnchorFullCoverage = 0.30f;
+
+/** Phase-correlation peak response below which the global shift is not trusted. */
+inline constexpr float kPhaseCorrMinResponse = 0.05f;
 
 /** Packed-field sentinel for "no valid correlation at this grid point". */
 inline constexpr float kCorrInvalid = -1.0f;
@@ -71,6 +101,86 @@ inline constexpr int kOutlierMinNeighbours = 3;
 
 /** Displacement median test: pass limit (it stops early once stable). */
 inline constexpr int kOutlierMaxPasses = 5;
+
+/**
+ * Incremental DIC: furthest a material point may sit from the nearest solved
+ * node (in grid cells) and still take that node's first-order expansion when
+ * bilinear interpolation lacks a corner. 1.5 covers a diagonal neighbour
+ * (sqrt(2) cells); beyond it the point is dropped.
+ */
+inline constexpr float kIncTaylorMaxCells = 1.5f;
+
+/**
+ * Incremental DIC mask warp: cap on frame-0 samples per pixel per axis when
+ * the material mask is pushed forward through X + U(X). The warp uses enough
+ * samples that neighbours land within 0.7 px of each other at the largest
+ * local stretch (2 per axis for a rigid or mildly strained body); 8 covers a
+ * local stretch of 5.6 between references.
+ */
+inline constexpr int kIncMaskMaxSamplesPerPx = 8;
+
+/**
+ * Incremental DIC coasting: a tracked node whose increment cannot be sampled
+ * (no solved node within kIncTaylorMaxCells) is carried on a plane fitted to
+ * the solved increments within this many grid cells, instead of being dropped.
+ * It is not reported while it coasts, and it is measured again as soon as the
+ * solve reaches it. 8 cells spans a band one subset wide with solved nodes on
+ * both sides at the default step-to-subset ratio.
+ */
+inline constexpr int kIncCoastRadiusCells = 8;
+
+/** Incremental DIC coasting: solved nodes the plane fit needs. */
+inline constexpr int kIncCoastMinNodes = 6;
+
+/**
+ * Incremental DIC coasting: how far (in subset sizes, image pixels) a node may
+ * travel on fitted increments before it is dropped. Crossing a stationary
+ * edge takes about one subset of travel; past two, the node is not coming back.
+ */
+inline constexpr float kIncCoastMaxTravelSubsets = 2.0f;
+
+/**
+ * Incremental DIC re-anchoring: a coasted node whose increment can be sampled
+ * again is not reported until its subset from the last reference it was
+ * measured on matches the current frame directly. The match may move the node
+ * from where coasting left it by at most this fraction of the distance it
+ * coasted (a plane fitted over a gap drifts by up to ~20% of the motion across
+ * it), and never less than kIncReanchorMinShiftPx.
+ */
+/**
+ * Incremental DIC re-anchoring: a node that coasted no further than this (in
+ * subset sizes) is reported again as soon as it is measured, without a direct
+ * match. A short coast, typically a frame or two at the edge of a gap, adds
+ * an error well below the measurement noise; a node that has never had a
+ * clean subset (it sat in the gap on frame 0) could not be confirmed anyway.
+ */
+inline constexpr float kIncCoastTrustedTravelSubsets = 0.25f;
+inline constexpr float kIncReanchorMaxShiftFraction = 0.3f;
+inline constexpr float kIncReanchorMinShiftPx = 1.0f;
+
+/** Incremental DIC re-anchoring: pixels kept around a stored subset, past its
+ *  edge, so its intensity gradients do not see the edge of the patch. */
+inline constexpr int kIncAnchorMarginPx = 10;
+
+/**
+ * Incremental DIC early update: with an interval N > 1, the reference moves to
+ * the frame just solved, without waiting out N, when the points it reports
+ * fall this fraction below those reported on the first frame against the
+ * current reference. The increment has grown past what the images still
+ * correlate over (fast loading, necking, whitening), and the frames after it
+ * correlate against something closer. The comparison is with this reference's
+ * own first frame, so a band that always fails does not shorten N.
+ */
+inline constexpr float kIncEarlyUpdateDrop = 0.05f;
+
+/**
+ * Incremental DIC mask warp: how far past the outermost frame-0 nodes (in
+ * grid cells, plus half a subset) the warped mask is evaluated. The field is
+ * extended linearly from the edge cells over that window. The material
+ * reaches up to ceil(half*sqrt(2)) + 1 px past the outer nodes (no user
+ * mask), so this has to cover more than one cell.
+ */
+inline constexpr int kIncMaskExtrapCells = 3;
 
 } // namespace tuning
 } // namespace Semper

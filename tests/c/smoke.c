@@ -125,7 +125,9 @@ int main(void) {
     params.rect_h = 176;
     params.step = 16;
     params.subset_size = 31;
-    params.strain_window = 5;
+    /* >= 2 * step: below that the VSG plane fit has one grid node and
+       semper_run returns SEMPER_ERR_STRAIN_WINDOW. */
+    params.strain_window = 33;
     params.use_6x6_interpolator = 0;
 
     float out[SEMPER_FLOATS_PER_POINT * MAX_PTS];
@@ -160,8 +162,55 @@ int main(void) {
         printf("note: 0 points after filter — C ABI path still exercised\n");
     }
 
-    printf("OK — C ABI smoke passed\n");
     semper_destroy(eng);
+
+    /* Incremental session: two frames of +DX each, reference moved every
+       frame. The second frame is solved against the first, and the result
+       is still the total from the first image: ~2 * DX. */
+    uint8_t* def2 = (uint8_t*)malloc((size_t)W * H);
+    if (!def2) {
+        fprintf(stderr, "alloc failed\n");
+        return 1;
+    }
+    shift_x(def, def2, DX);
+    semper_incremental* inc = semper_incremental_create();
+    if (!inc) {
+        fprintf(stderr, "semper_incremental_create failed\n");
+        return 1;
+    }
+    rc = semper_incremental_init(inc, ref, (size_t)W * H, NULL, 0, W, H, &params, 1);
+    if (rc != 0) {
+        fprintf(stderr, "semper_incremental_init failed: %d\n", rc);
+        semper_incremental_destroy(inc);
+        return 1;
+    }
+    const uint8_t* frames[2] = {def, def2};
+    for (int f = 0; f < 2; ++f) {
+        semper_incremental_info info;
+        memset(&info, 0, sizeof(info));
+        n = semper_incremental_process(inc, frames[f], (size_t)W * H, out,
+                                       SEMPER_FLOATS_PER_POINT * MAX_PTS,
+                                       metrics, SEMPER_METRICS_LEN, &info, NULL, NULL);
+        if (n <= 0) {
+            fprintf(stderr, "semper_incremental_process frame %d: %d\n", f + 1, n);
+            semper_incremental_destroy(inc);
+            return 1;
+        }
+        const float med_u = median_u(out, n);
+        printf("incremental frame %d: points=%d  median_u=%.4f (expect ~%d)  ref=%d updated=%d tracked=%d/%d\n",
+               f + 1, n, med_u, DX * (f + 1), (int)info.reference_frame, (int)info.reference_updated,
+               (int)info.tracked_points, (int)info.frame0_points);
+        if (fabsf(med_u - (float)(DX * (f + 1))) > 0.75f || info.reference_frame != f ||
+            info.reference_updated != 1) {
+            fprintf(stderr, "FAIL: incremental frame %d\n", f + 1);
+            semper_incremental_destroy(inc);
+            return 1;
+        }
+    }
+    semper_incremental_destroy(inc);
+    free(def2);
+
+    printf("OK — C ABI smoke passed\n");
     free(ref);
     free(def);
     return 0;

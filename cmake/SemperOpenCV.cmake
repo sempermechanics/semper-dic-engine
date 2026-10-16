@@ -11,7 +11,13 @@ foreach(_stub doc data)
     endif()
 endforeach()
 
-set(BUILD_LIST "core,imgproc,imgcodecs,features2d,calib3d,flann" CACHE STRING "" FORCE)
+# The engine needs core/imgproc/imgcodecs only. features2d, flann and calib3d
+# went out with the descriptor seeding front-end (they served AKAZE, BFMatcher
+# and one cv::findHomography call); dropping them takes ~29% off the aarch64
+# libsemper_c.so. Overridable so the cost can be re-measured.
+set(SEMPER_OPENCV_BUILD_LIST "core,imgproc,imgcodecs"
+    CACHE STRING "OpenCV modules compiled from source")
+set(BUILD_LIST "${SEMPER_OPENCV_BUILD_LIST}" CACHE STRING "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
 # Python extensions (and most host toolchains) use the dynamic CRT (/MD). OpenCV's

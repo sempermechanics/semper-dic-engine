@@ -11,8 +11,8 @@
 
 using Semper::pipeline::ReferenceCache;
 
-// The struct's own contract: one process-wide instance owns a raw Image*, so it
-// must never be copied or moved (double-free). Pin it at compile time.
+// The struct's own contract: one process-wide instance that solves hold
+// references into, so it must never be copied or moved. Pin it at compile time.
 static_assert(!std::is_copy_constructible<ReferenceCache>::value,
               "ReferenceCache must stay non-copyable (docs/CONTRACT.md A.2)");
 static_assert(!std::is_move_constructible<ReferenceCache>::value,
@@ -21,6 +21,10 @@ static_assert(!std::is_move_constructible<ReferenceCache>::value,
 #if defined(DIC_HAVE_OPENCV)
 
 #include <opencv2/core.hpp>
+
+#include <cstring>
+#include <memory>
+#include <vector>
 
 namespace {
 
@@ -102,7 +106,7 @@ TEST_CASE(ReferenceCache, NoMask_LeavesAllPixelsReal) {
     CHECK(ghosts == 0);
 }
 
-TEST_CASE(ReferenceCache, Relifecycle_UpdatesDimsAndClearsAkaze) {
+TEST_CASE(ReferenceCache, Relifecycle_UpdatesDims) {
     ReferenceCache cache;
     cache.set_from_gray(ramp_gray(40, 30), cv::Mat());
     REQUIRE(cache.ref_img != nullptr);
@@ -116,9 +120,6 @@ TEST_CASE(ReferenceCache, Relifecycle_UpdatesDimsAndClearsAkaze) {
     CHECK(cache.height == 50);
     CHECK(cache.ref_img->width == 20);
     CHECK(cache.ref_img->height == 50);
-    CHECK(cache.akaze_kp.empty());          // seeding state reset
-    CHECK(cache.akaze_desc.empty());
-    CHECK(cache.akaze_scale == 0.25);
 }
 
 TEST_CASE(ReferenceCache, EmptyInput_LeavesCacheCleared) {
@@ -145,8 +146,56 @@ TEST_CASE(ReferenceCache, Reset_ClearsEverything) {
     CHECK(cache.width == 0);
     CHECK(cache.height == 0);
     CHECK(cache.gray.empty());
-    CHECK(cache.akaze_kp.empty());
-    CHECK(cache.akaze_scale == 0.25);
+}
+
+// ---------------------------------------------------------------------------
+// adopt(): taking an already-prepared image must equal set_from_gray exactly.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+bool same_floats(const std::vector<float> &a, const std::vector<float> &b) {
+    return a.size() == b.size() &&
+           (a.empty() || std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0);
+}
+
+void check_adopt_matches(const cv::Mat &gray, const cv::Mat &mask) {
+    ReferenceCache via_gray;
+    via_gray.set_from_gray(gray, mask);
+
+    // What run_full_field builds for a deformed image.
+    auto prepared = std::make_unique<Semper::Image>(gray.cols, gray.rows, gray.data);
+    prepared->prepare_data(false);
+    ReferenceCache via_adopt;
+    via_adopt.adopt(std::move(prepared), gray.clone(), mask);
+
+    REQUIRE(via_gray.ref_img != nullptr);
+    REQUIRE(via_adopt.ref_img != nullptr);
+    CHECK(via_adopt.width == via_gray.width);
+    CHECK(via_adopt.height == via_gray.height);
+    CHECK(same_floats(via_adopt.ref_img->intensities, via_gray.ref_img->intensities));
+    CHECK(same_floats(via_adopt.ref_img->grad_x, via_gray.ref_img->grad_x));
+    CHECK(same_floats(via_adopt.ref_img->grad_y, via_gray.ref_img->grad_y));
+    CHECK(cv::norm(via_adopt.gray, via_gray.gray, cv::NORM_INF) == 0.0);
+}
+
+} // namespace
+
+TEST_CASE(ReferenceCache, Adopt_EqualsSetFromGray_NoMask) {
+    check_adopt_matches(ramp_gray(40, 30), cv::Mat());
+}
+
+TEST_CASE(ReferenceCache, Adopt_EqualsSetFromGray_WithMask) {
+    check_adopt_matches(ramp_gray(40, 30), left_half_black_mask(40, 30));
+}
+
+TEST_CASE(ReferenceCache, Adopt_NullImage_LeavesCacheCleared) {
+    ReferenceCache cache;
+    cache.set_from_gray(ramp_gray(24, 16), cv::Mat());
+    cache.adopt(nullptr, ramp_gray(24, 16), cv::Mat());
+    CHECK(cache.ref_img == nullptr);
+    CHECK(cache.width == 0);
+    CHECK(cache.gray.empty());
 }
 
 #else

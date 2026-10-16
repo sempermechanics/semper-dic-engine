@@ -58,7 +58,7 @@ def main() -> int:
         rect=(64, 64, 384, 384),
         step=32,
         subset=27,
-        strain_window=5,
+        strain_window=65,   # >= 2 * step
         progress=lambda pct: print(f"\r  progress: {pct:3d}%", end="", flush=True),
     )
     print()

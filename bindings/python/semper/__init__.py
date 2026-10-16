@@ -9,7 +9,7 @@ Example
 >>> eng = semper.Engine()
 >>> eng.set_reference(ref_u8)                     # 2-D uint8 array or encoded bytes
 >>> res = eng.run(def_u8, rect=(0, 0, 512, 512),
-...               step=10, subset=21, strain_window=5)
+...               step=10, subset=21, strain_window=21)
 >>> res.points.shape          # (N, 8): x, y, u, v, exx, eyy, exy, corr
 (2401, 8)
 """
@@ -20,14 +20,18 @@ from dataclasses import dataclass
 import numpy as np
 
 from ._semper import Engine as _Engine
+from ._semper import IncrementalSession as _IncrementalSession
 from ._semper import __version__
 
 __all__ = [
     "Engine",
     "Result",
+    "IncrementalSession",
+    "FrameResult",
     "DicError",
     "ERR_ROI",
     "ERR_INIT",
+    "ERR_STRAIN_WINDOW",
     "ERR_CANCELLED",
     "__version__",
 ]
@@ -35,11 +39,13 @@ __all__ = [
 # Frozen error codes (see the contract doc). >= 0 is a valid point count.
 ERR_ROI = -2
 ERR_INIT = -3
+ERR_STRAIN_WINDOW = -4
 ERR_CANCELLED = -99
 
 _MESSAGES = {
     ERR_ROI: "invalid ROI",
     ERR_INIT: "init/argument failure (was set_reference called?)",
+    ERR_STRAIN_WINDOW: "strain_window too small for step (need >= 2 * step)",
     ERR_CANCELLED: "cancelled",
 }
 
@@ -57,7 +63,7 @@ class Result:
     """One solve's output.
 
     ``points`` is an ``(N, 8)`` float32 array with columns
-    ``[x, y, u, v, exx, eyy, exy, corr]``; ``metrics`` is the ``(17,)`` telemetry.
+    ``[x, y, u, v, exx, eyy, exy, corr]``; ``metrics`` is the ``(23,)`` telemetry.
     """
 
     count: int
@@ -106,3 +112,88 @@ class Engine:
     def cancel(self) -> None:
         """Request cancellation of the run in flight. Safe to call from any thread."""
         self._engine.cancel()
+
+
+@dataclass
+class FrameResult:
+    """One frame of an incremental sequence.
+
+    ``points`` is ``(N, 8)`` float32, ``[x0, y0, u, v, exx, eyy, exy, corr]``:
+    total displacement from the first image at its grid points, with
+    Green-Lagrange strain of that total. ``metrics`` describes the solve
+    against the current reference; ``info`` holds ``reference_frame``,
+    ``reference_updated``, ``tracked_points``, ``frame0_points``,
+    ``taylor_fallbacks`` and ``lost_this_frame``.
+    """
+
+    count: int
+    points: np.ndarray
+    metrics: np.ndarray
+    info: dict
+
+
+class IncrementalSession:
+    """Incremental (updated-reference) DIC over a frame sequence.
+
+    The reference moves to the latest solved frame every ``update_interval``
+    frames (``0`` keeps the first image, identical to :meth:`Engine.run` per
+    frame). Each frame is correlated against the current reference and composed
+    onto the running total, so large deformation can be followed frame by
+    frame. Every update adds a little error, so on slow loading a larger
+    interval (or the fixed reference) is more accurate. With an interval above
+    1 the reference also moves as soon as a frame reports 5% fewer points.
+
+    A point the solve cannot reach on a frame (a band that does not correlate,
+    such as glare or a background edge) coasts on its neighbours' motion and is
+    not reported; it is reported again once it is measured, after a long coast
+    only once its own earlier subset confirms where it is.
+
+    Not thread-safe except for :meth:`cancel`.
+
+    >>> s = semper.IncrementalSession(ref_u8, rect=(0, 0, 512, 512), step=10,
+    ...                               subset=21, strain_window=21, update_interval=1)
+    >>> for frame in frames:
+    ...     res = s.process(frame)
+    """
+
+    def __init__(
+        self,
+        image,
+        rect,
+        step: int,
+        subset: int,
+        strain_window: int,
+        *,
+        update_interval: int = 1,
+        mask=None,
+        use_6x6: bool = False,
+        expected_w: int = 0,
+        expected_h: int = 0,
+    ) -> None:
+        self._session = _IncrementalSession()
+        code = self._session.init(
+            image, mask, tuple(rect), step, subset, strain_window, use_6x6,
+            update_interval, expected_w, expected_h,
+        )
+        if code < 0:
+            raise DicError(code)
+
+    def process(self, deformed, *, progress=None, raise_on_error: bool = True) -> FrameResult:
+        """Solve the next frame. Raises :class:`DicError` on a negative code
+        unless ``raise_on_error=False``. A failed or cancelled frame leaves the
+        session unchanged, so the same frame can be submitted again."""
+        code, points, metrics, info = self._session.process(deformed, progress)
+        if code < 0:
+            if raise_on_error:
+                raise DicError(code)
+            return FrameResult(code, np.empty((0, 8), np.float32), metrics, info)
+        return FrameResult(code, points, metrics, info)
+
+    @property
+    def frames_processed(self) -> int:
+        """Frames solved so far (the first image not counted)."""
+        return self._session.frames_processed
+
+    def cancel(self) -> None:
+        """Request cancellation of the frame in flight. Safe from any thread."""
+        self._session.cancel()

@@ -4,7 +4,6 @@
 
 #include "full_field_internal.hpp"
 
-#include <semper/seeding.hpp>
 #include <semper/tuning.hpp>
 #include "util/log.hpp"
 
@@ -23,6 +22,11 @@
 namespace Semper {
 namespace pipeline {
 namespace internal {
+
+void draw_outlined_text(cv::Mat &img, const std::string &text, cv::Point pt, double scale) {
+    cv::putText(img, text, pt, cv::FONT_HERSHEY_SIMPLEX, scale, cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
+    cv::putText(img, text, pt, cv::FONT_HERSHEY_SIMPLEX, scale, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+}
 
 void export_full_field_debug_suite(
         const std::string& local_debug_dir,
@@ -96,18 +100,12 @@ if (!local_debug_dir.empty()) {
                 }
 
                 if (!is_masked) {
-                    if (gp.mesh_assignment_type == 1) {
+                    if (gp.mesh_assignment_type == kMeshInTriangle) {
                         meshAssignMap.at<cv::Vec3b>(y, x) = cv::Vec3b(0, 255, 0);
-                    } else if (gp.mesh_assignment_type == 2) {
+                    } else if (gp.mesh_assignment_type == kMeshExtrapolated) {
                         meshAssignMap.at<cv::Vec3b>(y, x) = cv::Vec3b(0, 255, 255);
-                    } else if (gp.mesh_assignment_type >= 1000) {
-                        int dist = gp.mesh_assignment_type - 1000;
-                        int r = std::max(0, std::min(255, (dist - 127) * 2));
-                        int g = 255 - std::abs(dist - 127) * 2;
-                        int b = std::max(0, std::min(255, (127 - dist) * 2));
-                        meshAssignMap.at<cv::Vec3b>(y, x) = cv::Vec3b(b, g, r);
-                    } else if (gp.mesh_assignment_type == 4) {
-                        meshAssignMap.at<cv::Vec3b>(y, x) = cv::Vec3b(0, 165, 255);
+                    } else if (gp.mesh_assignment_type == kMeshAnchor) {
+                        meshAssignMap.at<cv::Vec3b>(y, x) = cv::Vec3b(255, 0, 0);
                     } else {
                         meshAssignMap.at<cv::Vec3b>(y, x) = cv::Vec3b(100, 100, 100);
                     }
@@ -150,12 +148,12 @@ if (!local_debug_dir.empty()) {
         cv::resize(strainColor, outStrain, sz, 0, 0, cv::INTER_NEAREST);
         cv::resize(simplexMap, outSimplex, sz, 0, 0, cv::INTER_NEAREST);
 
-        seeding::draw_outlined_text(outProp, "Propagation Debug", cv::Point(10, 25), 0.6);
-        seeding::draw_outlined_text(outThread, "8-Core Thread Execution Map", cv::Point(10, 25), 0.6);
-        seeding::draw_outlined_text(outMesh, "Mesh Assign (Grn=In, Yel=Ex, Gry=PathB)", cv::Point(10, 25), 0.6);
-        seeding::draw_outlined_text(outCorr, "ZNSSD Quality (Blue=Perfect, Red=Marginal)", cv::Point(10, 25), 0.6);
-        seeding::draw_outlined_text(outStrain, "Exx Strain (Raw Plot)", cv::Point(10, 25), 0.6);
-        seeding::draw_outlined_text(outSimplex, "Grn=Perfect | Yel=Save(Crash) | Cya=Save(Time) | Org=Dead(Crash) | Pur=Dead(Time) | Red=Insta-Dead", cv::Point(10, 25), 0.4);
+        draw_outlined_text(outProp, "Propagation Debug", cv::Point(10, 25), 0.6);
+        draw_outlined_text(outThread, "8-Core Thread Execution Map", cv::Point(10, 25), 0.6);
+        draw_outlined_text(outMesh, "Mesh Assign (Grn=In, Yel=Ex, Blu=Anchor, Gry=PathB)", cv::Point(10, 25), 0.6);
+        draw_outlined_text(outCorr, "ZNSSD Quality (Blue=Perfect, Red=Marginal)", cv::Point(10, 25), 0.6);
+        draw_outlined_text(outStrain, "Exx Strain (Raw Plot)", cv::Point(10, 25), 0.6);
+        draw_outlined_text(outSimplex, "Grn=Perfect | Yel=Save(Crash) | Cya=Save(Time) | Org=Dead(Crash) | Pur=Dead(Time) | Red=Insta-Dead", cv::Point(10, 25), 0.4);
 
         cv::imwrite(local_debug_dir + "/propagation_debug.png", outProp);
         cv::imwrite(local_debug_dir + "/thread_debug.png", outThread);
@@ -175,7 +173,7 @@ if (!local_debug_dir.empty()) {
             cv::line(outSimplexOverlap, pt2, pt3, cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
             cv::line(outSimplexOverlap, pt3, pt1, cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
         }
-        seeding::draw_outlined_text(outSimplexOverlap, "Simplex Health + Delaunay Overlap", cv::Point(10, 45), 0.4);
+        draw_outlined_text(outSimplexOverlap, "Simplex Health + Delaunay Overlap", cv::Point(10, 45), 0.4);
         cv::imwrite(local_debug_dir + "/simplex_mesh_overlap.png", outSimplexOverlap);
 
         std::string csvPath = local_debug_dir + "/debug_grid_data.csv";
@@ -313,8 +311,8 @@ if (!local_debug_dir.empty()) {
                 }
             }
 
-            seeding::draw_outlined_text(imgAll, "ALL Simplex Interventions vs. Mesh", cv::Point(10, 25), 0.6);
-            seeding::draw_outlined_text(imgDead, "ONLY Dead Points vs. Mesh", cv::Point(10, 25), 0.6);
+            draw_outlined_text(imgAll, "ALL Simplex Interventions vs. Mesh", cv::Point(10, 25), 0.6);
+            draw_outlined_text(imgDead, "ONLY Dead Points vs. Mesh", cv::Point(10, 25), 0.6);
 
             cv::imwrite(local_debug_dir + "/mesh_overlap_ALL_simplex.jpg", imgAll);
             cv::imwrite(local_debug_dir + "/mesh_overlap_ONLY_dead.jpg", imgDead);

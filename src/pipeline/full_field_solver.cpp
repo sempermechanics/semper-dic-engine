@@ -1,7 +1,7 @@
 // Orchestration for the hybrid full-field DIC solve.
 //
 // The individual phases live in sibling translation units (see
-// full_field_internal.hpp): AKAZE routing + Delaunay mesh + mesh-guided solve
+// full_field_internal.hpp): anchor seeding + Delaunay mesh + mesh-guided solve
 // in full_field_path_a.cpp, the flood fill in full_field_path_b.cpp, fallback
 // seeding in full_field_path_c.cpp, packing/telemetry in
 // full_field_solver_stats.cpp and the debug maps in
@@ -17,6 +17,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <opencv2/imgproc.hpp>
 #include <string>
@@ -65,6 +66,24 @@ int run_full_field(
     float* metrics,
     int metrics_len,
     ProgressCallback on_progress) {
+    return run_full_field_impl(cache, def_gray, roi_mask, params, output_ptr,
+                               output_capacity, metrics, metrics_len,
+                               std::move(on_progress), nullptr);
+}
+
+namespace internal {
+
+int run_full_field_impl(
+    ReferenceCache& cache,
+    const cv::Mat& def_gray,
+    const cv::Mat& roi_mask,
+    const FullFieldParams& params,
+    float* output_ptr,
+    int output_capacity,
+    float* metrics,
+    int metrics_len,
+    ProgressCallback on_progress,
+    FieldCapture* capture) {
 
         std::string local_debug_dir = cache.debug_dir;
         cache.debug_dir.clear();
@@ -100,27 +119,42 @@ int run_full_field(
             }
         }
 
-        Image defImg(defMat.cols, defMat.rows, defMat.data);
+        // Heap-allocated so incremental DIC can take it over as the next
+        // reference (FieldCapture::keep_deformed) instead of preparing it again.
+        auto defImgOwner = std::make_unique<Image>(defMat.cols, defMat.rows, defMat.data);
+        Image& defImg = *defImgOwner;
         defImg.prepare_data(false);
         timings.img_prep = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_prep_start).count();
 
         int safe_cores = std::max(1, (int)std::thread::hardware_concurrency());
 
-        // 🚀 IMPLEMENTATION: Priority 6 & 4 States — adaptive AKAZE scale pyramid
-        MeshSeedResult seeds = detect_mesh_seeds(cache, defMat, roiMask, params, local_debug_dir);
-        const std::vector<cv::Point2f>& akaze_ref_pts = seeds.ref_pts;
-        const std::vector<cv::Point2f>& akaze_def_pts = seeds.def_pts;
-        MeshQuality mesh_quality = seeds.quality;
-        float globalU = seeds.globalU, globalV = seeds.globalV;
-        timings.akaze = seeds.time_akaze_ms;
-        timings.ransac = seeds.time_ransac_ms;
-
-        // 🚀 IMPLEMENTATION: If we didn't even get a SPARSE mesh, trigger Path C
-        bool execute_path_c = (mesh_quality == MeshQuality::NONE);
-
         int gridW = params.rect_w / params.step;
         int gridH = params.rect_h / params.step;
         if (gridW <= 0 || gridH <= 0) return -2; // 🚀 PRIORITY 3: Return -2 for ROI Errors
+
+        // The VSG strain fit needs 3 grid nodes inside the strain window to
+        // solve for a plane. That count is fixed by (step, strain_window)
+        // alone, so when it is short every point is rejected by the strain
+        // post-filter no matter how well the correlation went, and the caller
+        // gets an empty field. Until 0.3.0 that came back as a *success* with
+        // zero points, which is indistinguishable from a genuinely blank ROI
+        // and left the caller nothing to debug from. Check it before solving.
+        const int vsg_nodes = StrainCalculator::vsg_window_node_count(
+                params.step, params.strain_window);
+        if (vsg_nodes < 3) {
+            // Derive the remedy from the function the gate itself calls, so the
+            // advice cannot drift from the rule. strain_window == 2 * step always
+            // clears it (radius == step puts 5 nodes in the window), which bounds
+            // the search; this runs only on the error path.
+            int min_window = 1;
+            while (StrainCalculator::vsg_window_node_count(params.step, min_window) < 3)
+                ++min_window;
+            LOGE("strain_window=%d spans only %d grid node(s) at step=%d; the VSG "
+                 "plane fit needs 3, so every point would be discarded. Raise "
+                 "strain_window to at least %d, or lower step.",
+                 params.strain_window, vsg_nodes, params.step, min_window);
+            return kBadStrainWindow;
+        }
 
         // Now that gridW and gridH exist, we can set their default fallbacks
         int path_c_seed_x = gridW / 2;
@@ -128,6 +162,27 @@ int run_full_field(
 
         ResultGrid resultGrid(gridH, std::vector<GridPoint>(gridW));
         int total_valid_points = 0;
+
+        // The scan below and the Hessian pre-pass depend only on the reference,
+        // the grid and the mask, so a batch against one reference computes them
+        // once (RefPrecompute). A hit replays the stored per-node verdicts into
+        // the same initializer the scan uses.
+        if (!cache.precompute) cache.precompute = std::make_unique<RefPrecompute>();
+        RefPrecompute& pre = *cache.precompute;
+        const bool grid_cached = pre.grid_matches(params, roiMask) &&
+                                 pre.gridW == gridW && pre.gridH == gridH;
+        if (grid_cached) {
+            for (int y = 0; y < gridH; ++y) {
+                for (int x = 0; x < gridW; ++x) {
+                    const bool shouldSkip = pre.skip[(size_t)y * gridW + x] != 0;
+                    int realX = params.rect_x + x * params.step;
+                    int realY = params.rect_y + y * params.step;
+                    resultGrid[y][x] = {(float)realX, (float)realY, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, CORR_INVALID, shouldSkip, -1, -1, 0, false, 0};
+                }
+            }
+            total_valid_points = pre.total_valid_points;
+        } else {
+        pre.grid_valid = false;
 
         // === 🚀 100% STRICT RULE: PURE SUBSETS ONLY ===
         // We scan the ENTIRE subset bounding box before allowing a grid point to exist.
@@ -180,6 +235,7 @@ int run_full_field(
                 // workers will ignore it entirely, just like DICe's kd-tree ignores it.
                 resultGrid[y][x] = {(float)realX, (float)realY, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, CORR_INVALID, shouldSkip, -1, -1, 0, false, 0};
             }
+        }
         }
 
         if (total_valid_points == 0) return -2; // 🚀 PRIORITY 3: Return -2 for Empty Mask
@@ -235,17 +291,15 @@ int run_full_field(
         };
         ThreadJoinGuard progressGuard{progress_thread, progress_thread_should_stop, progress_cv, progress_cv_mutex, progress_thread_detached};
 
-        std::vector<AffineTriangle> affTriangles;
-        MeshGuessField guess = build_mesh_guess_field(
-                cache, params, akaze_ref_pts, akaze_def_pts, mesh_quality,
-                globalU, globalV, gridW, gridH, local_debug_dir,
-                resultGrid, affTriangles, timings);
-
         // =========================================================
         // 🚀 GLOBAL HESSIAN PRE-PASS & CONTRAST THRESHOLDING
         // =========================================================
+        // Runs before seeding: the anchor lattice sits on grid nodes and reuses
+        // this pool, so its solves cost little more than the field costs anyway.
         auto t_prepass_start = std::chrono::high_resolution_clock::now();
-        HessianPool hessian_pool(gridW * gridH);
+        if (!grid_cached) {
+        pre.hessian_pool.assign((size_t)gridW * gridH, CachedHessianData());
+        HessianPool& hessian_pool = pre.hessian_pool;
 
     #pragma omp parallel for schedule(static) num_threads(safe_cores)
         for (int pool_idx = 0; pool_idx < gridW * gridH; ++pool_idx) {
@@ -260,14 +314,88 @@ int run_full_field(
             }
         }
 
+        // The cancel flag only ever goes up during a solve, so if it is still
+        // clear here every iteration above ran: the pool is complete and safe
+        // to reuse. Otherwise it stays marked stale for the next solve.
+        if (!cancel_requested()) {
+            pre.rect_x = params.rect_x; pre.rect_y = params.rect_y;
+            pre.rect_w = params.rect_w; pre.rect_h = params.rect_h;
+            pre.step = params.step; pre.subset_size = params.subset_size;
+            pre.roi_mask = roiMask.empty() ? cv::Mat() : roiMask.clone();
+            pre.gridW = gridW; pre.gridH = gridH;
+            pre.skip.assign((size_t)gridW * gridH, 0);
+            for (int y = 0; y < gridH; ++y)
+                for (int x = 0; x < gridW; ++x)
+                    pre.skip[(size_t)y * gridW + x] = resultGrid[y][x].solved ? 1 : 0;
+            pre.total_valid_points = total_valid_points;
+            pre.grid_valid = true;
+        }
+        }
+        const HessianPool& hessian_pool = pre.hessian_pool;
+
         timings.prepass = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_prepass_start).count();
+
+        // Anchor-lattice seeding: phase correlation for the global rigid shift,
+        // then IC-GN on a lattice of grid nodes. It records but publishes
+        // nothing; see AnchorResult for why that has to be a separate step.
+        std::vector<ThreadStats> stats_anchors(safe_cores);
+        MeshSeedResult seeds = solve_anchor_seeds(
+                cache, defMat, defImg, params, gridW, gridH, safe_cores,
+                hessian_pool, resultGrid, stats_anchors, timings);
+
+        // Now apply them. Nodes that clear the result gate *and* survive the
+        // median test are marked solved, so Path A skips them and Path B takes
+        // them as boundary seeds.
+        const int anchor_published = publish_anchor_results(
+                seeds, global_points_solved, compute_order_counter,
+                resultGrid, stats_anchors);
+        LOGD("Anchor lattice published %d of %d lattice nodes (%d converged)",
+             anchor_published, (int)seeds.anchors.size(), seeds.attempted);
+
+        const std::vector<cv::Point2f>& anchor_ref_pts = seeds.ref_pts;
+        const std::vector<cv::Point2f>& anchor_def_pts = seeds.def_pts;
+        MeshQuality mesh_quality = seeds.quality;
+        float globalU = seeds.globalU, globalV = seeds.globalV;
+
+        // Path C is the "we have no seed at all" fallback, and its failure aborts
+        // the solve. That was right when the front-end was AKAZE, which either
+        // produced a mesh or produced nothing. The anchor lattice also yields a
+        // phase-correlation lock and often some solved nodes, so a mesh too
+        // sparse to guide Path A is not the same as having no seed: Path B can
+        // flood-fill from what the lattice already found.
+        //
+        // A lock on its own is not a seed, though. Phase correlation can lock
+        // on a strong global shift while every anchor fails the result gate:
+        // then solved == 0, accepted == 0, and Path B has nothing to flood
+        // fill from but the blind grid-centre node. Require an actual point,
+        // and let the lock inform Path C's search rather than replace it.
+        const bool have_seed = seeds.solved > 0 || seeds.accepted >= 3;
+        bool execute_path_c = (mesh_quality == MeshQuality::NONE) && !have_seed;
+
+        if (cancel_requested()) return kCancelled;
+
+        std::vector<AffineTriangle> affTriangles;
+        MeshGuessField guess = build_mesh_guess_field(
+                cache, params, anchor_ref_pts, anchor_def_pts, mesh_quality,
+                globalU, globalV, gridW, gridH, local_debug_dir,
+                resultGrid, affTriangles, timings);
 
         const SolveContext ctx{cache, params, defImg, gridW, gridH, safe_cores,
                                hessian_pool, global_points_solved, compute_order_counter};
 
         if (execute_path_c) {
-            int rc = run_path_c(ctx, akaze_ref_pts, resultGrid, path_c_seed_x, path_c_seed_y, globalU, globalV);
-            if (rc != 0) return rc;
+            // Path C now runs in cases a bare phase lock used to suppress (see
+            // have_seed above), so its failure can no longer abort the solve:
+            // that would turn fields the old code delivered via Path B into an
+            // error return. When the lattice locked, fall through instead --
+            // Path B still has the global shift and the grid-centre seed, which
+            // is exactly what the old code handed it. Without a lock there is
+            // nothing left to try, so the abort stands.
+            int rc = run_path_c(ctx, anchor_ref_pts, resultGrid, path_c_seed_x, path_c_seed_y, globalU, globalV);
+            if (rc != 0) {
+                if (!seeds.phase_locked) return rc;
+                LOGE("Path C failed (%d); phase correlation locked, continuing to Path B with the global shift", rc);
+            }
         }
 
         {
@@ -281,13 +409,23 @@ int run_full_field(
 
         {
             ScopedTimer pathB_timer(timings.pathB);
-            run_path_b(ctx, akaze_ref_pts, akaze_def_pts, globalU, globalV,
+            run_path_b(ctx, anchor_ref_pts, anchor_def_pts, globalU, globalV,
                        path_c_seed_x, path_c_seed_y, resultGrid, stats_pathB);
         }
 
         // Path B's workers have been joined by their guard. A cancelled field is
         // partial, so there is nothing worth deriving strain from.
         if (cancel_requested()) return kCancelled;
+
+        if (capture) {
+            capture->gridW = gridW;
+            capture->gridH = gridH;
+            capture->rect_x = params.rect_x;
+            capture->rect_y = params.rect_y;
+            capture->step = params.step;
+            capture->attempted = total_valid_points;
+            capture->grid = resultGrid;
+        }
 
         auto packed = pack_full_field_output(
                 resultGrid, gridW, gridH, params.step, params.strain_window,
@@ -312,9 +450,9 @@ int run_full_field(
         // ==========================================
         // ⏱️ AGGREGATE PROFILING METRICS
         // ==========================================
-        SolveSummary summary = aggregate_thread_stats(stats_pathA, stats_pathB, safe_cores);
+        SolveSummary summary = aggregate_thread_stats(stats_pathA, stats_pathB, stats_anchors, safe_cores);
         timings.total = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_total_start).count();
-        log_profiling_summary(timings, summary, valid_count);
+        log_profiling_summary(timings, summary, seeds, valid_count);
 
         // =========================================================
         // 🐛 EXPORT FULL DEBUG SUITE (extracted — behaviour unchanged)
@@ -322,7 +460,7 @@ int run_full_field(
         if (!local_debug_dir.empty()) {
             export_full_field_debug_suite(
                     local_debug_dir, gridW, gridH, params, roiMask,
-                    cache.width, cache.height, cache.ref_img,
+                    cache.width, cache.height, cache.ref_img.get(),
                     resultGrid, strainField, affTriangles);
         }
 
@@ -330,11 +468,19 @@ int run_full_field(
         // 🚀 NEW: FULL ENGINE TELEMETRY EXPORT TO KOTLIN
         // ==========================================
         fill_engine_metrics(metrics, metrics_len, timings, summary,
-                            total_valid_points, valid_count, mesh_quality);
+                            total_valid_points, valid_count,
+                            packed.dropped_by_post_filter, seeds, mesh_quality);
+
+        if (capture && capture->keep_deformed) {
+            capture->deformed = std::move(defImgOwner);
+            capture->deformed_gray = def_gray.clone();
+        }
 
         defMat.release(); roiMask.release();
         return valid_count;
 }
+
+} // namespace internal
 
 
 } // namespace pipeline

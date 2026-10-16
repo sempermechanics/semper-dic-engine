@@ -8,7 +8,7 @@
     "rect": [40, 40, 432, 432],
     "step": 35,
     "subset_size": 27,
-    "strain_window": 5,
+    "strain_window": 71,
     "use_6x6_interpolator": true
   },
   "dice_solution": "DICe_solution_01.txt",

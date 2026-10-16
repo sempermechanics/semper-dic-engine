@@ -3,7 +3,6 @@
 
 #include "full_field_internal.hpp"
 
-#include <semper/seeding.hpp>
 #include <semper/solver.hpp>
 #include <semper/subset.hpp>
 #include <semper/tuning.hpp>
@@ -29,8 +28,8 @@ namespace internal {
 MeshGuessField build_mesh_guess_field(
         const ReferenceCache& cache,
         const FullFieldParams& params,
-        const std::vector<cv::Point2f>& akaze_ref_pts,
-        const std::vector<cv::Point2f>& akaze_def_pts,
+        const std::vector<cv::Point2f>& seed_ref_pts,
+        const std::vector<cv::Point2f>& seed_def_pts,
         MeshQuality mesh_quality,
         float globalU,
         float globalV,
@@ -53,10 +52,10 @@ MeshGuessField build_mesh_guess_field(
     auto t_mesh_start = std::chrono::high_resolution_clock::now();
 
     cv::Subdiv2D subdiv(cv::Rect(0, 0, cache.width, cache.height));
-    for (size_t i = 0; i < akaze_ref_pts.size(); i++) {
-        if (akaze_ref_pts[i].x > 0 && akaze_ref_pts[i].x < cache.width &&
-            akaze_ref_pts[i].y > 0 && akaze_ref_pts[i].y < cache.height) {
-            subdiv.insert(akaze_ref_pts[i]);
+    for (size_t i = 0; i < seed_ref_pts.size(); i++) {
+        if (seed_ref_pts[i].x > 0 && seed_ref_pts[i].x < cache.width &&
+            seed_ref_pts[i].y > 0 && seed_ref_pts[i].y < cache.height) {
+            subdiv.insert(seed_ref_pts[i]);
         }
     }
 
@@ -65,9 +64,9 @@ MeshGuessField build_mesh_guess_field(
 
     auto getDefPt = [&](cv::Point2f pt) -> cv::Point2f {
         float min_dist = 1e9; cv::Point2f best_pt = pt;
-        for (size_t i = 0; i < akaze_ref_pts.size(); i++) {
-            float d = (akaze_ref_pts[i].x - pt.x) * (akaze_ref_pts[i].x - pt.x) + (akaze_ref_pts[i].y - pt.y) * (akaze_ref_pts[i].y - pt.y);
-            if (d < min_dist) { min_dist = d; best_pt = akaze_def_pts[i]; }
+        for (size_t i = 0; i < seed_ref_pts.size(); i++) {
+            float d = (seed_ref_pts[i].x - pt.x) * (seed_ref_pts[i].x - pt.x) + (seed_ref_pts[i].y - pt.y) * (seed_ref_pts[i].y - pt.y);
+            if (d < min_dist) { min_dist = d; best_pt = seed_def_pts[i]; }
         }
         return best_pt;
     };
@@ -137,7 +136,7 @@ MeshGuessField build_mesh_guess_field(
                 cv::line(meshDebug, pt2, pt3, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
                 cv::line(meshDebug, pt3, pt1, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
             }
-            seeding::draw_outlined_text(meshDebug, "Delaunay 6-DOF Mesh", cv::Point(10, 25), 0.6);
+            draw_outlined_text(meshDebug, "Delaunay 6-DOF Mesh", cv::Point(10, 25), 0.6);
             cv::imwrite(local_debug_dir + "/delaunay_mesh_debug.jpg", meshDebug);
         } catch (...) {
             LOGE("Delaunay mesh debug export threw");
@@ -160,7 +159,7 @@ MeshGuessField build_mesh_guess_field(
                 if (cv::pointPolygonTest(triContours[ti], gp, false) >= 0) {
                     guess.u[idx] = (float)(tri.ux * gp.x + tri.uy * gp.y + tri.u); guess.v[idx] = (float)(tri.vx * gp.x + tri.vy * gp.y + tri.v);
                     guess.ux[idx] = (float)tri.ux; guess.uy[idx] = (float)tri.uy; guess.vx[idx] = (float)tri.vx; guess.vy[idx] = (float)tri.vy;
-                    guess.in_mesh[idx] = true; resultGrid[y][x].mesh_assignment_type = 1; break;
+                    guess.in_mesh[idx] = true; resultGrid[y][x].mesh_assignment_type = kMeshInTriangle; break;
                 }
             }
         }
@@ -187,7 +186,7 @@ MeshGuessField build_mesh_guess_field(
                     const auto &tri = affTriangles[best_ti];
                     guess.u[idx] = (float)(tri.ux * gp.x + tri.uy * gp.y + tri.u); guess.v[idx] = (float)(tri.vx * gp.x + tri.vy * gp.y + tri.v);
                     guess.ux[idx] = (float)tri.ux; guess.uy[idx] = (float)tri.uy; guess.vx[idx] = (float)tri.vx; guess.vy[idx] = (float)tri.vy;
-                    guess.in_mesh[idx] = true; resultGrid[y][x].mesh_assignment_type = 2;
+                    guess.in_mesh[idx] = true; resultGrid[y][x].mesh_assignment_type = kMeshExtrapolated;
                 }
             }
         }

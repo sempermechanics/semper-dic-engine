@@ -412,39 +412,102 @@ At each simplex vertex, evaluate ZNSSD:
 
 ---
 
-## 8. Feature-Based Initialization
+## 8. Anchor-Lattice Initialization
 
-### 8.1 AKAZE Feature Detection
+The seeding stage supplies the initial guess for §6's IC-GN iteration. It does
+not measure displacement; its job is to put every subset inside the basin of
+attraction and, through the Delaunay mesh of §8.4, to supply a first-order
+guess of the deformation gradient.
 
-**Algorithm:** Accelerated-KAZE (AKAZE) - fast variant of KAZE using binary descriptors.
+### 8.1 Global Rigid Shift by Phase Correlation
 
-**Keypoint Detection:**
-Construct nonlinear scale space using Perona-Malik diffusion:
+Let $f$ and $g$ be the reference and deformed intensity fields over the ROI,
+windowed by a Hann taper to suppress edge discontinuity. Their cross-power
+spectrum is normalised to unit magnitude:
 
-where  is the diffusivity function.
+$$ R(\bm{k}) = \frac{F(\bm{k})\,\overline{G(\bm{k})}}{\left|F(\bm{k})\,\overline{G(\bm{k})}\right|} $$
 
-Detect extrema in scale-normalized determinant of Hessian:
+For a pure translation $g(\bm{x}) = f(\bm{x} - \bm{d})$ the normalisation leaves
+a pure phase ramp, $R(\bm{k}) = e^{-i\bm{k}\cdot\bm{d}}$, whose inverse transform
+is a Dirac impulse at $\bm{d}$. The estimator takes the centroid of that peak,
+giving sub-pixel resolution, and its height as a confidence measure; a response
+below $k_{\text{PhaseCorrMinResponse}}$ is treated as no lock.
 
-**Descriptor:** Modified-Local Difference Binary (M-LDB) - 486-bit binary descriptor
+Discarding magnitude and keeping only phase is what makes this invariant to
+affine intensity change $a\,f + b$, matching the ZNSSD criterion the solver
+minimises. It uses every pixel in the ROI rather than a sparse keypoint set,
+which is why its accuracy on a rigid shift (~0.005 px measured) is two orders of
+magnitude better than any keypoint detector.
 
-### 8.2 Feature Matching
+**Limitation.** The estimate is a *translation*. Under a rotation $\theta$ about
+the ROI centre the true displacement at radius $r$ is $2r\sin(\theta/2)$, so a
+single global shift is increasingly wrong away from the centre. Measured
+behaviour: usable to about $2°$, degraded by $5°$, no lock by $15°$
+(see [SEEDING_BENCHMARK.md](SEEDING_BENCHMARK.md) §4.5).
 
-**Distance Metric:** Hamming distance between binary descriptors:
+### 8.2 Anchor Lattice
 
-**Matching Strategy:** Brute-force matching with cross-check:
+A regular lattice of ROI grid nodes with stride
 
-1. For each descriptor in reference, find nearest neighbor in deformed.
-2. Accept match only if reverse nearest neighbor agrees.
+$$ s = \max\left(1,\ \operatorname{round}\sqrt{\frac{N_x N_y}{N_{\text{target}}}}\right) $$
 
-**Outlier Rejection:** Reject matches with  (threshold = 25% bits different).
+is solved by the engine's own IC-GN, initialised from §8.1, with the last row
+and column always included so the convex hull reaches the ROI boundary. Because
+the anchors coincide with grid nodes they reuse the pooled Hessians of §6, and a
+node whose ZNSSD clears the result gate is retained as a **final** measurement
+rather than being re-solved.
 
-### 8.3 Global Displacement Estimation
+The two axes then part company. An axis carrying fewer than three lattice
+indices leaves the mesh with no interior edge along it, so each axis relaxes
+its own stride until it holds at least three; the pair is then coarsened again
+until the product is back within the budget $s$ implied, so a long thin ROI
+(a beam, a weld seam) keeps its short-axis floor without paying for it with a
+lattice several times $N_{\text{target}}$. On a square ROI both axes keep $s$
+and nothing moves.
 
-From accepted matches, estimate bulk translation:
+Two thresholds apply, because a seed and a result are held to different
+standards:
 
-**Median Estimator:** Robust to outliers (up to 50% contamination).
+| role | gate |
+|---|---|
+| mesh vertex | $C_{\text{ZNSSD}} \le k_{\text{AnchorAcceptScore}}$ (loose — the median test rejects blunders) |
+| output point | $C_{\text{ZNSSD}} \le k_{\text{CorrAccept}}$ (the same bar Path A applies) |
 
-**Typical Accuracy:** Within 1-2 pixels of true displacement for well-textured images.
+Neither gate publishes on its own. Both are recorded during the lattice solve
+and applied only after the median test of §8.3 has run over the whole
+lattice, so a node that clears the result gate but fails the median test is
+dropped from the field as well as from the mesh. The classic periodic-speckle
+blunder is exactly that combination: a confident ZNSSD on the wrong speckle
+blob, whose displacement disagrees with its neighbours. Publishing it would
+also hand Path B a boundary seed to flood fill from.
+
+### 8.3 Outlier Rejection — Universal Median Test
+
+For anchor $i$ with lattice neighbours $\mathcal{N}(i)$, reject when
+
+$$ \left|u_i - \operatorname{median}_{j \in \mathcal{N}(i)} u_j\right| > k_{\text{AnchorMedianTol}} $$
+
+and likewise for $v$. This is the Westerweel–Scarano test from PIV. It is used
+in preference to a global homography or affine fit because a deforming specimen
+does not have an affine displacement field — a global model rejects signal, not
+just blunders — whereas the median test assumes no field shape at all. The
+lattice makes the neighbourhood lookup $O(1)$.
+
+A rejected anchor is neither a mesh vertex nor an output point.
+
+### 8.4 Mesh Guess Field
+
+Delaunay triangulation over the surviving anchors gives, per triangle, an affine
+map from three reference vertices to their deformed positions, and hence a
+6-DOF guess $(u, v, u_x, u_y, v_x, v_y)$ at every enclosed grid point.
+
+The accuracy of the gradient components is what motivates the lattice. A vertex
+position error $\varepsilon$ over a triangle edge of length $L$ propagates to a
+gradient error of order $\varepsilon / L$. Keypoint detectors give
+$\varepsilon \sim 1$ px on short, clustered edges; IC-GN anchors give
+$\varepsilon \sim 0.01$ px on edges fixed at $s \cdot \text{step}$ — a measured
+improvement of 5–17× in $\|\nabla\bm{u} - \nabla\bm{u}_{\text{true}}\|_F$ on
+real speckle.
 
 ---
 
@@ -544,6 +607,159 @@ field over all frames, at a 45 px VSG, drops from 915 / 3874 / 2117 µε
 On a steel tensile series (40 frames) it rejects nothing. Threshold 2 rejects the
 same points on the PMMA series (and 8 on the steel's last frame, by the
 fracture); 3 leaves more room for noise.
+
+### 9.5 Incremental (Updated-Reference) DIC
+
+`include/semper/incremental.hpp`, `src/pipeline/incremental_session.cpp`,
+`src/pipeline/incremental_math.cpp`.
+
+By default every frame t is correlated against the first image. Under large
+rotation or strain the subsets of frame 0 stop matching frame t: the affine
+shape function covers less of the real deformation, and seeding is
+translation-only. Incremental DIC correlates frame t against a recent frame k
+instead and composes the result.
+
+**Composition.** Let `X0` be a frame-0 grid node and `U(X0, k)` its total
+displacement at the reference frame k, so the material point sits at
+`x_k = X0 + U(X0, k)` in image k. The increment field `u_k` is solved on a
+regular grid in image k. Then
+
+```
+U(X0, t) = U(X0, k) + u_k( X0 + U(X0, k) )
+```
+
+The output stays on the frame-0 grid, as total displacement, so the VSG and
+Green-Lagrange strain of §9.3 apply to `U(·, t)` unchanged.
+
+**Sampling `u_k` between nodes.** `x_k` is generally not a node of the frame-k
+grid:
+
+* If all four corners of the grid cell containing `x_k` are valid, `u_k` is
+  interpolated bilinearly. The ZNSSD reported for the point is the worst of
+  the four.
+* Otherwise, the nearest valid node `n` within `1.5` grid cells
+  (`tuning::kIncTaylorMaxCells`) gives a first-order expansion using its solved
+  displacement gradient, the same expansion Path B uses for its guesses:
+  `u_k(x) ≈ u_n + ∇u_n · (x − x_n)`. Ties go to the lowest row-major index, so
+  the result does not depend on thread timing.
+* Further away, the node **coasts** (below). A node that cannot coast either is
+  lost. A lost node never returns, since there is no `U(X0, k)` to compose
+  onto.
+
+Increment nodes go through the median test of §9.4 before they are sampled. The
+same test on the total field only drops points from that frame's output, and
+is not fed back into tracking: a false positive there would be permanent.
+
+**Coasting across a gap.** Some bands of an image cannot be correlated for a
+while even though the material in them is fine: a stationary reflection or
+glare, a translucent specimen passing from a light background onto a dark
+rig, a necking edge where the subset starts to take in background. A node in
+such a band gets no increment, while the nodes on either side do. Rather than
+drop it, its increment is estimated by a weighted least-squares plane
+`u = a + b·dx + c·dy` (and `v` likewise) through the solved increment nodes
+within `kIncCoastRadiusCells` = 8 cells, weights `1 / (1 + (d/step)²)`. The fit
+needs `kIncCoastMinNodes` = 6 nodes whose weighted spread is at least one step
+along both principal axes, so it is pinned in both directions. A coasting node
+is carried to the next reference but not reported. It is dropped once the
+fitted increments have carried it `kIncCoastMaxTravelSubsets` = 2 subsets, or
+once it leaves the image. Only a node that has been measured coasts. A node
+that frame 1 cannot measure may sit in a gap, or on texture too weak to
+correlate at all, and nothing could ever confirm it, so it is not followed.
+
+**Re-anchoring.** A plane fitted over a gap a subset wide drifts. Measured on a
+synthetic band crossing, the drift is up to about 20% of the distance coasted,
+0.5 to 2 px for a crossing. Once the node is measured again, that measurement
+starts from where coasting left it, so the drift would stay in it for good.
+So a node that coasted more than `kIncCoastTrustedTravelSubsets` = 0.25 subset
+is reported again only after a direct check:
+
+* While nodes are measured, each clean one within reach of a gap keeps an
+  **anchor**: its subset, cut from a reference where every node inside that
+  subset solved. "Within reach" means an unsolved or off-grid position within
+  two subsets plus two steps. Only a ~1.5 KB grey patch is kept, with
+  `kIncAnchorMarginPx` = 10 px of margin so its gradients do not see the
+  patch edge.
+* A measured node whose own subset is no longer clean keeps the anchor it has,
+  which was cut before it reached the gap.
+* When the coasted node can be sampled again and its subset here is clean, the
+  anchor subset is solved by ICGN straight onto the current frame, with a
+  simplex rescue as in Path B. It starts from where coasting put it.
+* The match must pass `kCorrAccept`, and it may move the node by at most
+  `max(1 px, 0.3 × distance coasted)`. Its position, through the matched
+  affine map, replaces the coasted one.
+* Until a match succeeds, the node moves on its measured increments,
+  unreported. Those do not count against its coasting distance.
+
+On the band crossing, nodes
+re-anchored on the far side are within 0.03 px (median) and 0.20 px (worst) of
+the truth, against up to 2.3 px without re-anchoring. `tracked_points` counts
+coasting and unconfirmed nodes; the output holds only measured ones.
+
+**Moving the reference.** Every `N` frames (`update_interval`) frame t becomes
+the new reference. With N > 1 it also moves early, to the frame just solved,
+when that frame reports `kIncEarlyUpdateDrop` = 5% fewer points than the
+first frame solved against the current reference. That happens when the
+increment has outgrown what the images still correlate over, as with fast
+loading, necking or whitening. On the tensile video it lifts the late-test
+minimum at N = 20 from 337 to 397 points, and changes nothing at N = 5. Its image is already prepared for correlation (intensities
+and gradients), so it is handed over without decoding or preparing it again.
+The ROI mask has to follow the material, so the frame-0 mask is warped
+forward. Every material pixel of the frame-0 window (the grid widened by
+`kIncMaskExtrapCells` = 3 cells plus half a subset) is sampled on a sub-pixel
+lattice, each sample `X` is moved to `X + U(X)`, and the pixel it lands in is
+set. `U` is the bilinear total field with invalid nodes filled by neighbour
+averaging. Outside the grid it is extended by the plane through the nearest
+grid point, which is exact for any affine motion. The lattice uses 2 samples
+per pixel per axis, more where the field stretches, so neighbouring samples
+land within 0.7 px of each other (up to `kIncMaskMaxSamplesPerPx` = 8). A 3×3
+morphological close then fills the pinholes.
+
+A forward warp has no inverse to solve, so it has no wrong branch to follow.
+Two earlier designs failed under large rotation:
+
+* The first solved `X + U(X) = p` per pixel by Newton.
+* It also held the field constant past a few cells. A held field is a pure
+  translation, which gives pixels outside a turned body a second, false
+  preimage.
+* Where a few drifted nodes fold the field, there are false branches too, and
+  a row's warm start followed them across the material, blanking whole bands.
+* Extending the edge cells' bilinear instead of a plane makes things worse:
+  its cross term grows quadratically off the corners.
+
+With the forward warp, a fold only makes samples overlap locally. The new
+reference's grid spans the tracked nodes' current positions, plus one step on
+the far sides.
+
+Without a user mask, the frame-0 material is the ROI rectangle widened by
+`ceil(half·√2) + 1` px, where `half` is half the subset size, rather than by
+`half` alone. Subsets stay axis-aligned on every reference while the material
+turns, so at 45° a node's subset reaches `half·√2` from its centre. With only
+`half` of material around the ROI, the edge nodes of a rotating ROI fall out
+of the scan, get sampled by Taylor fallback, and the losses spread inwards.
+With a user mask the mask is used as drawn, so a rotating masked region loses
+its edge ring the same way: draw it a subset wider if it will turn.
+
+**Why the error grows, and what N does.** Each solve carries an interpolation
+bias that depends on the sub-pixel part of the displacement (§10.1). Against a
+fixed reference it is paid once. Incrementally it is paid once per reference
+update, and on slow, smooth loading the increments are small sub-pixel steps
+of similar size, so the bias has one sign and adds up roughly linearly. Image
+noise in each new reference adds a random-walk term on top. Measured on smooth
+synthetic speckle over 160 frames of 0.1% stretch: rms 0.25 px at N = 1 and
+0.15 px at N = 5 with Keys 4×4, 0.21 and 0.11 px with 6×6, against 0.03 px for
+the fixed reference. On DICe's OHT ladder the fixed reference also wins
+(0.003 vs 0.058 px after four updates; see TESTING.md, `DiceIncremental`).
+
+In practice:
+
+* For small or moderate deformation the **fixed reference is more accurate**.
+  Use incremental only when it stops correlating: rotation past a few degrees,
+  strain of tens of percent, or speckle that changes appearance.
+* A larger N means fewer updates, so less accumulated bias, as long as frame
+  t still correlates with frame t − N.
+* The 6×6 interpolator lowers the per-update bias.
+
+`docs/INCREMENTAL_BENCHMARK.md` measures these trade-offs across scenarios.
 
 ---
 

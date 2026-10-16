@@ -25,9 +25,9 @@ usual. Respect the surface described here, and declare your change's
 | Tier | What it covers | Rule for contributors |
 |---|---|---|
 | **Frozen** | Binary/data formats: output packing, metrics layout, error codes, and the *meaning* of existing `FullFieldParams` fields | Never change in place. A change here is a **major** version bump and requires a coordinated change in the downstream app. |
-| **Stable** | Public function **signatures** in `include/semper/{pipeline,io,cancel,version}.hpp` and `include/semper/semper_c.h` | May be **extended additively** (new overloads / new functions). Existing signatures, parameter order, defaults, and semantics must not change without a **major** bump. |
+| **Stable** | Public function **signatures** in `include/semper/{pipeline,incremental,io,cancel,version}.hpp` and `include/semper/semper_c.h` | May be **extended additively** (new overloads / new functions). Existing signatures, parameter order, defaults, and semantics must not change without a **major** bump. |
 | **Additive-only** | Deliberate growth points: trailing `FullFieldParams` fields, unused metrics slots | Append only, each with a default that reproduces prior behavior. Never reorder or repurpose an existing entry. |
-| **Internal** | Everything in `src/`, `tuning.hpp` constants, `PointState`, `types.hpp`, algorithm internals, private headers | Change freely. Behavior is guarded by the golden test, not by this contract. |
+| **Internal** | Everything in `src/`, `tuning.hpp` constants, `types.hpp`, `seeding.hpp`, algorithm internals, private headers. Living under `include/semper/` does **not** make a header Stable — only the five named above and `semper_c.h` are. | Change freely. Behavior is guarded by the golden test, not by this contract. |
 
 **Semantic versioning** (`include/semper/version.hpp` / `SEMPER_VERSION`):
 
@@ -77,7 +77,7 @@ int run_full_field(..., CancelToken& token, ProgressCallback on_progress = nullp
   [A.4](#a4-frozen-data-formats)). Points beyond capacity are **dropped, never
   overflow**.
 - **Metrics** *(Frozen layout)*: when `metrics != nullptr && metrics_len >= 16`,
-  fill telemetry; 17 slots preferred. Slot indices are frozen.
+  fill telemetry; 23 slots preferred. Slot indices are frozen.
 - **Cancellation**: the legacy overload clears the process-global cancel flag on
   entry and polls it inside point loops. The `CancelToken&` overload binds that
   token for the duration of the solve.
@@ -98,6 +98,72 @@ struct ReferenceCache {                 // non-copyable, non-movable
 ```
 
 Must remain **non-copyable / non-movable**.
+
+`ReferenceCache` also keeps work that depends only on the reference and the
+grid: the node validity scan, the Hessian pool and the reference side of phase
+correlation. That cache is **Internal**. It is reused while `rect`, `step`,
+`subset_size` and the ROI mask are unchanged, and dropped by `reset`,
+`set_from_gray` and `adopt`. Outputs are bit-identical with or without it.
+`adopt(...)` (added v0.4.0) hands an already-prepared image to the cache; it
+exists for `IncrementalSession` and is **Internal** despite living in a Stable
+header.
+
+### `pipeline::IncrementalSession` — updated-reference sequences · *Stable (added v0.4.0)*
+
+```cpp
+// include/semper/incremental.hpp
+struct IncrementalParams {
+    FullFieldParams field;     // the frame-0 grid, exactly as for run_full_field
+    int update_interval = 1;   // 0 = fixed reference, N = move the reference every N frames
+                               // (sooner when a frame reports 5% fewer points, N > 1)
+};
+
+struct IncrementalFrameInfo {
+    int  reference_frame;      // frame this one was solved against (0 = first image)
+    bool reference_updated;    // this frame became the next reference
+    int  tracked_points;       // frame-0 nodes still followed, reported or not
+    int  frame0_points;        // frame-0 nodes after the boundary + mask scan
+    int  taylor_fallbacks;     // nodes sampled by first-order expansion
+    int  lost_this_frame;      // nodes that stopped being followed on this frame
+};
+
+class IncrementalSession {     // move-only
+public:
+    int  init(const cv::Mat& ref_gray, const cv::Mat& roi_mask, const IncrementalParams&);
+    int  process_frame(const cv::Mat& def_gray, float* output, int output_capacity,
+                       float* metrics, int metrics_len,
+                       ProgressCallback on_progress = nullptr,
+                       IncrementalFrameInfo* info = nullptr);
+    int  process_frame(..., CancelToken& cancel, ProgressCallback = nullptr,
+                       IncrementalFrameInfo* = nullptr);
+    void reset();
+    bool initialized() const;
+    int  frames_processed() const;
+    int  max_points() const;   // frame-0 grid node count
+    void set_debug_dir(std::string dir);
+};
+```
+
+- **Output** *(Frozen)*: the same 8-float packing and capacity rule as
+  `run_full_field`. `x, y` are **frame-0 grid coordinates**, `u, v` the **total**
+  displacement from the first image, and the strains are Green-Lagrange strain
+  of that total. Only measured nodes are reported. A node the solve cannot
+  reach on a frame (a gap it cannot correlate across) is followed on estimated
+  motion, unreported, and is reported again once it is measured; after a long
+  coast, only once its own earlier subset confirms where it is (MATHEMATICS
+  §9.5). A frame-0 node that cannot be followed at all is dropped and never
+  returns.
+- **`update_interval = 0`** *(Frozen)*: every frame is bit-identical to
+  `run_full_field` against the first image. With any interval, the first frame
+  is too.
+- **Returns** *(Frozen)*: `init` returns `0`, `-2`, `-3` (empty image, negative
+  interval) or `-4`. `process_frame` returns the same codes as `run_full_field`;
+  `-3` also covers "not initialized" and a frame whose size differs from the
+  first image.
+- **Errors and cancellation** leave the session exactly as it was, so the same
+  frame can be submitted again.
+- **Metrics** describe the increment solve against the current reference. The
+  frame-0 bookkeeping is in `IncrementalFrameInfo`, not in new metric slots.
 
 ### `pipeline::FullFieldParams` — solve inputs · *Frozen fields + Additive-only tail*
 
@@ -144,8 +210,34 @@ Empty `cv::Mat` = failure; do not switch to throwing.
 ### C ABI — `include/semper/semper_c.h` · *Stable (ABI)*
 
 `semper_create` / `destroy`, `semper_set_reference`, `semper_run`, `semper_cancel`,
-`semper_version`. Same Frozen return codes and 8-float packing. These six are the
-**only** exported symbols; the golden list in §A.6 fails CI if that set changes.
+`semper_version`. Same Frozen return codes and 8-float packing.
+
+Added in v0.4.0 (minor), the incremental session:
+
+```c
+typedef struct semper_incremental semper_incremental;      /* opaque */
+typedef struct semper_incremental_info {                    /* Frozen: six int32, 24 bytes */
+    int32_t reference_frame, reference_updated, tracked_points,
+            frame0_points, taylor_fallbacks, lost_this_frame;
+} semper_incremental_info;
+
+semper_incremental* semper_incremental_create(void);
+void semper_incremental_destroy(semper_incremental*);
+int  semper_incremental_init(semper_incremental*, const uint8_t* ref, size_t ref_len,
+                             const uint8_t* mask, size_t mask_len,
+                             int expected_w, int expected_h,
+                             const semper_params*, int32_t update_interval);
+int  semper_incremental_process(semper_incremental*, const uint8_t* def, size_t def_len,
+                                float* out, int out_capacity,
+                                float* metrics, int metrics_len,
+                                semper_incremental_info* info,   /* may be NULL */
+                                semper_progress_cb cb, void* user);
+void semper_incremental_cancel(semper_incremental*);           /* thread-safe */
+```
+
+`semper_params` is unchanged; the interval is a separate argument so its layout
+stays Frozen. These eleven functions are the **only** exported symbols; the
+golden list in §A.6 fails CI if that set changes.
 
 Every entry point is annotated `SEMPER_C_API`. The shared library is built with
 `-fvisibility=hidden` (and `/W…` on MSVC), so only the annotated symbols are
@@ -178,6 +270,14 @@ thread on Android.
 | `getPreviewFromBytes(byte[], int)` | `io::decode_bgr` |
 | `initializeReference(byte[], byte[]?, int, int)` | `io::decode_gray`, `ReferenceCache::set_from_gray` / `reset` |
 | `computeFullFieldDirect(…)` | `io::decode_gray`, `run_full_field` |
+| `initializeIncremental(byte[], byte[]?, int w, int h, rectX, rectY, rectW, rectH, step, subset, strainWindow, bool use6x6, int updateInterval)` (v0.4.0) | `io::decode_gray`, `IncrementalSession::init`; resets the fixed-reference cache |
+| `computeIncrementalFrame(byte[], ByteBuffer, callback, float[]?, int[]? info)` (v0.4.0) | `io::decode_gray`, `IncrementalSession::process_frame`; `info` (length ≥ 6) receives the `IncrementalFrameInfo` fields in declaration order, the bool as 0/1 |
+| `releaseIncremental()` (v0.4.0) | destroys the session |
+
+The fixed-reference and incremental paths share one lock and do not run at the
+same time: `initializeIncremental` drops the cached reference, and
+`initializeReference` closes any open incremental session, so call it again
+before going back to `computeFullFieldDirect`.
 
 ---
 
@@ -190,26 +290,117 @@ index:  0   1   2   3     4     5     6      7
 field:  x   y   u   v    exx   eyy   exy   corr
 ```
 
-### Metrics buffer — **17 × `float32`**
+### Metrics buffer — **23 × `float32`**
 
 Slot indices are Frozen; new telemetry appends. `metrics_len == 16` is the
-minimum honored; 17 preferred.
+minimum honored; **23 preferred**. The writer copies the largest prefix the
+caller's buffer can hold (16, 17, 19, 20, 21, 22 or 23 slots), so an existing
+caller that still passes 17 keeps working unchanged.
+
+**Slot 10 semantic change (v0.2.2).** The index, type and layout are unchanged
+and remain Frozen. Its *meaning* changed from "AKAZE + RANSAC time (ms)" to
+**"seeding time (ms)"** — phase correlation plus the anchor lattice — when the
+descriptor seeding front-end was replaced. Callers that display this value
+should relabel it; nothing about the buffer's shape moved. Slot 16 keeps
+`2 = full mesh / 1 = sparse mesh / 0 = Path C fallback`.
+
+**Slots 3 and 4 narrowed (v0.3.0).** Their labels — "Solved via Mesh" (Path A)
+and "Solved via Flood Fill" (Path B) — are unchanged and still Frozen, but they
+no longer account for every solved point. The anchor lattice introduced in
+v0.2.2 is a third solving path, and from v0.2.2 to v0.3.0 the points it solved
+reached slot 1 ("Total Solved") without appearing in slot 3 or slot 4. Rather
+than repurpose either Frozen slot, v0.3.0 **appends** the missing terms:
+
+| Slot | Meaning | Added |
+|---|---|---|
+| 17 | Total simplex-rescue time (ms), all paths | v0.2.2 |
+| 18 | Total IC-GN time (ms), all paths | v0.2.2 |
+| 19 | Solved via the anchor lattice | v0.3.0 |
+| 20 | Converged, then discarded by the VSG strain post-filter | v0.3.0 |
+| 21 | Phase-correlation lock: `1` = locked, `0` = no lock | v0.3.0 |
+| 22 | Mesh coverage: convex hull of the accepted anchors / ROI area, `0..1` | v0.3.0 |
+
+With slot 19 and slot 20 present the point accounting closes exactly, as
+long as the output buffer was large enough to hold the whole field:
+
+```
+metrics[3] + metrics[4] + metrics[19] == metrics[1] + metrics[20]
+```
+
+That is, every point some path solved is either in the output buffer or was
+dropped by the strain post-filter. Slot 20 was previously invisible: a caller
+seeing slot 1 fall short of slots 3 + 4 had no way to distinguish a point that
+never converged from one that converged and was then discarded because its
+strain fit was rank-deficient.
+`FullField.MetricsPointCountsAccountForEverySolvedPoint` asserts the identity
+above.
+
+**The identity does not survive truncation, by design.** Under the capacity
+rule (§A.2) packing stops as soon as the next point would not fit, and the
+points never reached were already counted by their solving path into slots 3,
+4 and 19 while landing in neither slot 1 nor slot 20 — so the left side
+exceeds the right by exactly the number left unpacked. The caller's test for
+that case is `(metrics[1] + 1) * 8 > output_capacity`, i.e. the buffer had no
+room for one more point; the identity is only guaranteed when that is false.
+`FullField.MetricsPointCountsAccountForEverySolvedPoint` passes a full-size
+buffer for that reason.
+
+**Slots 21 and 22 are the seeding health signals.** The anchor lattice estimates
+translation only, so past roughly 5° of rotation the phase lock fails and mesh
+coverage collapses — 0.45 at 5° and 0.15 at 15° against the old descriptor
+front-end's 0.96 (`docs/SEEDING_BENCHMARK.md` §4.5). Both numbers were already
+computed inside the seeder and then discarded, so a field solved off a
+15%-coverage mesh was reported exactly like a healthy one. Treat a `0` in slot
+21, or a slot 22 below roughly 0.5, as "these displacements are probably fine
+near the anchors and unreliable away from them" rather than as an error.
+
+Slots 17 and 18 also changed value in v0.3.0 without changing meaning: the
+anchor lattice runs a full IC-GN phase of its own, and its time was being
+dropped on the floor rather than added to these totals. Slot 8 ("Mean ICGN
+Iterations") was understated for the same reason — it divided a sum that
+excluded the anchor phase by a count that included it.
+
+**Prepass time on a reused reference (v0.4.0).** Slot values for the same
+inputs are unchanged, but the Hessian pre-pass time reads about `0` on the
+second and later frames against one reference with the same grid and mask:
+that work is now cached in `ReferenceCache` (§A.2). The other slots, and every
+output float, are bit-identical.
+
+**Incremental sessions.** Metrics from `IncrementalSession::process_frame`
+describe the solve against the current reference on that reference's own
+grid, so the counts (slots 0–4, 19, 20) are of that grid, not of the frame-0
+output. On the first frame against the first image they match the output
+exactly; after the reference has moved, the number of points written is the
+return value, and slot 1 is the increment solve's count.
 
 ### Return / error codes — Frozen
+
+Existing values never change. `-4` was **appended** in v0.3.0, which is an
+additive (minor) change: callers that branch on `n < 0` need no edit, and no
+previously-returned value moved. What did change is the *behaviour* of one
+input: a `strain_window` too small for `step` used to return `0` points with a
+success code — the VSG plane fit needs 3 grid nodes inside the window, and
+below that every point is discarded by the strain post-filter no matter how
+well it correlated. The rule is `strain_window >= 2 * step`
+(`StrainCalculator::vsg_window_node_count` is the exact test). Every example
+and smoke test in this repo was on the wrong side of it before v0.3.0.
 
 | Value | Meaning |
 |---|---|
 | `>= 0` | number of valid output points |
 | `-2` | invalid ROI |
 | `-3` | init / argument failure |
+| `-4` | `strain_window` too small for `step` (**added v0.3.0**) |
 | `-99` (`kCancelled`) | cancelled mid-solve |
 
 ---
 
 ## A.5 Change checklist
 
-- **Free to change (patch):** correlation math, ICGN, AKAZE, SIMD, threading,
-  `tuning.hpp`, anything under `src/` — golden test must still pass.
+- **Free to change (patch):** correlation math, ICGN, seeding, SIMD, threading,
+  `tuning.hpp`, anything under `src/` — golden test must still pass. Note that
+  `GoldenCorpus` covers the engine, not `run_full_field`; a seeding change can
+  move the full field without moving that golden. See docs/TESTING.md.
 - **Additive only (minor):** trailing `FullFieldParams` field, new metrics slot,
   new overload/function, new SDK entry point.
 - **Do not without major + app coordination:** change any §A.2 signature; change

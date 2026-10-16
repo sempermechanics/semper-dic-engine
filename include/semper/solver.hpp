@@ -11,7 +11,6 @@ namespace Semper {
         // Profiling trackers (kept as double for timing precision)
         double time_icgn_ms = 0.0;
         double time_simplex_ms = 0.0;
-        int count_icgn = 0;
         int count_simplex = 0;
         // ── LM ADDITION ─────────────────────────────────────────────────────────
         // Matches DICe schema parameters:
