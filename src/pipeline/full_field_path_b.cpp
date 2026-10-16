@@ -330,7 +330,11 @@ void run_path_b(
     std::vector<std::thread> workers;
     struct WorkerGuard { std::vector<std::thread> &ws; ~WorkerGuard() { for (auto &w : ws) if (w.joinable()) w.join(); } } wg{workers};
 
-    for (int w = 0; w < safe_cores && !done; ++w) {
+    // Read once, before any worker exists: a started worker writes `done`
+    // under `mtx`, so the spawn loop must not read it unlocked. A worker
+    // started after the flood finished sees `done` and returns at once.
+    const bool flood_finished = done;
+    for (int w = 0; w < safe_cores && !flood_finished; ++w) {
         workers.emplace_back([&, w]() {
             try {
                 std::unique_lock<std::mutex> lk(mtx);

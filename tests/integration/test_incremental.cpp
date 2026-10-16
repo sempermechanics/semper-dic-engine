@@ -527,7 +527,11 @@ TEST_CASE(Incremental, LongHorizon_160Frames) {
         // with margin; docs/INCREMENTAL_BENCHMARK.md has the full picture.
         CHECK(a.rms_u <= (interval == 1 ? 0.45 : 0.35));
         CHECK(a.rms_e <= 3.5e-2);
+#if !defined(SEMPER_SANITIZER_BUILD) && !defined(SEMPER_COVERAGE_BUILD)
+        // Sanitizer allocators hold freed memory (quarantine), so RSS is
+        // only a leak signal in a plain build.
         if (rss_early > 0) CHECK(rss_late - rss_early < 16L * 1048576L);
+#endif
     }
 }
 
