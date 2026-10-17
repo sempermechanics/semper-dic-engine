@@ -49,10 +49,17 @@ endif ()
 # run dic_tests, then gcovr/llvm-cov over the build tree. No gate.
 option(SEMPER_COVERAGE "Instrument the host tests for coverage (gcov)" OFF)
 if (SEMPER_COVERAGE AND NOT MSVC)
-    add_compile_options(--coverage -O0 -g)
+    # -O1, not -O0: at -O0 the suite ran over 90 min on CI (an incremental
+    # test that takes 3 s in Release took over 9 min); at -O1 the whole suite
+    # takes about 27 min on 4 cores.
+    # Keep gcc's default counter update (atomic under -fopenmp): with
+    # -fprofile-update=single the racing counter writes corrupted solver
+    # results and broke the bit-identity tests.
+    add_compile_options(--coverage -O1 -g)
     add_link_options(--coverage)
     # Golden-corpus numbers are a Release-host gate. Coverage builds are
-    # Debug -O0, which changes how many subsets initialize and their values.
+    # -O1 without -O2's flags, which changes how many subsets initialize and
+    # their values.
     add_compile_definitions(SEMPER_COVERAGE_BUILD=1)
 endif ()
 

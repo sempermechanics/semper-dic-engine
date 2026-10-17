@@ -219,7 +219,9 @@ jobs:
   coverage:
     name: Coverage (report-only)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Debug + gcov runs the incremental and DICe suites several times slower
+    # than Release; 30 min cut the run off mid-suite.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
