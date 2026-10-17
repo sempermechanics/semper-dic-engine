@@ -183,7 +183,8 @@ keeps all 289 anchors. AKAZE's mesh coverage decays with shift magnitude. The
 earlier concern that phase correlation would alias past ROI/2 does not
 materialise anywhere in this range.
 
-**Rotation — the lattice degrades from about 5 deg:**
+**Rotation — the translation-only lattice degraded from about 5 deg** (as first
+measured; fixed in §4.5.1):
 
 | rotation | phase lock | anchors kept | anchor mesh cov | anchor wall / CPU ms | AKAZE wall / CPU ms |
 |---|---|---|---|---|---|
@@ -218,17 +219,130 @@ matter which per-anchor solver mode is used. At 5 deg the outer anchors are
 already ~14 px out, at the edge of what ICGN pulls in from a zero-gradient
 guess.
 
-The principled fix, if this regime matters, is to estimate rotation globally as
-well — log-polar (Fourier-Mellin) phase correlation recovers rotation and scale
-before the translation correlation, and lives entirely in `imgproc`, so it would
-not reinstate `features2d`. That is unimplemented and unmeasured.
-
 **Practical relevance.** The engine ships in an Android app, so the reference
 and deformed frames may be captured handheld. Frame-to-frame camera rotation
 above 5 deg is plausible there in a way it is not on a fixed laboratory rig.
-This is the one scenario in which keeping a descriptor fallback — at the cost of
-the 2.755 MB and the `features2d`/`flann`/`calib3d` modules — has a real
-argument behind it.
+This was the one scenario in which keeping a descriptor fallback — at the cost
+of the 2.755 MB and the `features2d`/`flann`/`calib3d` modules — had a real
+argument behind it. §4.5.1 removes that argument.
+
+#### 4.5.1 Fixed: log-polar (Fourier-Mellin) rotation and scale
+
+L0 now estimates rotation and scale as well as translation, still `imgproc`
+only (`src/pipeline/phase_correlate.cpp`; derivation in
+[MATHEMATICS.md](MATHEMATICS.md) §8.1.1):
+
+1. Phase correlation of the log-polar resampled magnitude spectra gives
+   `theta` and `s`. The magnitude spectrum does not see translation, so this
+   needs no prior shift estimate.
+2. The deformed image is resampled with that rotation and scale undone about
+   the ROI centre, and the ordinary translation correlation runs on the result.
+3. Each anchor is seeded with the full similarity: the displacement the
+   rotation puts at that node, and gradients `sR - I`.
+4. The universal median test runs on the residual from the similarity, not on
+   the raw displacement.
+
+Step 4 was not anticipated above, and it is half the fix. At 15 deg, lattice
+neighbours 20 px apart differ by 5 px. On the lattice edge every neighbour
+lies on one side, so the raw neighbourhood median is offset by that much and
+each edge anchor fails the 1 px `kAnchorMedianTol` however accurate it is. With
+better seeds alone the outer ring would still have been rejected, and the
+hull would have shrunk to about 0.77 of the ROI.
+
+The similarity is used only when all three of these hold:
+- it moves the ROI corners more than `kSimilarityMinCornerPx` = 4 px beyond
+  the bare translation;
+- the rotation-corrected translation peak beats the uncorrected one;
+- the lattice it seeds routes `FULL` and keeps at least
+  `kSimilarityKeepFraction` = 90% of its anchors.
+
+Otherwise every seed is the translation-only value, bit for bit. When the last
+condition fails, the lattice is re-solved from the translation alone.
+`FullFieldGolden` passes unchanged: its affine scenario implies 2.8 px at the
+corners and stays on the translation path, which
+`SeedBench.LogPolarRotationScale` asserts directly.
+
+The third condition was added after IncBench
+([INCREMENTAL_BENCHMARK.md](INCREMENTAL_BENCHMARK.md)) showed what happens
+without it. Under strong uniaxial stretch the log-polar correlation still
+returns a peak, though a similarity cannot describe a stretch: −5.8 deg × 0.92
+for a 45% stretch, and about 90 deg once noise is added. The stretch has
+already weakened the translation peak, so the second condition passes. The
+lattice that model seeds can hold a self-consistent cluster of wrong anchors
+that neither the ZNSSD gate nor the residual median test rejects. On that
+noise-free frame the field went from 0.014 to 0.215 px rms, and with noise
+frames were lost outright: 27 against 14 dropped in the ring-mask scenario.
+Counting kept anchors cannot pick the better lattice, since the bad one keeps
+more (123 against 86). Only a lattice that keeps nearly everything shows that
+the model fits. `SeedBench.SimilarityFallsBackUnderStretch` pins that frame:
+0.2150 px with the condition disabled, 0.0137 px with it.
+
+**Measured** on Ubuntu 22.04 (WSL2), GCC 11.4, `taskset -c 0-3`,
+`SEMPER_SEEDBENCH_REPEATS=11`, both columns on the same host. "Before" is
+`045a500` with the same sweep rows added; the AKAZE column above cannot be
+re-measured, because that code is gone.
+
+| scenario | anchors kept | mesh cov (frac) | hull cov | seed CPU ms | field CPU ms | mean ICGN iters | field RMS px |
+|---|---|---|---|---|---|---|---|
+| 2 deg | 268 → **289** | 0.996 → **1.000** | 0.955 → 0.969 | 84.0 → **37.7** | 396.8 → **343.5** | 3.36 → 2.70 | 0.02188 → 0.02188 |
+| 5 deg | 54 → **289** | 0.450 → **1.000** | 0.443 → 0.969 | 290.1 → **34.9** | 629.6 → **355.7** | 5.57 → 2.83 | 0.02251 → 0.02251 |
+| 10 deg | 99 → **289** | 0.521 → **1.000** | 0.514 → 0.969 | 666.7 → **31.9** | 1001.0 → **369.1** | 4.91 → 3.05 | 0.02042 → 0.02041 |
+| 15 deg | 30 → **289** | 0.152 → **1.000** | 0.146 → 0.969 | 753.3 → **34.5** | 1084.5 → **383.6** | 5.81 → 3.26 | 0.01938 → 0.01937 |
+| 30 deg | 4 → **289** | 0.059 → **1.000** | 0.055 → 0.969 | 804.7 → **35.8** | 2652.8 → **415.3** | 8.99 → 3.57 | 0.02510 → 0.02511 |
+| 5% zoom | 189 → **289** | 0.906 → **1.000** | 0.816 → 0.969 | 162.7 → **35.6** | 490.5 → **338.7** | 4.20 → 2.74 | 0.02190 → 0.02190 |
+| 10 deg + 5% + (20, −12) px | 61 → **289** | 0.239 → **1.000** | 0.227 → 0.969 | 726.5 → **38.0** | 1048.9 → **375.3** | 5.33 → 3.10 | 0.02170 → 0.02169 |
+| 25 px shift | 289 → 289 | 1.000 → 1.000 | 0.969 → 0.969 | 32.5 → 34.3 | 204.1 → 207.6 | 1.31 → 1.31 | 0.00008 → 0.00008 |
+| 50 px shift | 289 → 289 | 1.000 → 1.000 | 0.969 → 0.969 | 32.5 → 34.5 | 199.5 → 206.3 | 1.31 → 1.31 | 0.00006 → 0.00006 |
+| 100 px shift | 289 → 289 | 1.000 → 1.000 | 0.969 → 0.969 | 33.0 → 35.1 | 204.9 → 209.4 | 1.32 → 1.32 | 0.00006 → 0.00006 |
+| real DICe pair, 0.4 px | 289 → 289 | 1.000 → 1.000 | 0.975 → 0.975 | 32.7 → 34.4 | 468.7 → 483.6 | 2.25 → 2.25 | 0.01627 → 0.01627 |
+
+"mesh cov (frac)" is the fraction of grid points with a mesh guess, the
+quantity the earlier tables in this section call mesh coverage. "hull cov" is
+the anchors' convex hull as a fraction of the ROI area; 0.969 is the full
+lattice, whose outermost nodes sit one step inside the ROI edge. Every rotated
+scenario now locks (`lock` = `sim` in the sweep's table) and routes `FULL`.
+The estimate reads 4.99, 14.94 and 9.96 deg × 1.049 on the 5 deg, 15 deg and
+combined rows.
+
+What this buys:
+
+- **Rotation no longer costs.** Seeding CPU is flat at 32–38 ms from 2 to
+  30 deg, against 84–805 ms before. Field CPU at 15 deg falls 2.8×, at 30 deg
+  6.4×. Mean ICGN iterations fall too, because Path A now starts from a mesh
+  that covers the whole ROI and carries the rotation's gradients.
+- **Against AKAZE, by inference only.** On the old host the lattice cost
+  1.12×, 1.56× and 2.19× AKAZE's CPU at 2, 5 and 15 deg. Applying this host's
+  before/after ratios (0.87, 0.56, 0.35) puts it at about 0.97×, 0.88× and
+  0.78×, i.e. at or below the descriptor seeder throughout. That combines two
+  hosts, so treat it as an estimate, not a measurement.
+- **Accuracy is unchanged.** Converged fraction (87.89%) and field RMS agree
+  to the fifth decimal in every scenario. As before, Path B had been covering
+  for the missing mesh; the fix removes the time cost.
+
+What it costs:
+
+- **The estimate is not free on pure translation.** One N² DFT plus a 256×128
+  correlation adds 1.3–1.6 ms of serial time per solve: the L0 phase goes from
+  3.0–3.3 to 4.3–4.4 ms on the 320 px ROI, and from 4.5 to 6.2 ms on the
+  400 px DICe ROI. Measured field CPU on the translation rows and the DICe pair is up 1.7–3.4%.
+  That is more than the estimate itself, but the solve that follows is
+  identical work (same seeds, same iterations, same RMS), and the same rows
+  spread 199.5–204.9 ms across repeats of the unchanged code. **Strictly, 0 deg
+  regresses by the estimate's 1.3–1.6 ms; from 2 deg up, CPU is lower.**
+- **Limits.**
+  - The magnitude spectrum repeats every 180 deg, so rotation is recovered in
+    (−90, 90) deg. Scale is accepted in (0.5, 2).
+  - An ROI whose short side is under 64 px gets no estimate and stays
+    translation-only — a 1000×30 beam ROI, for example.
+  - **Small noisy ROIs get nothing from it.** At σ = 2 grey-level noise, the
+    log-polar correlation finds no peak on a 110 px ROI from 5 to 45 deg,
+    while on a 200 px ROI it is within 0.05 deg at every angle. Such frames
+    stay translation-only, as before. Dropping the log compression rescues
+    most of the noisy 110 px cases, but breaks noise-free ones at 20–45 deg,
+    so it is not a drop-in fix.
+  - Anisotropic stretch is outside the model. The third condition above
+    returns such frames to the translation-only result, at the cost of
+    solving the lattice twice.
 
 
 ## 5. Cost accounting
@@ -456,7 +570,7 @@ measurement:
 | 3 | total wall time ≤ baseline | **pass** — every scenario. 192.0 vs 198.7 ms (DICe), 201.9 vs 283.9 (Sample 5), 372.7 vs 389.1 (Sample 14) |
 | 4 | total CPU time ≤ baseline, single and multi-threaded | **pass** — 678.3 vs 706.7 ms at 4 threads, 622.9 vs 691.3 ms pinned to one core |
 | 5 | peak RSS ≤ baseline | **pass** — 65.9 vs 67.9 MB, the lowest of all seven candidates |
-| 6 | coverage and convergence no worse | **pass for translation and strain, fails above ~5 deg rotation** — mesh coverage 1.000 vs 0.446 (DICe) and 0.762 (Sample 14), and 1.000 at translations to 100 px; but 0.450 at 5 deg and 0.152 at 15 deg, against AKAZE's 0.961. Convergence and field RMS are identical in every case — the cost is CPU, not correctness (§4.5) |
+| 6 | coverage and convergence no worse | **pass** — mesh coverage 1.000 vs 0.446 (DICe) and 0.762 (Sample 14), 1.000 at translations to 100 px, and, since the log-polar rotation estimate (§4.5.1), 1.000 at 2–30 deg rotation and 5% scale, against AKAZE's 0.961 at 15 deg. As first measured, translation-only, this failed above ~5 deg: 0.450 at 5 deg, 0.152 at 15 deg. Convergence and field RMS are identical in every case |
 | 7 | binary size not larger | **pass** — aarch64 29.1% smaller (−2.755 MB per ABI); x86_64 35.9% (−4.864 MB). Quote the aarch64 figure |
 
 Two criteria are not met literally. Criterion 1 fails on Sample 5 by 7% at a
@@ -474,7 +588,7 @@ sweep in `tests/integration/test_seeding_bench.cpp` early-returns unless
 
 is set, and three of them additionally need `SEMPER_DICE_REPO` pointed at an
 external checkout, so CI ran exactly one assertion-bearing case from the file.
-Four gates now run unconditionally:
+Seven gates now run unconditionally (four since 0.3.0, three since the rotation fix of §4.5.1):
 
 - `SeedBench.AnchorSeedingQualityGate` promotes three of the seven synthetic
   scenarios — 0.4 px translation, 0.5° rotation, 12 px translation — to
@@ -492,6 +606,17 @@ Four gates now run unconditionally:
 - `SeedBench.AnchorLatticeSizing` pins the per-axis stride, including the
   1000×6 ROI that motivated it. No fixture in this repo has that geometry, so
   the planner is tested directly rather than through a solve.
+- `SeedBench.LogPolarRotationScale` pins the sign and size of the
+  Fourier-Mellin rotation and scale (§4.5.1), the rotation-corrected
+  translation, and the switch: below `kSimilarityMinCornerPx`, including
+  FullFieldGolden's affine scenario, the result must equal the translation-only
+  one bit for bit.
+- `SeedBench.AnchorSeedingRotationGate` promotes the 5 deg, 15 deg and combined
+  10 deg + 5% + 20 px rows of LargeMotionSweep: similarity applied, `FULL`, hull
+  coverage ≥ 0.90, mesh fraction ≥ 0.95, vertex error ≤ 0.05 px.
+- `SeedBench.SimilarityFallsBackUnderStretch` pins the fallback of §4.5.1 on
+  the IncBench frame that exposed it: the similarity is rejected and the field
+  stays at the translation-only 0.014 px, not 0.215 px.
 
 Verified by perturbing the anchor stride by one in
 `src/pipeline/full_field_anchors.cpp`: the golden reports slots 3, 8, 19 and 22

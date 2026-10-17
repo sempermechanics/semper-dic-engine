@@ -3,9 +3,14 @@
 // Two layers, neither of which uses a feature detector or a descriptor:
 //
 //   L0  cv::phaseCorrelate over the ROI gives the global rigid shift from every
-//       pixel, rather than from the median of sparse keypoint matches.
+//       pixel, rather than from the median of sparse keypoint matches. A
+//       log-polar (Fourier-Mellin) correlation of the magnitude spectra adds
+//       rotation and scale when they move the ROI corners by more than
+//       kSimilarityMinCornerPx (phase_correlate.cpp).
 //   L1  a regular lattice of ROI grid nodes is solved with the engine's own
-//       IC-GN, seeded from L0. The converged nodes become the mesh vertices.
+//       IC-GN, seeded from L0 -- under rotation, each node with the
+//       displacement and gradients the similarity puts there. The converged
+//       nodes become the mesh vertices.
 //
 // Anchors sit on grid nodes on purpose. They reuse the Hessian pool the solve
 // already builds, and a node good enough to keep is a *final* result for that
@@ -134,14 +139,18 @@ MeshSeedResult solve_anchor_seeds(
     MeshSeedResult out;
     if (cache.ref_img == nullptr || gridW <= 0 || gridH <= 0) return out;
 
-    // --- L0: global rigid shift ------------------------------------------
-    double pu = 0.0, pv = 0.0, presp = 0.0;
+    // --- L0: global motion ------------------------------------------------
+    // Translation, or translation plus rotation and scale about the ROI centre
+    // when the log-polar estimate says the corners are far enough off for it
+    // to matter. Translation-only, every value below is exactly what the
+    // translation-only seeder produced.
+    seeding::SimilarityShift gm;
     {
         ScopedTimer t(timings.phase_corr);
         if (!cache.gray.empty() &&
             defMat.cols == cache.gray.cols && defMat.rows == cache.gray.rows) {
-            // The reference half (crop, float conversion, Hann window) is
-            // reused across solves against this reference.
+            // The reference half (crop, float conversion, Hann window, log-polar
+            // spectrum) is reused across solves against this reference.
             const cv::Rect roi(params.rect_x, params.rect_y, params.rect_w, params.rect_h);
             if (!cache.precompute) cache.precompute = std::make_unique<RefPrecompute>();
             RefPrecompute& pre = *cache.precompute;
@@ -150,11 +159,11 @@ MeshSeedResult solve_anchor_seeds(
                 pre.phase_roi = roi;
                 pre.phase_valid = true;
             }
-            out.phase_locked = seeding::phase_correlate_roi(pre.phase_ref, defMat, pu, pv, presp);
+            seeding::phase_correlate_similarity(pre.phase_ref, defMat, gm);
         }
     }
-    out.globalU = (float)pu;
-    out.globalV = (float)pv;
+    out.rotation_deg = (float)(gm.theta_rad * 180.0 / CV_PI);
+    out.scale = (float)gm.scale;
 
     ScopedTimer anchor_timer(timings.anchors);
 
@@ -173,7 +182,13 @@ MeshSeedResult solve_anchor_seeds(
     if (lat_y.back() != gridH - 1) lat_y.push_back(gridH - 1);
 
     const int LW = (int)lat_x.size(), LH = (int)lat_y.size();
-    if (LW < 2 || LH < 2) return out;
+    if (LW < 2 || LH < 2) {
+        out.phase_locked = gm.locked;
+        out.similarity = gm.similarity;
+        out.globalU = (float)gm.u;
+        out.globalV = (float)gm.v;
+        return out;
+    }
 
     // The planner and the two loops above must agree, or the median test's
     // O(1) neighbour lookup indexes the wrong nodes.
@@ -182,172 +197,256 @@ MeshSeedResult solve_anchor_seeds(
              lat.nx, lat.ny, LW, LH);
     }
 
-    std::vector<AnchorResult> anchors((size_t)LW * LH);
     const int n_anchor = LW * LH;
 
-    // With a phase-correlation lock the guess is already sub-pixel, so pure
-    // ICGN converges and the 6-DOF Simplex rescue is pure cost. Without a lock
-    // each anchor has to find its own offset, so the coarse search stays.
-    const auto init_mode = out.phase_locked ? INIT_NO_SIMPLEX : INIT_AUTO_SEARCH;
+    // Solve the lattice from one global model and run the median test on it.
+    // `sim` seeds every anchor with the similarity in `gm`; otherwise with the
+    // uncorrected translation (gm.t_*), exactly as the translation-only seeder
+    // did, so that path is bit-identical to it.
+    auto solve_lattice = [&](bool sim, MeshSeedResult& r) {
+        r.similarity = sim;
+        r.phase_locked = sim ? gm.locked : gm.t_locked;
+        r.globalU = (float)(sim ? gm.u : gm.t_u);
+        r.globalV = (float)(sim ? gm.v : gm.t_v);
+        const float gux = sim ? (float)gm.ux : 0.0f, guy = sim ? (float)gm.uy : 0.0f;
+        const float gvx = sim ? (float)gm.vx : 0.0f, gvy = sim ? (float)gm.vy : 0.0f;
+        const float gcx = (float)gm.cx, gcy = (float)gm.cy;
+        // The similarity's displacement at a reference point. Only evaluated
+        // under `sim`; the translation-only path never calls it.
+        const float model_u0 = r.globalU, model_v0 = r.globalV;
+        auto model_u = [=](float x, float y) { return model_u0 + gux * (x - gcx) + guy * (y - gcy); };
+        auto model_v = [=](float x, float y) { return model_v0 + gvx * (x - gcx) + gvy * (y - gcy); };
 
-    std::atomic<int> attempted(0);
+        std::vector<AnchorResult> anchors((size_t)n_anchor);
+
+        // With a phase-correlation lock the guess is already sub-pixel, so pure
+        // ICGN converges and the 6-DOF Simplex rescue is pure cost. Without a
+        // lock each anchor has to find its own offset, so the coarse search stays.
+        const auto init_mode = r.phase_locked ? INIT_NO_SIMPLEX : INIT_AUTO_SEARCH;
+
+        std::atomic<int> attempted(0);
 
 #pragma omp parallel num_threads(safe_cores)
-    {
-        const int tid = omp_get_thread_num();
-        OptimizationEngine engine;
-        Semper::SubsetData subset;
-        engine.lm_enabled = true;
-        engine.lm_alpha = tuning::kLmAlpha;
-        engine.use_6x6_interpolator = params.use_6x6_interpolator;
-        double local_hessian = 0.0, local_wait = 0.0;
-        // Stays 0: the anchor phase no longer publishes, so points_solved is
-        // credited in publish_anchor_results once the median test has spoken.
-        int local_pts = 0;
-        EngineStatFlusher flusher(engine, stats[tid], local_pts, local_hessian, local_wait);
+        {
+            const int tid = omp_get_thread_num();
+            OptimizationEngine engine;
+            Semper::SubsetData subset;
+            engine.lm_enabled = true;
+            engine.lm_alpha = tuning::kLmAlpha;
+            engine.use_6x6_interpolator = params.use_6x6_interpolator;
+            double local_hessian = 0.0, local_wait = 0.0;
+            // Stays 0: the anchor phase no longer publishes, so points_solved is
+            // credited in publish_anchor_results once the median test has spoken.
+            int local_pts = 0;
+            EngineStatFlusher flusher(engine, stats[tid], local_pts, local_hessian, local_wait);
 
-        // Chunk 4 measured against `static` and `dynamic, 16` on the DICe
-        // pair at 1/4/8 cores: this is the best of the three on wall time
-        // (`static` costs 14% more) and they tie on CPU. The residual
-        // parallel overhead is fixed per-thread cost, not granularity -- it
-        // does not move when the chunk does. docs/SEEDING_BENCHMARK.md 5.1.
+            // Chunk 4 measured against `static` and `dynamic, 16` on the DICe
+            // pair at 1/4/8 cores: this is the best of the three on wall time
+            // (`static` costs 14% more) and they tie on CPU. The residual
+            // parallel overhead is fixed per-thread cost, not granularity -- it
+            // does not move when the chunk does. docs/SEEDING_BENCHMARK.md 5.1.
 #pragma omp for schedule(dynamic, 4)
-        for (int idx = 0; idx < n_anchor; ++idx) {
-            if (cancel_requested()) continue;
+            for (int idx = 0; idx < n_anchor; ++idx) {
+                if (cancel_requested()) continue;
 
-            const int gx = lat_x[(size_t)(idx % LW)];
-            const int gy = lat_y[(size_t)(idx / LW)];
-            // No ROI mask check here: run_full_field's strict per-pixel scan
-            // already pre-set `solved` on every node the mask or the boundary
-            // reserve rejects, and the Hessian pool is only built for the rest.
-            if (resultGrid[gy][gx].solved) continue;
+                const int gx = lat_x[(size_t)(idx % LW)];
+                const int gy = lat_y[(size_t)(idx / LW)];
+                // No ROI mask check here: run_full_field's strict per-pixel scan
+                // already pre-set `solved` on every node the mask or the boundary
+                // reserve rejects, and the Hessian pool is only built for the rest.
+                if (resultGrid[gy][gx].solved) continue;
 
-            const int pool_idx = gy * gridW + gx;
-            const int realX = params.rect_x + gx * params.step;
-            const int realY = params.rect_y + gy * params.step;
-            attempted.fetch_add(1, std::memory_order_relaxed);
+                const int pool_idx = gy * gridW + gx;
+                const int realX = params.rect_x + gx * params.step;
+                const int realY = params.rect_y + gy * params.step;
+                attempted.fetch_add(1, std::memory_order_relaxed);
 
-            auto th1 = std::chrono::high_resolution_clock::now();
-            SubsetPrecomputer::precompute_subset_fast(subset, *cache.ref_img, realX, realY,
-                                                      params.subset_size,
-                                                      hessian_pool[(size_t)pool_idx]);
-            local_hessian += std::chrono::duration<double, std::milli>(
-                    std::chrono::high_resolution_clock::now() - th1).count();
-            if (!subset.is_initialized) continue;
+                auto th1 = std::chrono::high_resolution_clock::now();
+                SubsetPrecomputer::precompute_subset_fast(subset, *cache.ref_img, realX, realY,
+                                                          params.subset_size,
+                                                          hessian_pool[(size_t)pool_idx]);
+                local_hessian += std::chrono::duration<double, std::milli>(
+                        std::chrono::high_resolution_clock::now() - th1).count();
+                if (!subset.is_initialized) continue;
 
-            const int simplex_before = engine.count_simplex;
-            AnalysisResult res = engine.calculate_deformation(
-                    subset, def_img, out.globalU, out.globalV,
-                    0.0f, 0.0f, 0.0f, 0.0f, init_mode);
-            reject_if_ghosted(res, params.subset_size);
-            stats[tid].icgn_iters += res.iters;
-            const bool needed_rescue = (engine.count_simplex > simplex_before);
-            if (needed_rescue) record_simplex_outcome(stats[tid], res);
+                const int simplex_before = engine.count_simplex;
+                // Under the similarity each anchor starts where the rotation puts
+                // it, with the rotation's gradients: the one global shift is off
+                // by 2 r sin(theta/2) at radius r.
+                AnalysisResult res = sim
+                        ? engine.calculate_deformation(
+                                subset, def_img,
+                                model_u((float)realX, (float)realY),
+                                model_v((float)realX, (float)realY),
+                                gux, guy, gvx, gvy, init_mode)
+                        : engine.calculate_deformation(
+                                subset, def_img, r.globalU, r.globalV,
+                                0.0f, 0.0f, 0.0f, 0.0f, init_mode);
+                reject_if_ghosted(res, params.subset_size);
+                stats[tid].icgn_iters += res.iters;
+                const bool needed_rescue = (engine.count_simplex > simplex_before);
+                if (needed_rescue) record_simplex_outcome(stats[tid], res);
 
-            if (res.status != 0) continue;
+                if (res.status != 0) continue;
 
-            // Record, do not publish: the median test has not run yet, so it is
-            // not yet known whether this node is a measurement or a blunder.
-            AnchorResult& a = anchors[(size_t)idx];
-            a.rx = (float)realX; a.ry = (float)realY;
-            a.u = res.u; a.v = res.v;
-            a.ux = res.ux; a.uy = res.uy; a.vx = res.vx; a.vy = res.vy;
-            a.corr = res.correlation_score;
-            a.gx = gx; a.gy = gy;
-            a.thread_id = tid;
-            a.icgn_iters = res.iters;
-            a.used_simplex = needed_rescue;
+                // Record, do not publish: the median test has not run yet, so it
+                // is not yet known whether this node is a measurement or a blunder.
+                AnchorResult& a = anchors[(size_t)idx];
+                a.rx = (float)realX; a.ry = (float)realY;
+                a.u = res.u; a.v = res.v;
+                a.ux = res.ux; a.uy = res.uy; a.vx = res.vx; a.vy = res.vy;
+                a.corr = res.correlation_score;
+                a.gx = gx; a.gy = gy;
+                a.thread_id = tid;
+                a.icgn_iters = res.iters;
+                a.used_simplex = needed_rescue;
 
-            // Two gates. A mesh vertex only has to be approximately right, and
-            // the median test below rejects blunders; an output point has to
-            // clear the same bar Path A applies. kCorrAccept is the tighter of
-            // the two, so output implies vertex.
-            a.vertex = res.correlation_score <= tuning::kAnchorAcceptScore;
-            a.output = res.correlation_score <= tuning::kCorrAccept;
+                // Two gates. A mesh vertex only has to be approximately right, and
+                // the median test below rejects blunders; an output point has to
+                // clear the same bar Path A applies. kCorrAccept is the tighter of
+                // the two, so output implies vertex.
+                a.vertex = res.correlation_score <= tuning::kAnchorAcceptScore;
+                a.output = res.correlation_score <= tuning::kCorrAccept;
+            }
         }
-    }
 
-    out.attempted = attempted.load(std::memory_order_relaxed);
+        r.attempted = attempted.load(std::memory_order_relaxed);
 
-    // Universal median test (Westerweel & Scarano) over the lattice. A global
-    // affine or homography fit would be the wrong model: under a real strain
-    // field the displacements are not affine, so a global fit rejects signal.
-    // The 8-neighbourhood median assumes no field shape, and the lattice makes
-    // the lookup O(1).
-    std::vector<float> us, vs;
-    us.reserve((size_t)n_anchor);
-    vs.reserve((size_t)n_anchor);
-    out.ref_pts.reserve((size_t)n_anchor);
-    out.def_pts.reserve((size_t)n_anchor);
-    for (int lj = 0; lj < LH; ++lj) {
-        for (int li = 0; li < LW; ++li) {
-            const size_t idx = (size_t)lj * LW + li;
-            AnchorResult& a = anchors[idx];
+        // Universal median test (Westerweel & Scarano) over the lattice. A global
+        // affine or homography fit would be the wrong model: under a real strain
+        // field the displacements are not affine, so a global fit rejects signal.
+        // The 8-neighbourhood median assumes no field shape, and the lattice makes
+        // the lookup O(1).
+        //
+        // Under the similarity the test runs on the residual from it. Rotation is
+        // a smooth field, but at 15 deg lattice neighbours 20 px apart differ by
+        // 5 px, and on the lattice edge -- where every neighbour sits on one side
+        // -- the raw median lands that far off and each edge anchor fails a 1 px
+        // tolerance however good it is. Subtracting the model removes exactly
+        // that. Translation-only, the residual is the displacement itself and
+        // this is the original test.
+        std::vector<float> res_u((size_t)n_anchor, 0.0f), res_v((size_t)n_anchor, 0.0f);
+        for (size_t i = 0; i < anchors.size(); ++i) {
+            const AnchorResult& a = anchors[i];
             if (!a.vertex) continue;
+            res_u[i] = sim ? a.u - model_u(a.rx, a.ry) : a.u;
+            res_v[i] = sim ? a.v - model_v(a.rx, a.ry) : a.v;
+        }
 
-            std::array<float, 8> nu{}, nv{};
-            int nn = 0;
-            for (int dj = -1; dj <= 1; ++dj) {
-                for (int di = -1; di <= 1; ++di) {
-                    if (di == 0 && dj == 0) continue;
-                    const int nj = lj + dj, ni = li + di;
-                    if (ni < 0 || ni >= LW || nj < 0 || nj >= LH) continue;
-                    const AnchorResult& nb = anchors[(size_t)nj * LW + ni];
-                    if (!nb.vertex) continue;
-                    nu[nn] = nb.u;
-                    nv[nn] = nb.v;
-                    ++nn;
+        std::vector<float> us, vs;
+        us.reserve((size_t)n_anchor);
+        vs.reserve((size_t)n_anchor);
+        r.ref_pts.reserve((size_t)n_anchor);
+        r.def_pts.reserve((size_t)n_anchor);
+        for (int lj = 0; lj < LH; ++lj) {
+            for (int li = 0; li < LW; ++li) {
+                const size_t idx = (size_t)lj * LW + li;
+                AnchorResult& a = anchors[idx];
+                if (!a.vertex) continue;
+
+                std::array<float, 8> nu{}, nv{};
+                int nn = 0;
+                for (int dj = -1; dj <= 1; ++dj) {
+                    for (int di = -1; di <= 1; ++di) {
+                        if (di == 0 && dj == 0) continue;
+                        const int nj = lj + dj, ni = li + di;
+                        if (ni < 0 || ni >= LW || nj < 0 || nj >= LH) continue;
+                        const AnchorResult& nb = anchors[(size_t)nj * LW + ni];
+                        if (!nb.vertex) continue;
+                        nu[nn] = res_u[(size_t)nj * LW + ni];
+                        nv[nn] = res_v[(size_t)nj * LW + ni];
+                        ++nn;
+                    }
                 }
-            }
-            if (nn >= 3) {
-                const float mu = median_of(nu.data(), nn), mv = median_of(nv.data(), nn);
-                if (std::abs(a.u - mu) > tuning::kAnchorMedianTol ||
-                    std::abs(a.v - mv) > tuning::kAnchorMedianTol) {
-                    // Withhold `kept` only. `vertex` stays set, so a rejected
-                    // node still votes in its neighbours' medians -- dropping it
-                    // from the sample would let one blunder cascade along a row.
-                    continue;
+                if (nn >= 3) {
+                    const float mu = median_of(nu.data(), nn), mv = median_of(nv.data(), nn);
+                    if (std::abs(res_u[idx] - mu) > tuning::kAnchorMedianTol ||
+                        std::abs(res_v[idx] - mv) > tuning::kAnchorMedianTol) {
+                        // Withhold `kept` only. `vertex` stays set, so a rejected
+                        // node still votes in its neighbours' medians -- dropping
+                        // it from the sample would let one blunder cascade along
+                        // a row.
+                        continue;
+                    }
                 }
+                a.kept = true;
+                r.ref_pts.emplace_back(a.rx, a.ry);
+                r.def_pts.emplace_back(a.rx + a.u, a.ry + a.v);
+                us.push_back(a.u);
+                vs.push_back(a.v);
+                if (a.output) r.solved++;
             }
-            a.kept = true;
-            out.ref_pts.emplace_back(a.rx, a.ry);
-            out.def_pts.emplace_back(a.rx + a.u, a.ry + a.v);
-            us.push_back(a.u);
-            vs.push_back(a.v);
-            if (a.output) out.solved++;
+        }
+        r.accepted = (int)r.ref_pts.size();
+
+        if (r.accepted >= 3) {
+            r.globalU = median_of(us);
+            r.globalV = median_of(vs);
+            std::vector<cv::Point2f> hull;
+            cv::convexHull(r.ref_pts, hull);
+            const float roi_area = (float)(params.rect_w * params.rect_h);
+            r.coverage = roi_area > 0.0f ? (float)cv::contourArea(hull) / roi_area : 0.0f;
+        }
+
+        const float accepted_fraction = r.attempted > 0
+                ? (float)r.accepted / (float)r.attempted : 0.0f;
+        // The old floor of 10 vertices came from AKAZE, where findHomography
+        // needed that many correspondences. A Delaunay mesh needs three — one
+        // triangle — so a sparse mesh is useful well below the old threshold,
+        // and on a small ROI the lattice legitimately produces only a handful
+        // of nodes.
+        if (r.accepted >= tuning::kAnchorFullMinVertices &&
+            accepted_fraction >= tuning::kAnchorFullFraction &&
+            r.coverage >= tuning::kAnchorFullCoverage) {
+            r.quality = MeshQuality::FULL;
+        } else if (r.accepted >= 3 && r.coverage >= tuning::kAnchorSparseCoverage) {
+            r.quality = MeshQuality::SPARSE;
+        } else {
+            r.quality = MeshQuality::NONE;
+        }
+        r.anchors = std::move(anchors);
+        return accepted_fraction;
+    };
+
+    if (!gm.similarity) {
+        solve_lattice(false, out);
+    } else {
+        const float kept = solve_lattice(true, out);
+        // The estimate is a similarity. Under strong anisotropic stretch it can
+        // report a rotation that is not there, and with the translation peak
+        // already weak the corrected peak still beats it. The lattice it seeds
+        // then comes out weak -- and not merely sparse: anchors started from
+        // the wrong model can converge, as a cluster, onto the wrong speckle.
+        // Such a cluster agrees with itself, so neither the ZNSSD gate nor a
+        // median test of residuals from that same wrong model catches it
+        // (SeedBench.SimilarityFallsBackUnderStretch: 25 px blunders at p95).
+        // Counting kept anchors cannot choose between the two lattices either,
+        // because the blunders are kept. So the similarity is trusted only when
+        // its lattice says the model fits nearly everywhere; otherwise the
+        // translation-only lattice is used, which makes that frame identical
+        // to the translation-only seeder. A rotation the similarity fits keeps
+        // ~100% and never pays for the second solve.
+        if (out.quality != MeshQuality::FULL || kept < tuning::kSimilarityKeepFraction) {
+            LOGD("ROUTING: similarity lattice weak (%d/%d kept, quality %d); "
+                 "re-solving from the translation alone",
+                 out.accepted, out.attempted, (int)out.quality);
+            out = MeshSeedResult{};
+            solve_lattice(false, out);
+            out.similarity_rejected = true;
         }
     }
-    out.accepted = (int)out.ref_pts.size();
+    out.rotation_deg = (float)(gm.theta_rad * 180.0 / CV_PI);
+    out.scale = (float)gm.scale;
 
-    if (out.accepted >= 3) {
-        out.globalU = median_of(us);
-        out.globalV = median_of(vs);
-        std::vector<cv::Point2f> hull;
-        cv::convexHull(out.ref_pts, hull);
-        const float roi_area = (float)(params.rect_w * params.rect_h);
-        out.coverage = roi_area > 0.0f ? (float)cv::contourArea(hull) / roi_area : 0.0f;
-    }
-
-    const float accepted_fraction = out.attempted > 0
-            ? (float)out.accepted / (float)out.attempted : 0.0f;
-    // The old floor of 10 vertices came from AKAZE, where findHomography needed
-    // that many correspondences. A Delaunay mesh needs three — one triangle —
-    // so a sparse mesh is useful well below the old threshold, and on a small
-    // ROI the lattice legitimately produces only a handful of nodes.
-    if (out.accepted >= tuning::kAnchorFullMinVertices &&
-        accepted_fraction >= tuning::kAnchorFullFraction &&
-        out.coverage >= tuning::kAnchorFullCoverage) {
-        out.quality = MeshQuality::FULL;
-    } else if (out.accepted >= 3 && out.coverage >= tuning::kAnchorSparseCoverage) {
-        out.quality = MeshQuality::SPARSE;
-    } else {
-        out.quality = MeshQuality::NONE;
-    }
-
-    LOGD("ROUTING: anchor lattice %d/%d kept (%d as output, cov %.2f, phase %s) -> quality %d",
+    LOGD("ROUTING: anchor lattice %d/%d kept (%d as output, cov %.2f, phase %s, "
+         "rot %.2f deg x%.4f %s) -> quality %d",
          out.accepted, out.attempted, out.solved, (double)out.coverage,
-         out.phase_locked ? "locked" : "none", (int)out.quality);
-    out.anchors = std::move(anchors);
+         out.phase_locked ? "locked" : "none", (double)out.rotation_deg,
+         (double)out.scale,
+         out.similarity ? "applied"
+                        : out.similarity_rejected ? "rejected, translation lattice used"
+                                                  : "not applied",
+         (int)out.quality);
     return out;
 }
 
