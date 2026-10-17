@@ -15,7 +15,7 @@
 // types.hpp) are exempt.
 #define SEMPER_VERSION_MAJOR 0
 #define SEMPER_VERSION_MINOR 4
-#define SEMPER_VERSION_PATCH 0
+#define SEMPER_VERSION_PATCH 1
 
 #define SEMPER_STRINGIFY_(x) #x
 #define SEMPER_STRINGIFY(x) SEMPER_STRINGIFY_(x)

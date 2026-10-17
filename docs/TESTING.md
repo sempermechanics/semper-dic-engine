@@ -508,8 +508,8 @@ cannot do both jobs: Ubuntu already sits at 2 clean and goes to 3 perturbed.
 `MAX_SLOW_CONVERGENCE_FLIPS` (6) remains as a backstop against churn in both
 directions at once. Every perturbed flip measured was `0 -> 1`, on both hosts.
 
-Sanitizer and coverage builds skip this suite — instrumentation and `-O0`
-change which subsets initialize.
+Sanitizer and coverage builds skip this suite — instrumentation and the
+coverage build's `-O1` change which subsets initialize.
 
 ```bash
 # recapture both fixtures, on Ubuntu GCC Release only
@@ -724,6 +724,9 @@ The `coverage` CI job configures `-DSEMPER_COVERAGE=ON`, runs `dic_tests`, and
 publishes a `gcovr` report over `src/` as an artifact. **There is no threshold or
 gate** — it exists to make it visible when a source file (like `image_codec.cpp`,
 which was at ~0%) drifts out of the exercised set, not to block a PR on a number.
+The build is `-O1`: at `-O0` the incremental suites alone outran a 90-minute
+job. Leave gcc's counter update at its default (atomic under `-fopenmp`);
+`-fprofile-update=single` corrupted solver results across OpenMP threads.
 Locally: `cmake -S tests -B build/cov -DSEMPER_COVERAGE=ON -DDIC_REQUIRE_OPENCV=ON
 && cmake --build build/cov -j && ./build/cov/dic_tests && gcovr --root . build/cov
 --filter 'src/' --txt`.
