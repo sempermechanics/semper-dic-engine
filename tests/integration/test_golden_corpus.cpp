@@ -17,7 +17,7 @@
 // of poorly conditioned 6x6 subsets. The tolerances below cover that
 // noise while still failing on a status flip or a systematic field shift.
 // Sanitizer and coverage builds skip this suite: instrumentation and
-// Debug -O0 change floating-point results (and which subsets initialize)
+// coverage -O1 change floating-point results (and which subsets initialize)
 // enough to trip the relative check. The other suites still cover those
 // builds.
 //
