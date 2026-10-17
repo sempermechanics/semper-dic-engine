@@ -295,7 +295,9 @@ field:  x   y   u   v    exx   eyy   exy   corr
 Slot indices are Frozen; new telemetry appends. `metrics_len == 16` is the
 minimum honored; **23 preferred**. The writer copies the largest prefix the
 caller's buffer can hold (16, 17, 19, 20, 21, 22 or 23 slots), so an existing
-caller that still passes 17 keeps working unchanged.
+caller that still passes 17 keeps working unchanged. The JNI adapter honours
+this from v0.4.1; before that it copied at most 19 slots, so slots 19–22 never
+reached Kotlin.
 
 **Slot 10 semantic change (v0.2.2).** The index, type and layout are unchanged
 and remain Frozen. Its *meaning* changed from "AKAZE + RANSAC time (ms)" to
