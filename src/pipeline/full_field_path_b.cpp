@@ -1,7 +1,8 @@
 // Path B — reliability-guided flood fill (RGDIC), deterministic in parallel.
 //
 // The flood fill grows the solved region outwards from Path A's boundary (or
-// from AKAZE / Path C seeds when Path A solved nothing). Each unsolved cell is
+// from the anchor-lattice vertices or the Path C seed when Path A solved
+// nothing). Each unsolved cell is
 // solved once, from the first solved neighbour that reaches it: the
 // neighbour's displacement, projected by its gradients, is the cell's initial
 // guess. Which neighbour that is decides the answer — a different guess
@@ -78,7 +79,7 @@ using ReliabilityQueue = std::priority_queue<SeedNode, std::vector<SeedNode>, Re
 struct CellTask {
     int x = 0, y = 0;
     float gu = 0, gv = 0, gux = 0, guy = 0, gvx = 0, gvy = 0;
-    bool counts_as_path_b = true; // AKAZE / Path C seeds are not counted
+    bool counts_as_path_b = true; // seeds (lattice vertices, Path C) are not counted
 
     bool initialized = false;     // subset fit inside the image
     bool needed_rescue = false;   // Simplex ran

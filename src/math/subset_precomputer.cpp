@@ -225,7 +225,7 @@ namespace Semper {
         // ── Normalize + build steepest_descent_images in one fused loop ──
         //    (SD images are needed for the ICGN Newton step — can't skip these)
 
-        // 🚀 SIMD SoA mirror must track n (see Types.h / SimdKernels.h)
+        // 🚀 SIMD SoA mirror must track n (see types.hpp / simd.hpp)
         if (data.sdi_planes.size() != static_cast<size_t>(n) * 6)
             data.sdi_planes.resize(static_cast<size_t>(n) * 6);
 

@@ -593,7 +593,13 @@ deliberate act**: the diff to the `.bin` belongs in a commit whose message says
 why the field moved. The file originated on the GPU branch; the two branches'
 fixtures are not interchangeable, because their seeding front-ends differ.
 
-## Suite: `SeedBench` — `integration/test_seeding_bench.cpp`
+## Suite: `SeedBench` — `integration/test_seeding_bench.cpp` + `integration/test_seeding_contracts.cpp`
+
+Split in v0.5.0 (the one file had passed 1200 lines): the sweeps are in
+`test_seeding_bench.cpp`, the always-on cases below in
+`test_seeding_contracts.cpp`, and the harness both use (ground-truth fields,
+scenarios, per-row measurement, table/CSV writers) in
+`framework/seed_bench.h`. The suite name is unchanged.
 
 Mostly a **measurement harness**, not a gate: `CandidateSweep`,
 `RealSpeckleSweep`, `Challenge5`, `Challenge14Sinusoid` and `LargeMotionSweep`
@@ -786,9 +792,9 @@ tests/
   integration/            the assembled engine end-to-end + robustness
                             test_optimization_engine, test_robustness,
                             test_full_field_contracts,
-                            test_full_field_golden, test_seeding_bench,
-                            test_full_field_determinism, test_reference_cache
-                            (the last five OpenCV-gated)
+                            test_full_field_golden, test_seeding_contracts,
+                            test_seeding_bench, test_full_field_determinism,
+                            test_reference_cache (the last six OpenCV-gated)
   dice/                   DICe golden comparisons
   perf/                   throughput gates
 ```
@@ -796,7 +802,7 @@ tests/
 `tests/CMakeLists.txt` lists sources under `DIC_UNIT_TESTS` /
 `DIC_INTEGRATION_TESTS` / `DIC_DICE_TESTS` / `DIC_PERF_TESTS`, plus
 `DIC_PIPELINE_TESTS` for the OpenCV-gated suites (`test_full_field_contracts`,
-`test_full_field_golden`, `test_seeding_bench`, `test_full_field_determinism`,
+`test_full_field_golden`, `test_seeding_contracts`, `test_seeding_bench`, `test_full_field_determinism`,
 `test_image_codec`, `test_reference_cache`) — attached only when OpenCV is present.
 
 ## Adding a new test

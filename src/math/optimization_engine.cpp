@@ -434,7 +434,7 @@ namespace Semper {
         float znssd = 0.0f;
 
         if (valid_pixels == static_cast<int>(n)) {
-            // 🚀 Portable SIMD kernels (NEON/SSE via one codepath) — see SimdKernels.h
+            // 🚀 Portable SIMD kernels (NEON/SSE via one codepath) — see simd.hpp
             def_sum_sq = simd::sum_sq_diff(buffer.data(), n, def_mean);
 
             float def_std = std::sqrt(def_sum_sq / valid_pixels);

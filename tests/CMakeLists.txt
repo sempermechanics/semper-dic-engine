@@ -120,6 +120,7 @@ set(DIC_PIPELINE_SOURCES
 set(DIC_PIPELINE_TESTS
         integration/test_full_field_contracts.cpp
         integration/test_full_field_golden.cpp
+        integration/test_seeding_contracts.cpp
         integration/test_seeding_bench.cpp
         integration/test_incremental_bench.cpp
         integration/test_full_field_determinism.cpp

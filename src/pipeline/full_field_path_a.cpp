@@ -1,6 +1,5 @@
-// Path A — mesh-guided OpenMP solve.
-// Extract-only split from full_field_path_a.cpp; algorithms unchanged.
-// schedule(dynamic, 32), thread count, and arithmetic are unchanged.
+// Path A — mesh-guided OpenMP solve of every grid node the Delaunay guess
+// field (full_field_mesh.cpp) covers, schedule(dynamic, 32).
 
 #include "full_field_internal.hpp"
 

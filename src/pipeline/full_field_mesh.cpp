@@ -1,5 +1,5 @@
-// Path A — Delaunay 6-DOF guess field construction.
-// Extract-only split from full_field_path_a.cpp; algorithms unchanged.
+// Path A, part one — the Delaunay 6-DOF guess field over the anchor-lattice
+// vertices. full_field_path_a.cpp solves from it.
 
 #include "full_field_internal.hpp"
 
@@ -236,9 +236,6 @@ MeshGuessField build_mesh_guess_field(
     return guess;
 }
 
-// ==========================================
-// 🚀 PATH A (DELAUNAY MESH EXECUTION)
-// ==========================================
 } // namespace internal
 } // namespace pipeline
 } // namespace Semper
