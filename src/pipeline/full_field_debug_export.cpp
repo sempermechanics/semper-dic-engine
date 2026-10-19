@@ -28,6 +28,34 @@ void draw_outlined_text(cv::Mat &img, const std::string &text, cv::Point pt, dou
     cv::putText(img, text, pt, cv::FONT_HERSHEY_SIMPLEX, scale, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
 }
 
+namespace {
+
+// Whether the ROI mask excludes grid node (x, y). Bounds-checked: the mask is
+// image-sized and cv::Mat::at is not checked in Release, and until the rect
+// was clipped to the image (validate_params) a node could sit outside it.
+bool node_masked(const cv::Mat &roiMask, const FullFieldParams &params, int x, int y) {
+    if (roiMask.empty()) return false;
+    const int px = params.rect_x + x * params.step, py = params.rect_y + y * params.step;
+    if (px < 0 || py < 0 || px >= roiMask.cols || py >= roiMask.rows) return true;
+    return roiMask.at<uchar>(py, px) < 128;
+}
+
+// How a node's solve went, for the health maps and the CSV:
+//   0 converged without Simplex      3 failed, Simplex ran after an IC-GN reject
+//   1 rescued after an IC-GN reject  4 failed, Simplex ran after the budget ran out
+//   2 rescued after the budget       5 failed, no Simplex
+int solver_state(const GridPoint &gp) {
+    const bool timed_out = gp.icgn_iters >= tuning::kIcgnMaxIter;
+    if (gp.solved && gp.corr > 0.0f) {
+        if (!gp.used_simplex) return 0;
+        return timed_out ? 2 : 1;
+    }
+    if (!gp.used_simplex) return 5;
+    return timed_out ? 4 : 3;
+}
+
+} // namespace
+
 void export_full_field_debug_suite(
         const std::string& local_debug_dir,
         int gridW,
@@ -76,27 +104,13 @@ if (!local_debug_dir.empty()) {
             for (int x = 0; x < gridW; ++x) {
                 const auto &gp = resultGrid[y][x];
 
-                bool is_masked = (!roiMask.empty() &&
-                                  roiMask.at<uchar>(params.rect_y + y * params.step, params.rect_x + x * params.step) < 128);
+                const bool is_masked = node_masked(roiMask, params, x, y);
 
                 if (!is_masked) {
-                    if (gp.solved && gp.corr > 0.0f) {
-                        if (!gp.used_simplex) {
-                            simplexMap.at<cv::Vec3b>(y, x) = cv::Vec3b(0, 255, 0);
-                        } else if (gp.icgn_iters < tuning::kIcgnMaxIter) {
-                            simplexMap.at<cv::Vec3b>(y, x) = cv::Vec3b(0, 255, 255);
-                        } else {
-                            simplexMap.at<cv::Vec3b>(y, x) = cv::Vec3b(255, 255, 0);
-                        }
-                    } else {
-                        if (!gp.used_simplex) {
-                            simplexMap.at<cv::Vec3b>(y, x) = cv::Vec3b(0, 0, 255);
-                        } else if (gp.icgn_iters < tuning::kIcgnMaxIter) {
-                            simplexMap.at<cv::Vec3b>(y, x) = cv::Vec3b(0, 165, 255);
-                        } else {
-                            simplexMap.at<cv::Vec3b>(y, x) = cv::Vec3b(255, 0, 255);
-                        }
-                    }
+                    static const cv::Vec3b STATE_COLORS[6] = {
+                            {0, 255, 0}, {0, 255, 255}, {255, 255, 0},
+                            {0, 165, 255}, {255, 0, 255}, {0, 0, 255}};
+                    simplexMap.at<cv::Vec3b>(y, x) = STATE_COLORS[solver_state(gp)];
                 }
 
                 if (!is_masked) {
@@ -185,19 +199,7 @@ if (!local_debug_dir.empty()) {
                 for (int x = 0; x < gridW; ++x) {
                     const auto &gp = resultGrid[y][x];
 
-                    bool is_masked = (!roiMask.empty() && roiMask.at<uchar>(params.rect_y + y * params.step, params.rect_x + x * params.step) < 128);
-                    if (is_masked) continue;
-
-                    int solver_state = 0;
-                    if (gp.solved && gp.corr > 0.0f) {
-                        if (!gp.used_simplex) solver_state = 0;
-                        else if (gp.icgn_iters < tuning::kIcgnMaxIter) solver_state = 1;
-                        else solver_state = 2;
-                    } else {
-                        if (!gp.used_simplex) solver_state = 5;
-                        else if (gp.icgn_iters < tuning::kIcgnMaxIter) solver_state = 3;
-                        else solver_state = 4;
-                    }
+                    if (node_masked(roiMask, params, x, y)) continue;
 
                     // 🚀 UPDATE THE EXPORT LINE
                     csvFile << gp.x << "," << gp.y << "," << x << "," << y << ","
@@ -206,7 +208,7 @@ if (!local_debug_dir.empty()) {
                             << gp.mesh_assignment_type << ","
                             << (gp.used_simplex ? 1 : 0) << ","
                             << gp.icgn_iters << ","
-                            << solver_state << ","
+                            << solver_state(gp) << ","
                             << gp.guess_u << "," << gp.guess_v << ","
                             << gp.guess_ux << "," << gp.guess_uy << ","
                             << gp.guess_vx << "," << gp.guess_vy << "\n";
@@ -264,46 +266,35 @@ if (!local_debug_dir.empty()) {
             for (int y = 0; y < gridH; ++y) {
                 for (int x = 0; x < gridW; ++x) {
                     const auto &gp = resultGrid[y][x];
-                    bool is_masked = (!roiMask.empty() && roiMask.at<uchar>(params.rect_y + y * params.step, params.rect_x + x * params.step) < 128);
-                    if (is_masked) continue;
+                    if (node_masked(roiMask, params, x, y)) continue;
 
-                    int solver_state = 0;
-                    if (gp.solved && gp.corr > 0.0f) {
-                        if (!gp.used_simplex) solver_state = 0;
-                        else if (gp.icgn_iters < tuning::kIcgnMaxIter) solver_state = 1;
-                        else solver_state = 2;
-                    } else {
-                        if (!gp.used_simplex) solver_state = 5;
-                        else if (gp.icgn_iters < tuning::kIcgnMaxIter) solver_state = 3;
-                        else solver_state = 4;
-                    }
-
-                    if (solver_state == 0) continue;
+                    const int state = solver_state(gp);
+                    if (state == 0) continue;
 
                     cv::Point pt(gp.x - shiftX, gp.y - shiftY);
                     int radius = 4;
                     int markerSize = 10;
                     int thickness = 2;
 
-                    if (solver_state == 1) {
+                    if (state == 1) {
                         cv::circle(imgAll, pt, radius, cv::Scalar(0, 255, 255), -1, cv::LINE_AA);
                         cv::circle(imgAll, pt, radius, cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
                     }
-                    else if (solver_state == 2) {
+                    else if (state == 2) {
                         cv::circle(imgAll, pt, radius, cv::Scalar(255, 255, 0), -1, cv::LINE_AA);
                         cv::circle(imgAll, pt, radius, cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
                     }
-                    else if (solver_state == 3) {
+                    else if (state == 3) {
                         cv::Scalar col(0, 165, 255);
                         cv::drawMarker(imgAll, pt, col, cv::MARKER_TILTED_CROSS, markerSize, thickness, cv::LINE_AA);
                         cv::drawMarker(imgDead, pt, col, cv::MARKER_TILTED_CROSS, markerSize, thickness, cv::LINE_AA);
                     }
-                    else if (solver_state == 4) {
+                    else if (state == 4) {
                         cv::Scalar col(255, 0, 255);
                         cv::drawMarker(imgAll, pt, col, cv::MARKER_TILTED_CROSS, markerSize, thickness, cv::LINE_AA);
                         cv::drawMarker(imgDead, pt, col, cv::MARKER_TILTED_CROSS, markerSize, thickness, cv::LINE_AA);
                     }
-                    else if (solver_state == 5) {
+                    else if (state == 5) {
                         cv::Scalar col(0, 0, 255);
                         cv::drawMarker(imgAll, pt, col, cv::MARKER_TILTED_CROSS, markerSize, thickness, cv::LINE_AA);
                         cv::drawMarker(imgDead, pt, col, cv::MARKER_TILTED_CROSS, markerSize, thickness, cv::LINE_AA);

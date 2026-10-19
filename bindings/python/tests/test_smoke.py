@@ -87,18 +87,27 @@ def test_set_reference_rejects_non_2d():
         eng.set_reference(rgb)
 
 
-def test_set_reference_float_array_is_cast_not_rejected():
-    # to_gray uses pybind11 forcecast, so a float64 array is silently narrowed to
-    # uint8 rather than rejected — the "must be uint8" message is NOT enforced.
-    # Pin this surprising-but-real behavior so a future change is a conscious one.
+def test_float_image_is_scaled_not_truncated():
+    # A float image in [0, 1] used to go through pybind11's forcecast, which
+    # truncated every pixel to 0 or 1: a black frame. Non-uint8 arrays are now
+    # mapped from their own range onto 0..255 (io::to_gray8), the same rule as
+    # a decoded 16-bit file, and ZNSSD does not see the affine map.
+    ref = _speckle()
+    dx = 3
+    eng_u8 = semper.Engine()
+    eng_u8.set_reference(ref)
+    want = eng_u8.run(np.roll(ref, dx, axis=1), rect=(40, 40, 176, 176), step=20,
+                      subset=31, strain_window=41)
+
     eng = semper.Engine()
-    ref_f64 = _speckle().astype(np.float64)
-    eng.set_reference(ref_f64)  # must NOT raise
-    res = eng.run(
-        ref_f64, rect=(0, 0, 128, 128), step=20, subset=31, strain_window=41,
-        raise_on_error=False,
-    )
-    assert res.metrics.shape == (23,)
+    eng.set_reference(ref.astype(np.float64) / 255.0)
+    got = eng.run(np.roll(ref, dx, axis=1).astype(np.float32) / 255.0,
+                  rect=(40, 40, 176, 176), step=20, subset=31, strain_window=41)
+    # Stretched to the full 0..255 range before quantizing, so not the same
+    # bytes as the uint8 frame, but the same field.
+    assert want.count > 0
+    assert got.count >= 0.8 * want.count
+    assert abs(float(np.median(got.points[:, 2])) - dx) < 0.05
 
 
 def test_strain_window_too_small_raises():

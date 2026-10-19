@@ -47,7 +47,11 @@ void ReferenceCache::reset() {
 
 void ReferenceCache::set_from_gray(const cv::Mat& gray_in, const cv::Mat& roi_mask) {
     reset();
-    if (gray_in.empty()) return;
+    // Image and the Ghost Wall read pixels as bytes; anything but 8-bit gray
+    // (image or mask) leaves the cache empty, and the next solve returns -3.
+    // io::to_gray8 converts.
+    if (gray_in.empty() || gray_in.type() != CV_8UC1) return;
+    if (!roi_mask.empty() && roi_mask.type() != CV_8UC1) return;
     gray = gray_in.clone();
     width = gray.cols;
     height = gray.rows;

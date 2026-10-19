@@ -5,6 +5,8 @@
 
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <string>
 #include "framework/synthetic.h"
 #include "framework/synthetic_cv.h"
 
@@ -18,6 +20,7 @@
 #include <cmath>
 #include <limits>
 #include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
 #include <thread>
 #include <vector>
 
@@ -215,6 +218,41 @@ TEST_CASE(FullField, RectOffImage_ReturnsRoiError) {
     FullFieldParams sliver = params_for(W, H);
     sliver.rect_x = W - STEP / 2;
     CHECK(call_solver(cache, def_gray, sliver, cap) == -2);
+}
+
+// The deformed image was never checked against the reference: a frame of
+// another size skipped phase correlation (it checks) and was then correlated
+// pixel by pixel anyway, returning a plausible field of nonsense; a frame of
+// another type was read as bytes. Both are argument errors now.
+TEST_CASE(FullField, DeformedSizeMismatch_ReturnsInitError) {
+    cv::Mat ref_gray, def_gray;
+    make_pair(ref_gray, def_gray);
+    ReferenceCache cache;
+    cache.set_from_gray(ref_gray, cv::Mat());
+    const int cap = 8 * ((W / STEP) * (H / STEP) + 8);
+    CHECK(call_solver(cache, def_gray(cv::Rect(0, 0, W - 16, H)).clone(), params_for(W, H), cap) == -3);
+    cv::Mat bigger;
+    cv::copyMakeBorder(def_gray, bigger, 0, 20, 0, 20, cv::BORDER_REFLECT);
+    CHECK(call_solver(cache, bigger, params_for(W, H), cap) == -3);
+    CHECK(call_solver(cache, def_gray, params_for(W, H), cap) > 0);
+}
+
+TEST_CASE(FullField, DeformedWrongType_ReturnsInitError) {
+    cv::Mat ref_gray, def_gray;
+    make_pair(ref_gray, def_gray);
+    ReferenceCache cache;
+    cache.set_from_gray(ref_gray, cv::Mat());
+    const int cap = 8 * ((W / STEP) * (H / STEP) + 8);
+    cv::Mat f32, bgr;
+    def_gray.convertTo(f32, CV_32F);
+    cv::cvtColor(def_gray, bgr, cv::COLOR_GRAY2BGR);
+    CHECK(call_solver(cache, f32, params_for(W, H), cap) == -3);
+    CHECK(call_solver(cache, bgr, params_for(W, H), cap) == -3);
+    // The ROI mask is read as bytes too.
+    std::vector<float> out((size_t)cap, 0.0f);
+    cv::Mat mask_f(H, W, CV_32FC1, cv::Scalar(255.0f));
+    CHECK(run_full_field(cache, def_gray, mask_f, params_for(W, H), out.data(), cap,
+                         nullptr, 0, nullptr) == -3);
 }
 
 TEST_CASE(FullField, EmptyDeformed_ReturnsInitError) {
@@ -606,6 +644,37 @@ TEST_CASE(FullField, RefCache_CancelledSolveDoesNotPoisonCache) {
     CHECK(rc == kCancelled || rc > 0);
     CHECK(bit_equal(solve_on(shared, frames[0], cv::Mat(), p),
                     solve_fresh(ref_gray, frames[0], cv::Mat(), p)));
+}
+
+// The debug export reads the ROI mask at every grid node. With a rect past
+// the image those reads were out of bounds (roiMask.at<> is unchecked in
+// Release). validate_params now clips the rect first, and the export's own
+// lookup is bounds-checked too; under ASan this is the test for both.
+TEST_CASE(DebugExport, RectBeyondImage_NoOOB) {
+    cv::Mat ref_gray, def_gray;
+    make_pair(ref_gray, def_gray);
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() /
+                         ("semper_debug_" + std::to_string((long long)std::chrono::steady_clock::now()
+                                                                  .time_since_epoch().count()));
+    REQUIRE(fs::create_directories(dir));
+
+    cv::Mat mask(H, W, CV_8UC1, cv::Scalar(255));
+    cv::circle(mask, cv::Point(W / 2, H / 2), 30, cv::Scalar(0), -1);
+    FullFieldParams p = params_for(W + 4 * STEP, H + 4 * STEP);
+    p.rect_x = -2 * STEP;
+    p.rect_y = -2 * STEP;
+
+    ReferenceCache cache;
+    cache.set_from_gray(ref_gray, mask);
+    cache.debug_dir = dir.string();
+    const int cap = 8 * ((p.rect_w / STEP) * (p.rect_h / STEP) + 8);
+    std::vector<float> out((size_t)cap, 0.0f);
+    CHECK(run_full_field(cache, def_gray, mask, p, out.data(), cap, nullptr, 0, nullptr) > 0);
+    // The export ran: its CSV is there.
+    CHECK(fs::exists(dir / "debug_grid_data.csv"));
+    std::error_code ec;
+    fs::remove_all(dir, ec);
 }
 
 // ---------------------------------------------------------------------------

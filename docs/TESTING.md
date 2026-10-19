@@ -416,6 +416,9 @@ so a pixel-corrupting decode bug was invisible to the whole pipeline. OpenCV-gat
 | `EncodedPng_RoundTripsExactly` | Encoded PNG decodes losslessly to the original | Encoded-image decode regressed |
 | `EncodedColor_ConvertsToGray` | Encoded 3-channel image collapses to one channel | Colour images enter the solver as multi-channel garbage |
 | `EncodedNon8U_ConvertsTo8U` | 16-bit PNG is converted to `CV_8U` | Non-8U depth reaches the solver, which assumes 8-bit |
+| `Encoded16Bit_PreservesContrast` | A 12-bit ramp in a 16-bit PNG decodes to 0..255, strictly increasing | The depth conversion saturates again (before v0.5.0 the ramp came out nearly all 255) |
+| `FloatAndSigned_ScaledToGray8` | `to_gray8`: a [0, 1] float image spans 0..255, a flat one is 128, 8-bit gray passes through, colour collapses, empty stays empty | The one conversion every non-8-bit input goes through (decode, Python arrays) changed |
+| `EncodedWithRawLength_StillDecoded` | A PNG whose byte length equals `w*h` for the expected size is decoded as a PNG; a raw buffer that merely starts like a JPEG is still raw | Raw-vs-encoded is decided by length alone again |
 | `MismatchedLength_FallsThroughToEncoded` | `expected_w/h` set but `len` matching neither raw size → encoded path | A wrong-length raw buffer is misread as raw instead of decoded |
 | `NullAndEmpty_ReturnEmpty` | `nullptr` / `len == 0` → empty `cv::Mat`, no crash | Null-deref on a bad caller argument |
 | `GarbageBytes_ReturnEmptyNoCrash` | Undecodable bytes → empty, no crash | Decoder trusts attacker-controlled bytes |
@@ -454,6 +457,8 @@ quality. OpenCV-gated.
 |---|---|---|
 | `DegenerateRoi_ReturnsRoiError` | `rect_w < step` → `-2` | ROI validation regressed |
 | `EmptyDeformed_ReturnsInitError` | Empty deformed image → `-3` | Init-guard regressed |
+| `DeformedSizeMismatch_ReturnsInitError` / `DeformedWrongType_ReturnsInitError` | A deformed frame of another size than the reference, or not `CV_8UC1` (float, BGR), and a non-`CV_8UC1` mask → `-3` | Before v0.5.0 a smaller frame solved into a plausible field of nonsense and a float frame was read as bytes |
+| `DebugExport.RectBeyondImage_NoOOB` | The debug export (maps + CSV) runs on a rect hanging off the image with a mask; clean under ASan | The export's mask lookup reads outside the mask again |
 | `EvenOrZeroSubsetSize_ReturnsInitError` | `subset_size` 20, 0, −21, 1, 2 → `-3`; 3 solves | `validate_params` stopped guarding the subset buffers (crashes under ASan without it) |
 | `HugeRect_ClippedToImage` | A rect of `INT_MAX` sides, and one hanging off the top-left by whole steps, give the image-sized rect's field byte for byte | The rect sizes the grid again (`std::bad_alloc` through the C/JNI boundary), or clipping moved the lattice |
 | `RectOffImage_ReturnsRoiError` | Rect wholly off the image, `rect_x + rect_w` overflowing `int`, or a clipped rect narrower than a step → `-2` | Clipping overflowed or let an empty grid through |

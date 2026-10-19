@@ -73,6 +73,13 @@ int run_full_field(..., CancelToken& token, ProgressCallback on_progress = nullp
   A non-positive `params.step` is treated as an invalid ROI (`-2`) — it would
   otherwise divide-by-zero when forming the grid. This is a clarification of the
   existing `-2` meaning, not a new code.
+- **Image types** *(v0.5.0)*: `def_gray` must be `CV_8UC1` and the size of
+  the cached reference, and a non-empty `roi_mask` `CV_8UC1` (any size; it is
+  resized), or the call returns `-3`. A frame of another size used to skip
+  phase correlation and then solve anyway, returning a plausible field of
+  nonsense. `set_from_gray` with a non-`CV_8UC1` image or mask leaves the
+  cache empty (so the next solve is `-3`), and `IncrementalSession::init`
+  returns `-3` for either.
 - **Parameter validation** *(v0.5.0)*: `subset_size` must be odd and at least
   3, or the call returns `-3` (an even size overran the subset buffers). The
   rect is clipped to the reference image before the grid is formed; the near
@@ -219,9 +226,20 @@ one process-wide token, the one every solve started without a token polls.
 cv::Mat decode_gray(const uint8_t* data, size_t len, int expected_w = 0, int expected_h = 0);
 cv::Mat decode_bgr (const uint8_t* data, size_t len);
 void    image_dimensions(const uint8_t* data, size_t len, int& out_w, int& out_h);
+cv::Mat to_gray8(const cv::Mat& img);                         // added v0.5.0
 ```
 
 Empty `cv::Mat` = failure; do not switch to throwing.
+
+- **Depth** *(v0.5.0)*: an encoded image of any depth other than 8-bit is
+  mapped linearly from its own min..max onto 0..255 (`to_gray8`); a flat one
+  becomes 128. Before, `convertTo(CV_8U)` saturated it — a 12-bit camera frame
+  came out nearly all white. ZNSSD is invariant to that affine map, so only
+  quantization changes for frames that already decoded correctly.
+- **Raw or encoded** *(v0.5.0)*: with `expected_w/h`, a buffer of exactly
+  `w*h*4` or `w*h` bytes is still decoded as an image when it starts with a
+  PNG, JPEG, TIFF, BMP, WebP or PNM signature and decodes as one; otherwise it
+  is raw, as before.
 
 ### C ABI — `include/semper/semper_c.h` · *Stable (ABI)*
 

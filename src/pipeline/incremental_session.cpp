@@ -179,6 +179,7 @@ int IncrementalSession::init(const cv::Mat& ref_gray, const cv::Mat& roi_mask,
     s.clear();
 
     if (ref_gray.empty() || ref_gray.type() != CV_8UC1) return -3;
+    if (!roi_mask.empty() && roi_mask.type() != CV_8UC1) return -3;
     if (params.update_interval < 0) return -3;
     // The same checks run_full_field makes, with the rect clipped to the
     // image the same way, so the frame-0 grid is the grid every frame solves.

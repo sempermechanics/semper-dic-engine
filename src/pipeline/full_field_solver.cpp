@@ -128,6 +128,15 @@ int run_full_field_impl(
 
         // 🚀 PRIORITY 3: Return -3 for memory/init errors
         if (output_ptr == nullptr || cache.ref_img == nullptr || def_gray.empty()) return -3;
+        // The deformed frame is correlated pixel for pixel against the cached
+        // reference, as 8-bit gray: another size used to skip phase
+        // correlation and then solve anyway, another type was read as bytes.
+        if (def_gray.type() != CV_8UC1 || def_gray.cols != cache.width ||
+            def_gray.rows != cache.height) {
+            return -3;
+        }
+        // The mask is read as bytes too (it may be any size; it is resized).
+        if (!roi_mask.empty() && roi_mask.type() != CV_8UC1) return -3;
         FullFieldParams params = params_in;
         const int param_rc = validate_params(params, cache.width, cache.height);
         if (param_rc != 0) return param_rc;
@@ -140,7 +149,9 @@ int run_full_field_impl(
         LOGD("=== computeFullFieldDirect (HYBRID CORE) START ===");
 
         auto t_prep_start = std::chrono::high_resolution_clock::now();
-        cv::Mat defMat = def_gray;
+        // Image reads rows * cols contiguous bytes; a view into a larger Mat
+        // is not.
+        cv::Mat defMat = def_gray.isContinuous() ? def_gray : def_gray.clone();
         cv::Mat roiMask;
         if (!roi_mask.empty()) {
             roiMask = roi_mask;

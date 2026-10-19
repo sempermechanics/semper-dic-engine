@@ -137,6 +137,73 @@ TEST_CASE(ImageCodec, EncodedNon8U_ConvertsTo8U) {
     CHECK(got.rows == h);
 }
 
+// A 16-bit image used to be convertTo(CV_8U) without a scale, which
+// saturates: a 12-bit camera frame (0..4095) came out almost entirely 255.
+// It is now mapped linearly from its own range onto 0..255, which ZNSSD does
+// not see (it is invariant to a*I + b per image).
+TEST_CASE(ImageCodec, Encoded16Bit_PreservesContrast) {
+    const int w = 64, h = 8;
+    cv::Mat u16(h, w, CV_16UC1);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            u16.at<uint16_t>(y, x) = static_cast<uint16_t>(x * 64 + y);   // 0..4039, 12-bit
+    std::vector<uchar> png;
+    REQUIRE(cv::imencode(".png", u16, png));
+
+    cv::Mat got = decode_gray(png.data(), png.size());
+    REQUIRE(!got.empty());
+    REQUIRE(got.type() == CV_8UC1);
+    double lo = 0, hi = 0;
+    cv::minMaxLoc(got, &lo, &hi);
+    CHECK(lo == 0.0);
+    CHECK(hi == 255.0);
+    // Monotone along the ramp, and every column distinct.
+    for (int x = 1; x < w; ++x) CHECK(got.at<uchar>(0, x) > got.at<uchar>(0, x - 1));
+}
+
+TEST_CASE(ImageCodec, FloatAndSigned_ScaledToGray8) {
+    cv::Mat f(4, 16, CV_32FC1);
+    for (int x = 0; x < 16; ++x) f.col(x).setTo(x / 15.0f);   // a [0, 1] float image
+    cv::Mat g = Semper::io::to_gray8(f);
+    REQUIRE(g.type() == CV_8UC1);
+    CHECK(g.at<uchar>(0, 0) == 0);
+    CHECK(g.at<uchar>(0, 15) == 255);
+    CHECK(g.at<uchar>(2, 5) == 85);
+    // A flat image has no range to stretch: mid-grey, not a division by zero.
+    cv::Mat flat(3, 3, CV_64FC1, cv::Scalar(0.25));
+    CHECK(cv::countNonZero(Semper::io::to_gray8(flat) != 128) == 0);
+    // 8-bit grey passes through untouched; colour collapses to one channel.
+    cv::Mat g8 = make_gray(5, 4);
+    CHECK(cv::countNonZero(Semper::io::to_gray8(g8) != g8) == 0);
+    cv::Mat bgr(4, 5, CV_8UC3, cv::Scalar(10, 20, 30));
+    CHECK(Semper::io::to_gray8(bgr).type() == CV_8UC1);
+    CHECK(Semper::io::to_gray8(cv::Mat()).empty());
+}
+
+// Raw or encoded used to be decided by length alone. An encoded file whose
+// size happens to equal w * h (or w * h * 4) for the expected dimensions was
+// read as raw pixels -- the PNG's bytes, as an image.
+TEST_CASE(ImageCodec, EncodedWithRawLength_StillDecoded) {
+    const int w = 11, h = 9;
+    cv::Mat gray = make_gray(w, h);
+    std::vector<uchar> png;
+    REQUIRE(cv::imencode(".png", gray, png));
+    const int n = (int)png.size();
+    cv::Mat got = decode_gray(png.data(), png.size(), n, 1);   // n * 1 == len
+    REQUIRE(!got.empty());
+    CHECK(got.cols == w);
+    CHECK(got.rows == h);
+    CHECK(cv::countNonZero(got != gray) == 0);
+    // ...and a raw buffer that merely starts like a JPEG is still raw.
+    std::vector<uint8_t> raw((size_t)w * h, 7);
+    raw[0] = 0xFF; raw[1] = 0xD8; raw[2] = 0xFF;
+    cv::Mat r = decode_gray(raw.data(), raw.size(), w, h);
+    REQUIRE(!r.empty());
+    CHECK(r.cols == w);
+    CHECK(r.at<uchar>(0, 0) == 0xFF);
+    CHECK(r.at<uchar>(0, 3) == 7);
+}
+
 TEST_CASE(ImageCodec, MismatchedLength_FallsThroughToEncoded) {
     // expected_w/h are set, but len matches neither w*h nor w*h*4, so the raw
     // branches are skipped and the encoded decoder runs on the PNG bytes.

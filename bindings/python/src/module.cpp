@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -30,21 +31,36 @@ namespace {
 
 ProgressCallback to_callback(const py::object& progress);
 
-// Accepts a 2-D uint8 ndarray (H, W) — wrapped as grayscale, copied so it owns
-// its pixels across the solve — or encoded bytes (PNG/JPEG) decoded via io.
+// Accepts a 2-D ndarray (H, W) — copied so it owns its pixels across the
+// solve — or encoded bytes (PNG/JPEG) decoded via io. A uint8 array is taken
+// as is; any other dtype (uint16, float in [0, 1], ...) is mapped from its own
+// range onto 0..255 by io::to_gray8, as a decoded 16-bit file is. (Until
+// 0.5.0 pybind11's forcecast truncated it to uint8: a [0, 1] float image
+// became black.)
 cv::Mat to_gray(const py::object& img, int expected_w, int expected_h) {
     if (py::isinstance<py::bytes>(img) || py::isinstance<py::bytearray>(img)) {
         std::string s = py::cast<std::string>(img);
         return Semper::io::decode_gray(reinterpret_cast<const uint8_t*>(s.data()),
                                        s.size(), expected_w, expected_h);
     }
-    auto arr = py::array_t<uint8_t, py::array::c_style | py::array::forcecast>::ensure(img);
-    if (!arr) throw std::invalid_argument("image must be a uint8 ndarray or encoded bytes");
-    if (arr.ndim() != 2) throw std::invalid_argument("grayscale image must be 2-D (H, W)");
-    const int h = static_cast<int>(arr.shape(0));
-    const int w = static_cast<int>(arr.shape(1));
-    cv::Mat wrapped(h, w, CV_8UC1, const_cast<uint8_t*>(arr.data()));
-    return wrapped.clone();
+    auto check_2d = [](const py::array& a) {
+        if (a.ndim() != 2) throw std::invalid_argument("grayscale image must be 2-D (H, W)");
+        if (a.shape(0) > INT32_MAX || a.shape(1) > INT32_MAX)
+            throw std::invalid_argument("image too large");
+    };
+    if (py::isinstance<py::array_t<uint8_t>>(img)) {
+        auto arr = py::array_t<uint8_t, py::array::c_style | py::array::forcecast>::ensure(img);
+        check_2d(arr);
+        cv::Mat wrapped(static_cast<int>(arr.shape(0)), static_cast<int>(arr.shape(1)), CV_8UC1,
+                        const_cast<uint8_t*>(arr.data()));
+        return wrapped.clone();
+    }
+    auto arr = py::array_t<double, py::array::c_style | py::array::forcecast>::ensure(img);
+    if (!arr) throw std::invalid_argument("image must be a numeric ndarray or encoded bytes");
+    check_2d(arr);
+    cv::Mat wrapped(static_cast<int>(arr.shape(0)), static_cast<int>(arr.shape(1)), CV_64FC1,
+                    const_cast<double*>(arr.data()));
+    return Semper::io::to_gray8(wrapped);
 }
 
 class Engine {
