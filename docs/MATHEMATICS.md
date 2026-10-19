@@ -19,7 +19,7 @@ changing the numerics. For *where* each equation lives in the code, see
 5.  [Optimization Framework](#5-optimization-framework)
 6.  [Inverse Compositional Gauss-Newton](#6-inverse-compositional-gauss-newton)
 7.  [Simplex Rescue Method](#7-simplex-rescue-method)
-8.  [Feature-Based Initialization](#8-feature-based-initialization)
+8.  [Anchor-Lattice Initialization](#8-anchor-lattice-initialization)
 9.  [Strain Tensor Calculation](#9-strain-tensor-calculation)
 10. [Error Analysis & Uncertainty](#10-error-analysis--uncertainty)
 11. [Implementation Validation](#11-implementation-validation)
@@ -337,6 +337,56 @@ where  pixels.
 
 **Typical Convergence:** 3-5 iterations for well-textured subsets with good initial guess.
 
+### 6.6 Validity, Conditioning and Failure (v0.5.0)
+
+**Which pixels count.** Pixel $i$ of the subset contributes to an iteration
+when its warped position $\bm{q}_i = W(\bm{x}_i)$ rounds to a pixel at least
+4 px inside the image (DICe's guard; it is stricter than every interpolator's
+bilinear-demotion boundary) and its reference pixel is not in the Ghost Wall
+($I_{\text{ref}} \ge -5$). Validity is a property of where a sample was
+taken, never of the value read: $g(\bm{q}_i) = 0$ is black speckle, and a
+negative value is cubic undershoot beside it. Until v0.5.0 every sample not
+$> 0$ was dropped as if it had left the image. One sampler
+(`sample_warped_subset`) serves IC-GN and the Simplex cost (§7.3), so both
+see the same pixels. Fewer than 90% valid pixels ends the solve (status 1).
+
+**Which Hessian.** With every pixel valid the step uses the reference
+Hessian of §6.3 (LM-damped as in §5 when enabled), fixed for the call. An
+iteration that lost pixels uses the Hessian of the pixels it has,
+
+$$ \mathbf{H}_{\text{masked}} = \sum_{i \text{ valid}} \nabla I_i^{\top}\nabla I_i , $$
+
+for that iteration only; the next full iteration is back on the reference one.
+
+**When to invert.** The four gradient columns of the steepest-descent images
+are $\nabla I \cdot x$ or $\nabla I \cdot y$ with $|x|, |y| \le h = \lfloor
+d/2 \rfloor$, so their rows and columns of $\mathbf{H}$ scale as $h^2$ and
+$\det \mathbf{H}$ as $h^8$. A test on the determinant therefore depends on
+the subset size (it overflowed float past ~170 px, and a singular Hessian's
+rounding noise cleared a $10^{-6}$ floor by twenty orders of magnitude).
+The engine scales first,
+
+$$ \tilde{\mathbf{H}} = \mathbf{D}\,\mathbf{H}\,\mathbf{D}, \qquad
+\mathbf{D} = \operatorname{diag}(1, 1, h^{-1}, h^{-1}, h^{-1}, h^{-1}), $$
+
+and inverts $\mathbf{H}$ only when the reciprocal 1-norm condition number
+$1 / (\|\tilde{\mathbf{H}}\|_1 \|\tilde{\mathbf{H}}^{-1}\|_1)$, computed
+from the explicit inverse (an estimator such as LDLT's `rcond()` misjudged
+the symmetric-texture case below by five orders of magnitude), exceeds
+`tuning::kHessianMinRcond` $= 10^{-6}$ (in addition to DICe's $2\times2$
+translation-block test). This applies to the reference Hessian at
+precompute, the LM-damped one, and every masked one. A texture symmetric
+about the subset centre is the textbook failure: it cannot see a rotation
+about that centre, so the $\partial u/\partial y$ and $\partial v/\partial
+x$ columns coincide while the translation block is perfectly conditioned.
+
+**When to stop.** An update $\Delta\bm{p}$ is applied only if it is finite
+and $|\det \Delta W| > 10^{-6}$ (the inverse-compositional update needs
+$\Delta W^{-1}$), and only if the composed warp is finite; otherwise the solve
+ends with status 1 on the last good warp. Finiteness is read from the float's
+exponent bits, because `-ffast-math` lets the compiler fold `std::isfinite`
+to true.
+
 ---
 
 ## 7. Simplex Rescue Method
@@ -402,7 +452,9 @@ for (int iter = 0; iter < 80; ++iter) {
 
 ### 7.3 Cost Function Evaluation
 
-At each simplex vertex, evaluate ZNSSD:
+At each simplex vertex, evaluate ZNSSD over the pixels §6.6 calls valid,
+sampled by the same routine as IC-GN (a non-finite score counts as the worst,
+2.0):
 
 **Typical Performance:**
 
@@ -609,6 +661,10 @@ the test is unchanged.
 
 A rejected anchor is neither a mesh vertex nor an output point.
 
+The median over an even number of neighbours is the mean of the middle pair
+(`util::median_inplace`, shared with §9.4). Until v0.5.0 the lattice took the
+upper of the two, which leans the test towards the larger displacements.
+
 ### 8.4 Mesh Guess Field
 
 Delaunay triangulation over the surviving anchors gives, per triangle, an affine
@@ -711,7 +767,8 @@ cluster is peeled from its edge inward. A straight jump (a crack) survives,
 because each side is its own majority.
 
 **Where:** `StrainCalculator::reject_displacement_outliers`, called from
-`pack_full_field_output`; constants `tuning::kOutlier*`.
+`pack_full_field_output`; constants `tuning::kOutlier*`. The points it rejects
+are counted in metrics slot 23 (v0.5.0).
 
 **Validation (real images):** on the 3-point-bending PMMA series it rejects 211
 points over 33 frames and nothing in 26 of them; each rejected point checked

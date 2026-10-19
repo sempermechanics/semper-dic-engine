@@ -37,6 +37,17 @@ usual. Respect the surface described here, and declare your change's
 
 Downstream apps pin an **exact** engine tag and only auto-adopt minor/patch bumps.
 
+> **v0.5.0 is a minor release.** Additive: `kSeedFailed` / `SEMPER_ERR_SEED`
+> (`-5`), metrics slot 23 and `kMetricsLen` / `SEMPER_METRICS_LEN` = 24,
+> `metrics.hpp` with `metrics_prefix_len`, `io::to_gray8`. Every Frozen value
+> and every existing signature is unchanged. What callers can observe besides:
+> inputs that used to be accepted and mis-solved are now refused (`-3` for an
+> even subset or a frame that does not match the reference, `-2` for a rect
+> with nothing on the image), exceptions no longer cross the C ABI or JNI, a
+> `CancelToken` solve no longer listens to `request_cancel()`, non-8-bit
+> images keep their contrast, and the solved field moves (IC-GN validity and
+> conditioning, MATHEMATICS §6.6; goldens re-captured).
+
 > **Build-plumbing carve-out.** Export/visibility machinery — the `SEMPER_C_API`
 > macro, `-fvisibility=hidden`, `dllexport`/`dllimport` selection — is treated as
 > build plumbing, not public surface: it changes *how* the documented symbols are

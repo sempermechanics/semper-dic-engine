@@ -109,12 +109,12 @@ FullFieldParams default_params() {
 // Windows MinGW, a difference of one iteration spread over 380 points.
 // Slot 22 (mesh coverage) is a convex-hull area ratio accumulated in double
 // precision and moves in its last bits across libm implementations.
-constexpr int kCountSlots = 14;
+constexpr int kCountSlots = 15;
 constexpr int kCountMetric[kCountSlots] = {0,  1,  2,  3,  4,  5,  6,
-                                           7,  8,  16, 19, 20, 21, 22};
+                                           7,  8,  16, 19, 20, 21, 22, 23};
 constexpr float kCountTol[kCountSlots] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f,
                                           0.f, 0.1f, 0.f, 0.f, 0.f, 0.f,
-                                          1e-4f};
+                                          1e-4f, 0.f};
 
 struct SolveOutput {
     int code = 0;
@@ -122,9 +122,10 @@ struct SolveOutput {
     // Only the COUNTING metrics are recorded. Slots 9..14 and 17/18 are
     // wall-clock timings and would differ on every run by construction.
     //
-    // DIVERGENCE from the upstream file: slots 19..22 are recorded too.
+    // DIVERGENCE from the upstream file: slots 19..23 are recorded too.
     // They are this branch's additions -- anchor points solved, points
-    // dropped by the strain post-filter, the phase lock, and mesh coverage.
+    // dropped by the strain post-filter, the phase lock, mesh coverage, and
+    // (v0.5.0) points dropped by the displacement median test.
     // Without them a seeding change that shifted work between the three
     // solving paths, or that quietly lost the phase lock, would leave every
     // recorded number unchanged and pass.

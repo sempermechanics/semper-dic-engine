@@ -483,8 +483,10 @@ quality. OpenCV-gated.
 
 Relative equivalence for the **subset** solver: an 18×18 grid over two
 scenarios (pure translation and affine) is solved with `INIT_NO_SIMPLEX` from a
-zero guess, once per interpolator. 578 of the 648 nodes survive
-`precompute_subset` and are recorded; they are compared against
+zero guess, once per interpolator. 554 of the 648 nodes survive
+`precompute_subset` and are recorded (578 before v0.5.0: the 6×6 conditioning
+test now rejects 12 per scenario, every one of which was a status-1 record
+with diverged values); they are compared against
 `tests/fixtures/golden_corpus.bin.bicubic` and `.keys6x6`.
 
 | Test | Proves | Failure would mean |
@@ -492,7 +494,8 @@ zero guess, once per interpolator. 578 of the 648 nodes survive
 | `CaptureOrCompare_4x4Bicubic` | Every point's convergence status and converged u/v/strains match the capture | The bicubic path moved |
 | `CaptureOrCompare_6x6Keys` | The same for the Keys 4th-order path | The 6×6 path moved |
 
-**The fixtures are captured on Ubuntu GCC Release** (`244231e`), and host tests
+**The fixtures are captured on Ubuntu GCC Release** (re-captured for v0.5.0 on
+Ubuntu 24.04, GCC 13.3; first captured at `244231e`), and host tests
 build with `-ffast-math`, so bit-exact reproduction is not on offer even for an
 identical binary rerun. Values get tolerances (`1e-2` px, `1e-3` strain). Status
 gets one specific, bounded excuse:
@@ -551,10 +554,11 @@ against a committed binary baseline, `tests/fixtures/full_field_golden.bin`.
 | `CaptureOrCompare` | Two synthetic scenarios (translate, affine) reproduce the recorded point count, the recorded counting metrics exactly, and every point value within a portable tolerance | Any stage of the pipeline changed its output — intended or not |
 | `RepeatSolve_IsDeterministic` | Five solves of the same field agree bit-for-bit | A data race or an order-dependent reduction entered the parallel region |
 
-Fourteen metrics slots are recorded alongside the field: `0..8`, `16`, and this
-branch's `19..22` (anchor points, post-filter drops, phase lock, mesh coverage).
+Fifteen metrics slots are recorded alongside the field: `0..8`, `16`, and this
+branch's `19..23` (anchor points, post-filter drops, phase lock, mesh coverage,
+and from v0.5.0 median-test drops).
 The timing slots (`9..14`, `17`, `18`) are excluded — they differ every run by
-construction. Twelve of the fourteen are integer counts or a 0/1 flag and are
+construction. Thirteen of the fifteen are integer counts or a 0/1 flag and are
 compared **exactly**; that exactness is what makes this suite a gate. The two
 exceptions are averages: slot 8 (mean IC-GN iterations) gets `0.1` and slot 22
 (mesh coverage, a convex-hull area ratio) gets `1e-4`.
