@@ -73,6 +73,16 @@ int run_full_field(..., CancelToken& token, ProgressCallback on_progress = nullp
   A non-positive `params.step` is treated as an invalid ROI (`-2`) — it would
   otherwise divide-by-zero when forming the grid. This is a clarification of the
   existing `-2` meaning, not a new code.
+- **Parameter validation** *(v0.5.0)*: `subset_size` must be odd and at least
+  3, or the call returns `-3` (an even size overran the subset buffers). The
+  rect is clipped to the reference image before the grid is formed; the near
+  edge moves by whole steps, so every node keeps its position
+  `rect_x + i * step`. A rect with nothing on the image, or narrower than one
+  step once clipped, is `-2`. Until v0.5.0 an oversized rect sized the grid
+  from the rect and could throw `std::bad_alloc` out of the call.
+- **Exceptions** never cross the C ABI or JNI: each entry point catches what
+  escapes and returns `-3` (`NULL` from the C constructors). The C++ functions
+  may still throw `std::bad_alloc` and OpenCV exceptions.
 - **Writes** *(Frozen)*: at most `output_capacity` floats, **8 per point** (see
   [A.4](#a4-frozen-data-formats)). Points beyond capacity are **dropped, never
   overflow**.
@@ -157,7 +167,8 @@ public:
   `run_full_field` against the first image. With any interval, the first frame
   is too.
 - **Returns** *(Frozen)*: `init` returns `0`, `-2`, `-3` (empty image, negative
-  interval) or `-4`. `process_frame` returns the same codes as `run_full_field`;
+  interval, a `subset_size` that is not odd and at least 3) or `-4`. The rect is
+  validated and clipped exactly as `run_full_field` does. `process_frame` returns the same codes as `run_full_field`;
   `-3` also covers "not initialized" and a frame whose size differs from the
   first image.
 - **Errors and cancellation** leave the session exactly as it was, so the same

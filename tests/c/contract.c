@@ -131,6 +131,47 @@ static void test_degenerate_roi(uint8_t* ref, uint8_t* def) {
     semper_destroy(eng);
 }
 
+/* ---- Parameter validation (v0.5.0): odd subset >= 3, rect clipped to the image ---- */
+static void test_param_validation(uint8_t* ref, uint8_t* def) {
+    semper_engine* eng = semper_create();
+    CHECK(semper_set_reference(eng, ref, (size_t)W * H, NULL, 0, W, H) == 0);
+    float out[8 * 64];
+    float metrics[SEMPER_METRICS_LEN];
+
+    /* An even or zero subset wrote past the subset buffers (heap overflow). */
+    const int bad_subsets[] = {20, 0, -21};
+    for (size_t i = 0; i < sizeof(bad_subsets) / sizeof(bad_subsets[0]); ++i) {
+        semper_params p = valid_params();
+        p.subset_size = bad_subsets[i];
+        CHECK(semper_run(eng, def, (size_t)W * H, NULL, 0, &p, out, 8 * 64,
+                         metrics, SEMPER_METRICS_LEN, NULL, NULL) == SEMPER_ERR_INIT);
+    }
+
+    /* A rect far larger than the image used to size the grid from the rect and
+       throw std::bad_alloc through this C entry point (process abort). It is
+       clipped to the image now. */
+    semper_params huge = valid_params();
+    huge.rect_w = 0x7fffffff;
+    huge.rect_h = 0x7fffffff;
+    CHECK(semper_run(eng, def, (size_t)W * H, NULL, 0, &huge, out, 8 * 64,
+                     metrics, SEMPER_METRICS_LEN, NULL, NULL) >= 0);
+
+    /* Nothing of the rect on the image: invalid ROI. */
+    semper_params off = valid_params();
+    off.rect_x = W + 1;
+    CHECK(semper_run(eng, def, (size_t)W * H, NULL, 0, &off, out, 8 * 64,
+                     metrics, SEMPER_METRICS_LEN, NULL, NULL) == SEMPER_ERR_ROI);
+
+    semper_incremental* inc = semper_incremental_create();
+    semper_params even = valid_params();
+    even.subset_size = 20;
+    CHECK(semper_incremental_init(inc, ref, (size_t)W * H, NULL, 0, W, H, &even, 1) == SEMPER_ERR_INIT);
+    CHECK(semper_incremental_init(inc, ref, (size_t)W * H, NULL, 0, W, H, &huge, 1) == 0);
+    semper_incremental_destroy(inc);
+
+    semper_destroy(eng);
+}
+
 /* ---- strain_window too small for step -> SEMPER_ERR_STRAIN_WINDOW (v0.3.0) ---- */
 static void test_strain_window_guard(uint8_t* ref, uint8_t* def) {
     semper_engine* eng = semper_create();
@@ -310,6 +351,7 @@ int main(void) {
     test_run_null_guards(def);
     test_set_reference_guards(ref);
     test_degenerate_roi(ref, def);
+    test_param_validation(ref, def);
     test_strain_window_guard(ref, def);
     test_capacity_rule(ref, def);
     test_metrics_len_rule(ref, def);

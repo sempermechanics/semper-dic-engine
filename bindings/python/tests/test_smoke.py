@@ -123,3 +123,30 @@ def test_error_codes_and_messages():
     assert err.code == semper.ERR_ROI
     assert "ROI" in str(err)
     assert semper.DicError(semper.ERR_INIT).code == semper.ERR_INIT
+
+
+def test_even_subset_rejected_with_init_code():
+    # An even subset is off-centre by construction and used to write past the
+    # engine's subset buffers; it is an argument error now.
+    ref = _speckle()
+    eng = semper.Engine()
+    eng.set_reference(ref)
+    for subset in (30, 0):
+        with pytest.raises(semper.DicError) as excinfo:
+            eng.run(ref, rect=(40, 40, 176, 176), step=20, subset=subset, strain_window=41)
+        assert excinfo.value.code == semper.ERR_INIT
+
+
+def test_rect_larger_than_image_is_clipped():
+    # The rect is clipped to the image, so an oversized one solves the image
+    # instead of sizing buffers from the rect.
+    ref = _speckle()
+    eng = semper.Engine()
+    eng.set_reference(ref)
+    big = eng.run(ref, rect=(0, 0, 2**31 - 1, 2**31 - 1), step=20, subset=31, strain_window=41)
+    exact = eng.run(ref, rect=(0, 0, 256, 256), step=20, subset=31, strain_window=41)
+    assert big.count == exact.count
+    np.testing.assert_array_equal(big.points, exact.points)
+    with pytest.raises(semper.DicError) as excinfo:
+        eng.run(ref, rect=(300, 0, 64, 64), step=20, subset=31, strain_window=41)
+    assert excinfo.value.code == semper.ERR_ROI

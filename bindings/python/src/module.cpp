@@ -82,9 +82,13 @@ public:
 
         // One point per grid node is the upper bound; 8 floats each. Over-allocate
         // so the solver never has to drop points (see the capacity contract).
-        const int cols = step > 0 ? (p.rect_w / step + 1) : 0;
-        const int rows = step > 0 ? (p.rect_h / step + 1) : 0;
-        const size_t max_pts = static_cast<size_t>(std::max(0, cols) * std::max(0, rows));
+        // The engine clips the rect to the image, so the image bounds the grid
+        // too: an oversized rect must not size this buffer.
+        const int span_w = std::min(p.rect_w, cache_.width);
+        const int span_h = std::min(p.rect_h, cache_.height);
+        const size_t cols = step > 0 ? static_cast<size_t>(std::max(0, span_w / step + 1)) : 0;
+        const size_t rows = step > 0 ? static_cast<size_t>(std::max(0, span_h / step + 1)) : 0;
+        const size_t max_pts = cols * rows;
         std::vector<float> out(max_pts * 8, 0.0f);
         float metrics[23] = {0};
 

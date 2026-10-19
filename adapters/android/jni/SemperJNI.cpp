@@ -1,5 +1,8 @@
 #include <android/bitmap.h>
 #include <jni.h>
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -9,6 +12,7 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include <semper/guarded_call.hpp>
 #include <semper/incremental.hpp>
 #include <semper/io.hpp>
 #include <semper/pipeline.hpp>
@@ -17,6 +21,7 @@
 #undef LOG_TAG
 #define LOG_TAG "SemperJNI"
 
+using Semper::guarded_call;
 using Semper::pipeline::FullFieldParams;
 using Semper::pipeline::IncrementalFrameInfo;
 using Semper::pipeline::IncrementalParams;
@@ -34,31 +39,41 @@ static int g_session_w = 0, g_session_h = 0;
 
 namespace {
 
+// Every export runs its body through guarded_call: a C++ exception reaching a
+// JNI frame aborts the app, so it is logged and becomes the export's error
+// value (-3 for the solve entry points, null for the preview).
+void report_exception(const char* what) {
+    LOGE("native exception at the JNI boundary: %s", what);
+}
+
 // Bridges the solver's progress callback to SemperNativeLib.ProgressCallback.
 // The solver calls it from its own progress thread, which attaches itself.
 struct ProgressBridge {
+    JNIEnv* ownerEnv = nullptr;   // the creating (JNI call) thread's env
     JavaVM* jvm = nullptr;
     jobject globalCallback = nullptr;
     jmethodID methodId = nullptr;
 
-    ProgressBridge(JNIEnv* env, jobject callbackObj) {
+    ProgressBridge(JNIEnv* env, jobject callbackObj) : ownerEnv(env) {
         env->GetJavaVM(&jvm);
         if (callbackObj != nullptr) {
             globalCallback = env->NewGlobalRef(callbackObj);
             jclass cls = env->GetObjectClass(callbackObj);
             methodId = env->GetMethodID(cls, "onProgressUpdate", "(I)V");
+            if (env->ExceptionCheck()) {   // no such method: NoSuchMethodError
+                env->ExceptionClear();
+                methodId = nullptr;
+            }
             env->DeleteLocalRef(cls);
         }
     }
     ProgressBridge(const ProgressBridge&) = delete;
     ProgressBridge& operator=(const ProgressBridge&) = delete;
 
-    // Called on the creating thread once the solve has returned.
-    void release(JNIEnv* env) {
-        if (globalCallback != nullptr) {
-            env->DeleteGlobalRef(globalCallback);
-            globalCallback = nullptr;
-        }
+    // On the creating thread, once the solve has returned or thrown: the
+    // solver's progress thread is joined before run_full_field returns.
+    ~ProgressBridge() {
+        if (globalCallback != nullptr) ownerEnv->DeleteGlobalRef(globalCallback);
     }
 
     void operator()(int percentage) const {
@@ -91,8 +106,12 @@ bool decode_optional(JNIEnv* env, jbyteArray bytes, int w, int h, cv::Mat& out) 
     jsize len = env->GetArrayLength(bytes);
     jbyte* buf = env->GetByteArrayElements(bytes, nullptr);
     if (buf == nullptr) return false;
+    // Released on every path, a throwing decode included.
+    struct Release {
+        JNIEnv* env; jbyteArray bytes; jbyte* buf;
+        ~Release() { env->ReleaseByteArrayElements(bytes, buf, JNI_ABORT); }
+    } release{env, bytes, buf};
     out = Semper::io::decode_gray(reinterpret_cast<uint8_t*>(buf), (size_t)len, w, h);
-    env->ReleaseByteArrayElements(bytes, buf, JNI_ABORT);
     return true;
 }
 
@@ -156,14 +175,15 @@ extern "C" {
 JNIEXPORT void JNICALL
 Java_com_sempermechanics_semper_SemperNativeLib_setDebugOutputDir(
         JNIEnv* env, jobject, jstring debugDir) {
-    std::lock_guard<std::mutex> lock(g_cache.mutex);
-    if (debugDir == nullptr) {
+    guarded_call([&] {
+        std::lock_guard<std::mutex> lock(g_cache.mutex);
         g_cache.debug_dir.clear();
-        return;
-    }
-    const char* dir = env->GetStringUTFChars(debugDir, nullptr);
-    g_cache.debug_dir = std::string(dir);
-    env->ReleaseStringUTFChars(debugDir, dir);
+        if (debugDir == nullptr) return;
+        const char* dir = env->GetStringUTFChars(debugDir, nullptr);
+        if (dir == nullptr) return;   // OutOfMemoryError pending in Java
+        g_cache.debug_dir = std::string(dir);
+        env->ReleaseStringUTFChars(debugDir, dir);
+    }, report_exception);
 }
 
 /**
@@ -183,39 +203,70 @@ Java_com_sempermechanics_semper_SemperNativeLib_setCancelRequested(
     }
 }
 
+/**
+ * Decode an encoded image and scale it to `targetWidth`, keeping the aspect
+ * ratio (height at least 1 px). Returns an ARGB_8888 Bitmap, or null when the
+ * bytes do not decode, `targetWidth` is not positive, or the Bitmap cannot be
+ * created or locked.
+ */
 JNIEXPORT jobject JNICALL
 Java_com_sempermechanics_semper_SemperNativeLib_getPreviewFromBytes(
         JNIEnv* env, jobject, jbyteArray fileData, jint targetWidth) {
-    if (fileData == nullptr) return nullptr;
-    jsize len = env->GetArrayLength(fileData);
-    jbyte* buf = env->GetByteArrayElements(fileData, nullptr);
-    if (buf == nullptr) return nullptr;
-    cv::Mat fullImg = Semper::io::decode_bgr(reinterpret_cast<uint8_t*>(buf), (size_t)len);
-    env->ReleaseByteArrayElements(fileData, buf, JNI_ABORT);
-    if (fullImg.empty()) return nullptr;
+    if (env == nullptr || fileData == nullptr || targetWidth <= 0) return nullptr;
+    return guarded_call<jobject>(nullptr, [&]() -> jobject {
+        jsize len = env->GetArrayLength(fileData);
+        jbyte* buf = env->GetByteArrayElements(fileData, nullptr);
+        if (buf == nullptr) return nullptr;
+        cv::Mat fullImg;
+        {
+            struct Release {
+                JNIEnv* env; jbyteArray bytes; jbyte* buf;
+                ~Release() { env->ReleaseByteArrayElements(bytes, buf, JNI_ABORT); }
+            } release{env, fileData, buf};
+            fullImg = Semper::io::decode_bgr(reinterpret_cast<uint8_t*>(buf), (size_t)len);
+        }
+        if (fullImg.empty()) return nullptr;
 
-    float ratio = (float)targetWidth / fullImg.cols;
-    int targetHeight = (int)(fullImg.rows * ratio);
-    cv::Mat resizedImg;
-    cv::resize(fullImg, resizedImg, cv::Size(targetWidth, targetHeight));
+        // A very wide image scaled to a small width rounds its height to 0,
+        // which cv::resize throws on.
+        const double ratio = (double)targetWidth / (double)fullImg.cols;
+        const int targetHeight = std::max(1, (int)std::lround(fullImg.rows * ratio));
+        cv::Mat rgba;
+        cv::resize(fullImg, rgba, cv::Size(targetWidth, targetHeight));
+        cv::cvtColor(rgba, rgba, cv::COLOR_BGR2RGBA);
 
-    jclass bitmapCls = env->FindClass("android/graphics/Bitmap");
-    jmethodID createBitmapMethod = env->GetStaticMethodID(
-            bitmapCls, "createBitmap",
-            "(IILandroid/graphics/Bitmap$Config;)Landroid/graphics/Bitmap;");
-    jclass configCls = env->FindClass("android/graphics/Bitmap$Config");
-    jfieldID argb8888Field = env->GetStaticFieldID(
-            configCls, "ARGB_8888", "Landroid/graphics/Bitmap$Config;");
-    jobject config = env->GetStaticObjectField(configCls, argb8888Field);
-    jobject jBitmap = env->CallStaticObjectMethod(
-            bitmapCls, createBitmapMethod, targetWidth, targetHeight, config);
+        jclass bitmapCls = env->FindClass("android/graphics/Bitmap");
+        if (bitmapCls == nullptr) return nullptr;
+        jmethodID createBitmapMethod = env->GetStaticMethodID(
+                bitmapCls, "createBitmap",
+                "(IILandroid/graphics/Bitmap$Config;)Landroid/graphics/Bitmap;");
+        jclass configCls = env->FindClass("android/graphics/Bitmap$Config");
+        if (createBitmapMethod == nullptr || configCls == nullptr) return nullptr;
+        jfieldID argb8888Field = env->GetStaticFieldID(
+                configCls, "ARGB_8888", "Landroid/graphics/Bitmap$Config;");
+        if (argb8888Field == nullptr) return nullptr;
+        jobject config = env->GetStaticObjectField(configCls, argb8888Field);
+        jobject jBitmap = env->CallStaticObjectMethod(
+                bitmapCls, createBitmapMethod, targetWidth, targetHeight, config);
+        if (jBitmap == nullptr || env->ExceptionCheck()) return nullptr;
 
-    void* pixels;
-    if (AndroidBitmap_lockPixels(env, jBitmap, &pixels) < 0) return nullptr;
-    cv::cvtColor(resizedImg, resizedImg, cv::COLOR_BGR2RGBA);
-    memcpy(pixels, resizedImg.data, resizedImg.total() * resizedImg.elemSize());
-    AndroidBitmap_unlockPixels(env, jBitmap);
-    return jBitmap;
+        AndroidBitmapInfo info;
+        if (AndroidBitmap_getInfo(env, jBitmap, &info) < 0 ||
+            info.format != ANDROID_BITMAP_FORMAT_RGBA_8888 ||
+            (int)info.width != targetWidth || (int)info.height != targetHeight) {
+            return nullptr;
+        }
+        void* pixels = nullptr;
+        if (AndroidBitmap_lockPixels(env, jBitmap, &pixels) < 0 || pixels == nullptr) return nullptr;
+        // Row by row: a Bitmap's rows may be padded past width * 4 bytes.
+        const size_t row_bytes = (size_t)targetWidth * 4;
+        for (int y = 0; y < targetHeight; ++y) {
+            std::memcpy(static_cast<uint8_t*>(pixels) + (size_t)y * info.stride,
+                        rgba.ptr(y), row_bytes);
+        }
+        AndroidBitmap_unlockPixels(env, jBitmap);
+        return jBitmap;
+    }, report_exception);
 }
 
 JNIEXPORT jintArray JNICALL
@@ -226,11 +277,14 @@ Java_com_sempermechanics_semper_SemperNativeLib_getImageDimensions(
         jsize len = env->GetArrayLength(fileData);
         jbyte* buf = env->GetByteArrayElements(fileData, nullptr);
         if (buf != nullptr) {
-            Semper::io::image_dimensions(reinterpret_cast<uint8_t*>(buf), (size_t)len, w, h);
+            guarded_call([&] {
+                Semper::io::image_dimensions(reinterpret_cast<uint8_t*>(buf), (size_t)len, w, h);
+            }, report_exception);
             env->ReleaseByteArrayElements(fileData, buf, JNI_ABORT);
         }
     }
     jintArray result = env->NewIntArray(2);
+    if (result == nullptr) return nullptr;   // OutOfMemoryError pending in Java
     jint temp[] = {w, h};
     env->SetIntArrayRegion(result, 0, 2, temp);
     return result;
@@ -245,28 +299,19 @@ Java_com_sempermechanics_semper_SemperNativeLib_initializeReference(
     // would hold its two images until the next initializeIncremental.
     g_session.reset();
     g_session_w = g_session_h = 0;
-    if (refBytes == nullptr) {
-        g_cache.reset();
-        return;
-    }
-    jsize len = env->GetArrayLength(refBytes);
-    jbyte* buf = env->GetByteArrayElements(refBytes, nullptr);
-    if (buf == nullptr) { g_cache.reset(); return; }
-    cv::Mat refMat = Semper::io::decode_gray(
-            reinterpret_cast<uint8_t*>(buf), (size_t)len, width, height);
-    env->ReleaseByteArrayElements(refBytes, buf, JNI_ABORT);
-
-    cv::Mat roiMask;
-    if (maskBytes != nullptr && env->GetArrayLength(maskBytes) > 0) {
-        jsize mlen = env->GetArrayLength(maskBytes);
-        jbyte* mbuf = env->GetByteArrayElements(maskBytes, nullptr);
-        if (mbuf == nullptr) { g_cache.reset(); return; }
-        roiMask = Semper::io::decode_gray(
-                reinterpret_cast<uint8_t*>(mbuf), (size_t)mlen,
-                refMat.cols, refMat.rows);
-        env->ReleaseByteArrayElements(maskBytes, mbuf, JNI_ABORT);
-    }
-    g_cache.set_from_gray(refMat, roiMask);
+    guarded_call([&] {
+        cv::Mat refMat;
+        if (refBytes == nullptr || !decode_optional(env, refBytes, width, height, refMat)) {
+            g_cache.reset();
+            return;
+        }
+        cv::Mat roiMask;
+        if (!decode_optional(env, maskBytes, refMat.cols, refMat.rows, roiMask)) {
+            g_cache.reset();
+            return;
+        }
+        g_cache.set_from_gray(refMat, roiMask);
+    }, report_exception);
 }
 
 JNIEXPORT jint JNICALL
@@ -277,36 +322,36 @@ Java_com_sempermechanics_semper_SemperNativeLib_computeFullFieldDirect(
         jboolean use6x6Interpolator, jobject outputBuffer, jobject callbackObj,
         jfloatArray out_metrics) {
     (void)refBytes;  // reference comes from initializeReference cache
-    std::lock_guard<std::mutex> lock(g_cache.mutex);
-
     if (env == nullptr || defBytes == nullptr || outputBuffer == nullptr)
         return -3;
-    float* output_ptr = nullptr;
-    const int output_capacity = output_capacity_floats(env, outputBuffer, output_ptr);
-    if (output_capacity < 0) return -3;
+    std::lock_guard<std::mutex> lock(g_cache.mutex);
+    return guarded_call(-3, [&] {
+        float* output_ptr = nullptr;
+        const int output_capacity = output_capacity_floats(env, outputBuffer, output_ptr);
+        if (output_capacity < 0) return -3;
 
-    cv::Mat defMat;
-    if (!decode_optional(env, defBytes, g_cache.width, g_cache.height, defMat)) return -3;
-    if (defMat.empty()) return -3;
+        cv::Mat defMat;
+        if (!decode_optional(env, defBytes, g_cache.width, g_cache.height, defMat)) return -3;
+        if (defMat.empty()) return -3;
 
-    cv::Mat roiMask;
-    if (!decode_optional(env, maskBytes, g_cache.width, g_cache.height, roiMask)) return -3;
+        cv::Mat roiMask;
+        if (!decode_optional(env, maskBytes, g_cache.width, g_cache.height, roiMask)) return -3;
 
-    const FullFieldParams params = make_params(rectX, rectY, rectWidth, rectHeight,
-                                               step, subsetSize, strainWindow, use6x6Interpolator);
+        const FullFieldParams params = make_params(rectX, rectY, rectWidth, rectHeight,
+                                                   step, subsetSize, strainWindow, use6x6Interpolator);
 
-    ProgressBridge progress(env, callbackObj);
-    float metrics_buf[kJniMetricsLen] = {0};
-    const int metrics_len = metrics_capacity(env, out_metrics);
+        ProgressBridge progress(env, callbackObj);
+        float metrics_buf[kJniMetricsLen] = {0};
+        const int metrics_len = metrics_capacity(env, out_metrics);
 
-    int result = Semper::pipeline::run_full_field(
-            g_cache, defMat, roiMask, params, output_ptr, output_capacity,
-            metrics_len ? metrics_buf : nullptr, metrics_len,
-            [&progress](int pct) { progress(pct); });
+        const int result = Semper::pipeline::run_full_field(
+                g_cache, defMat, roiMask, params, output_ptr, output_capacity,
+                metrics_len ? metrics_buf : nullptr, metrics_len,
+                [&progress](int pct) { progress(pct); });
 
-    progress.release(env);
-    if (metrics_len) copy_metrics(env, out_metrics, metrics_buf);
-    return result;
+        if (metrics_len) copy_metrics(env, out_metrics, metrics_buf);
+        return result;
+    }, report_exception);
 }
 
 /**
@@ -327,22 +372,24 @@ Java_com_sempermechanics_semper_SemperNativeLib_initializeIncremental(
     g_session_w = g_session_h = 0;
     if (refBytes == nullptr) return -3;
 
-    cv::Mat refMat;
-    if (!decode_optional(env, refBytes, width, height, refMat) || refMat.empty()) return -3;
-    cv::Mat roiMask;
-    if (!decode_optional(env, maskBytes, refMat.cols, refMat.rows, roiMask)) return -3;
+    return guarded_call(-3, [&] {
+        cv::Mat refMat;
+        if (!decode_optional(env, refBytes, width, height, refMat) || refMat.empty()) return -3;
+        cv::Mat roiMask;
+        if (!decode_optional(env, maskBytes, refMat.cols, refMat.rows, roiMask)) return -3;
 
-    IncrementalParams ip;
-    ip.field = make_params(rectX, rectY, rectWidth, rectHeight, step, subsetSize,
-                           strainWindow, use6x6Interpolator);
-    ip.update_interval = updateInterval;
-    auto session = std::make_unique<IncrementalSession>();
-    const int rc = session->init(refMat, roiMask, ip);
-    if (rc != 0) return rc;
-    g_session = std::move(session);
-    g_session_w = refMat.cols;
-    g_session_h = refMat.rows;
-    return 0;
+        IncrementalParams ip;
+        ip.field = make_params(rectX, rectY, rectWidth, rectHeight, step, subsetSize,
+                               strainWindow, use6x6Interpolator);
+        ip.update_interval = updateInterval;
+        auto session = std::make_unique<IncrementalSession>();
+        const int rc = session->init(refMat, roiMask, ip);
+        if (rc != 0) return rc;
+        g_session = std::move(session);
+        g_session_w = refMat.cols;
+        g_session_h = refMat.rows;
+        return 0;
+    }, report_exception);
 }
 
 /**
@@ -356,43 +403,44 @@ JNIEXPORT jint JNICALL
 Java_com_sempermechanics_semper_SemperNativeLib_computeIncrementalFrame(
         JNIEnv* env, jobject, jbyteArray defBytes, jobject outputBuffer,
         jobject callbackObj, jfloatArray out_metrics, jintArray out_info) {
+    if (env == nullptr || defBytes == nullptr || outputBuffer == nullptr) return -3;
     std::lock_guard<std::mutex> lock(g_cache.mutex);
-    if (env == nullptr || defBytes == nullptr || outputBuffer == nullptr || !g_session)
-        return -3;
-    float* output_ptr = nullptr;
-    const int output_capacity = output_capacity_floats(env, outputBuffer, output_ptr);
-    if (output_capacity < 0) return -3;
+    if (!g_session) return -3;
+    return guarded_call(-3, [&] {
+        float* output_ptr = nullptr;
+        const int output_capacity = output_capacity_floats(env, outputBuffer, output_ptr);
+        if (output_capacity < 0) return -3;
 
-    cv::Mat defMat;
-    if (!decode_optional(env, defBytes, g_session_w, g_session_h, defMat)) return -3;
-    if (defMat.empty()) return -3;
+        cv::Mat defMat;
+        if (!decode_optional(env, defBytes, g_session_w, g_session_h, defMat)) return -3;
+        if (defMat.empty()) return -3;
 
-    // setDebugOutputDir arms one solve, as it does for computeFullFieldDirect.
-    if (!g_cache.debug_dir.empty()) {
-        g_session->set_debug_dir(g_cache.debug_dir);
-        g_cache.debug_dir.clear();
-    }
+        // setDebugOutputDir arms one solve, as it does for computeFullFieldDirect.
+        if (!g_cache.debug_dir.empty()) {
+            g_session->set_debug_dir(g_cache.debug_dir);
+            g_cache.debug_dir.clear();
+        }
 
-    ProgressBridge progress(env, callbackObj);
-    float metrics_buf[kJniMetricsLen] = {0};
-    const int metrics_len = metrics_capacity(env, out_metrics);
-    IncrementalFrameInfo info;
+        ProgressBridge progress(env, callbackObj);
+        float metrics_buf[kJniMetricsLen] = {0};
+        const int metrics_len = metrics_capacity(env, out_metrics);
+        IncrementalFrameInfo info;
 
-    int result = g_session->process_frame(
-            defMat, output_ptr, output_capacity,
-            metrics_len ? metrics_buf : nullptr, metrics_len,
-            [&progress](int pct) { progress(pct); }, &info);
-    g_session->set_debug_dir(std::string());
+        const int result = g_session->process_frame(
+                defMat, output_ptr, output_capacity,
+                metrics_len ? metrics_buf : nullptr, metrics_len,
+                [&progress](int pct) { progress(pct); }, &info);
+        g_session->set_debug_dir(std::string());
 
-    progress.release(env);
-    if (metrics_len) copy_metrics(env, out_metrics, metrics_buf);
-    if (out_info != nullptr && env->GetArrayLength(out_info) >= 6) {
-        const jint values[6] = {info.reference_frame, info.reference_updated ? 1 : 0,
-                                info.tracked_points, info.frame0_points,
-                                info.taylor_fallbacks, info.lost_this_frame};
-        env->SetIntArrayRegion(out_info, 0, 6, values);
-    }
-    return result;
+        if (metrics_len) copy_metrics(env, out_metrics, metrics_buf);
+        if (out_info != nullptr && env->GetArrayLength(out_info) >= 6) {
+            const jint values[6] = {info.reference_frame, info.reference_updated ? 1 : 0,
+                                    info.tracked_points, info.frame0_points,
+                                    info.taylor_fallbacks, info.lost_this_frame};
+            env->SetIntArrayRegion(out_info, 0, 6, values);
+        }
+        return result;
+    }, report_exception);
 }
 
 /** Close the incremental session and free its reference. */

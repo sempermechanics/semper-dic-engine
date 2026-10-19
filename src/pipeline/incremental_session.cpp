@@ -175,13 +175,15 @@ int IncrementalSession::init(const cv::Mat& ref_gray, const cv::Mat& roi_mask,
 
     if (ref_gray.empty() || ref_gray.type() != CV_8UC1) return -3;
     if (params.update_interval < 0) return -3;
-    const FullFieldParams& f = params.field;
-    if (f.step <= 0 || f.subset_size <= 0) return -2;
+    // The same checks run_full_field makes, with the rect clipped to the
+    // image the same way, so the frame-0 grid is the grid every frame solves.
+    s.params = params;
+    const int param_rc = validate_params(s.params.field, ref_gray.cols, ref_gray.rows);
+    if (param_rc != 0) return param_rc;
+    const FullFieldParams& f = s.params.field;
     const int gridW = f.rect_w / f.step, gridH = f.rect_h / f.step;
-    if (gridW <= 0 || gridH <= 0) return -2;
     if (StrainCalculator::vsg_window_node_count(f.step, f.strain_window) < 3) return kBadStrainWindow;
 
-    s.params = params;
     s.width = ref_gray.cols;
     s.height = ref_gray.rows;
     s.grid0 = GridGeom{gridW, gridH, f.rect_x, f.rect_y, f.step};

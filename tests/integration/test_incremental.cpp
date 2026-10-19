@@ -409,6 +409,12 @@ TEST_CASE(Incremental, Contracts_ErrorCodes) {
     ip.field.strain_window = 3;
     CHECK(session.init(s.ref, cv::Mat(), ip) == kBadStrainWindow);
     ip.field = p;
+    ip.field.subset_size = 20;   // even: off-centre subset, rejected
+    CHECK(session.init(s.ref, cv::Mat(), ip) == -3);
+    ip.field = p;
+    ip.field.rect_x = 1000;      // entirely off the 256 px image
+    CHECK(session.init(s.ref, cv::Mat(), ip) == -2);
+    ip.field = p;
     ip.update_interval = -1;
     CHECK(session.init(s.ref, cv::Mat(), ip) == -3);
     CHECK(session.init(cv::Mat(), cv::Mat(), IncrementalParams{p, 1}) == -3);

@@ -76,9 +76,14 @@ The engine's answer for one subset.
 Everything precomputed about one reference subset. Invariants:
 
 - `x_offsets/y_offsets` (and `_f` float mirrors): relative coords in `[-dim/2, +dim/2]`, row-major, length `n = dim²`.
-  **`dim` must be odd** — the offsets are built symmetrically around the center
-  pixel, so an even `dim` yields an off-center subset. The UI enforces this
-  (see [Parameters from the app](#parameters-from-the-app)); direct callers must.
+  **`dim` must be odd and at least 3** — the offsets are built symmetrically
+  around the center pixel, so the subset holds `(2·(dim/2)+1)²` pixels, and for
+  an even `dim` that is more than the `dim²` its buffers hold. The engine
+  enforces this rather than trusting the caller: `run_full_field` and
+  `IncrementalSession::init` return `-3` for any other `subset_size`
+  (`validate_params`, which also clips the rect to the image), and the three
+  `SubsetPrecomputer` functions return an uninitialized subset for one. The app
+  also only offers odd sizes (see [Parameters from the app](#parameters-from-the-app)).
 - `norm_ref_intensities[i] = (ref_intensities[i] − mean_intensity) / std_dev`.
 - `H` = Σ sd·sdᵀ (6×6 Gauss-Newton Hessian), `H_inv` = its inverse.
 - `steepest_descent_images[i]` = `[gx, gy, gx·x, gx·y, gy·x, gy·y] / std_dev` (Eigen 6×1, AoS).

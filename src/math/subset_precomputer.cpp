@@ -1,15 +1,36 @@
 #include <semper/subset.hpp>
-#include <semper/assert.hpp>
 #include "util/log.hpp"
 #include <cmath>
 
 namespace Semper {
 
+    namespace {
+        // A subset is the (2 * (dim / 2) + 1)^2 pixels centred on (cx, cy), and
+        // its buffers hold dim^2: the two agree only for an odd dim. An even one
+        // overran every buffer by 2 * dim + 1 floats, and dim 0 wrote into empty
+        // vectors. run_full_field and IncrementalSession::init reject such a dim
+        // with -3; this is the guard for every other caller, and it is not an
+        // assert because asserts compile out of the builds that ship.
+        bool dim_ok(int_t dim) { return dim >= 3 && dim % 2 == 1; }
+
+        bool subset_on_image(const Image& img, int_t cx, int_t cy, int_t half) {
+            return cx - half >= 0 && cx + half < img.width &&
+                   cy - half >= 0 && cy + half < img.height;
+        }
+    } // namespace
+
     // =========================================================
     // EXISTING: Full Precompute (Fallback / Original logic)
     // =========================================================
     void SubsetPrecomputer::precompute_subset(SubsetData& data, const Image& ref_img, int_t cx, int_t cy, int_t dim) {
-        SEMPER_ASSERT(dim > 0);
+        data.cx = cx;
+        data.cy = cy;
+        // Before anything is sized from dim: a subset that does not fit the
+        // image is rejected without allocating for it.
+        if (!dim_ok(dim) || !subset_on_image(ref_img, cx, cy, dim / 2)) {
+            data.is_initialized = false;
+            return;
+        }
         int n = dim * dim;
         int half = dim / 2;
 
@@ -37,15 +58,6 @@ namespace Semper {
                     idx++;
                 }
             }
-        }
-
-        data.cx = cx;
-        data.cy = cy;
-
-        if (cx - half < 0 || cx + half >= ref_img.width ||
-            cy - half < 0 || cy + half >= ref_img.height) {
-            data.is_initialized = false;
-            return;
         }
 
         // 🚀 Float conversion
@@ -164,13 +176,9 @@ namespace Semper {
             const Image& ref_img, int_t cx, int_t cy, int_t dim) {
 
         CachedHessianData result; // valid = false by default
+        if (!dim_ok(dim) || !subset_on_image(ref_img, cx, cy, dim / 2)) return result;
         int n    = dim * dim;
         int half = dim / 2;
-
-        if (cx - half < 0 || cx + half >= ref_img.width  ||
-            cy - half < 0 || cy + half >= ref_img.height) {
-            return result;
-        }
 
         // ── Pass 1: Mean intensity ───────────────────────────────
         float sum = 0.0f;
@@ -287,6 +295,15 @@ namespace Semper {
             int_t cx, int_t cy, int_t dim,
             const CachedHessianData& cached) {
 
+        // A valid pool entry says nothing about this dim: the pool is keyed
+        // on the grid node, not on the subset size.
+        data.cx = cx;
+        data.cy = cy;
+        if (!dim_ok(dim) || !subset_on_image(ref_img, cx, cy, dim / 2)) {
+            data.is_initialized = false;
+            return;
+        }
+
         // Safety: degrade gracefully if the pool entry was invalid (boundary overshoot, etc.)
         if (!cached.valid) {
             precompute_subset(data, ref_img, cx, cy, dim);
@@ -320,15 +337,6 @@ namespace Semper {
                     data.y_offsets_f[oi] = static_cast<float>(y);
                     oi++;
                 }
-        }
-
-        data.cx = cx;
-        data.cy = cy;
-
-        if (cx - half < 0 || cx + half >= ref_img.width  ||
-            cy - half < 0 || cy + half >= ref_img.height) {
-            data.is_initialized = false;
-            return;
         }
 
         // ── Fast contiguous load via memcpy (hardware prefetch-friendly) ──

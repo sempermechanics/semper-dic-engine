@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <opencv2/core.hpp>
 #include <vector>
 
@@ -128,6 +129,89 @@ TEST_CASE(FullField, DegenerateStep_ReturnsRoiError) {
     p.step = 0;
     const int code = call_solver(cache, def_gray, p, 8 * 4);
     CHECK(code == -2);
+}
+
+TEST_CASE(FullField, EvenOrZeroSubsetSize_ReturnsInitError) {
+    // The subset is built symmetrically around its centre pixel, so it holds
+    // (2 * (dim / 2) + 1)^2 pixels. For an even dim that is (dim + 1)^2, and
+    // the precompute wrote 441 values into the 400-float buffers of a subset
+    // of 20 (a heap overflow under ASan, silent corruption without it); for 0
+    // it wrote into empty vectors. Nothing below the C ABI checked it.
+    cv::Mat ref_gray, def_gray;
+    make_pair(ref_gray, def_gray);
+    ReferenceCache cache;
+    cache.set_from_gray(ref_gray, cv::Mat());
+    const int cap = 8 * ((W / STEP) * (H / STEP) + 8);
+    for (int subset : {20, 0, -21, 1, 2}) {
+        FullFieldParams p = params_for(W, H);
+        p.subset_size = subset;
+        CHECK(call_solver(cache, def_gray, p, cap) == -3);
+    }
+    // The smallest subset that is accepted.
+    FullFieldParams p = params_for(W, H);
+    p.subset_size = 3;
+    CHECK(call_solver(cache, def_gray, p, cap) >= 0);
+}
+
+TEST_CASE(FullField, HugeRect_ClippedToImage) {
+    // The rect was never intersected with the image: rect_w = INT_MAX made a
+    // grid of INT_MAX / step columns, and the ResultGrid allocation threw
+    // std::bad_alloc straight through the C and JNI entry points. The rect is
+    // now clipped to the image without moving the grid lattice, so any rect
+    // that covers the image solves exactly the image-sized rect.
+    cv::Mat ref_gray, def_gray;
+    make_pair(ref_gray, def_gray);
+    const int cap = 8 * ((W / STEP) * (H / STEP) + 8);
+    auto solve = [&](const FullFieldParams &p, std::vector<float> &out) {
+        ReferenceCache cache;
+        cache.set_from_gray(ref_gray, cv::Mat());
+        out.assign((size_t)cap, 0.0f);
+        float metrics[23] = {};
+        return run_full_field(cache, def_gray, cv::Mat(), p, out.data(), cap,
+                              metrics, 23, nullptr);
+    };
+    std::vector<float> want, got;
+    const int n_want = solve(params_for(W, H), want);
+    REQUIRE(n_want > 0);
+
+    FullFieldParams huge = params_for(W, H);
+    huge.rect_w = std::numeric_limits<int>::max();
+    huge.rect_h = std::numeric_limits<int>::max();
+    CHECK(solve(huge, got) == n_want);
+    CHECK(std::memcmp(want.data(), got.data(), (size_t)n_want * 8 * sizeof(float)) == 0);
+
+    // Hanging off the top-left by whole steps: same lattice, same field.
+    FullFieldParams shifted = params_for(W + 3 * STEP, H + 2 * STEP);
+    shifted.rect_x = -3 * STEP;
+    shifted.rect_y = -2 * STEP;
+    CHECK(solve(shifted, got) == n_want);
+    CHECK(std::memcmp(want.data(), got.data(), (size_t)n_want * 8 * sizeof(float)) == 0);
+}
+
+TEST_CASE(FullField, RectOffImage_ReturnsRoiError) {
+    cv::Mat ref_gray, def_gray;
+    make_pair(ref_gray, def_gray);
+    ReferenceCache cache;
+    cache.set_from_gray(ref_gray, cv::Mat());
+    const int cap = 8 * 64;
+
+    FullFieldParams right = params_for(W, H);
+    right.rect_x = W + 10;
+    CHECK(call_solver(cache, def_gray, right, cap) == -2);
+
+    FullFieldParams above = params_for(W, H);
+    above.rect_y = -2 * H;
+    CHECK(call_solver(cache, def_gray, above, cap) == -2);
+
+    // rect_x + rect_w overflows int.
+    FullFieldParams overflow = params_for(std::numeric_limits<int>::max(), H);
+    overflow.rect_x = std::numeric_limits<int>::max() - 5;
+    CHECK(call_solver(cache, def_gray, overflow, cap) == -2);
+
+    // On the image, but narrower than one step once clipped.
+    FullFieldParams sliver = params_for(W, H);
+    sliver.rect_x = W - STEP / 2;
+    CHECK(call_solver(cache, def_gray, sliver, cap) == -2);
 }
 
 TEST_CASE(FullField, EmptyDeformed_ReturnsInitError) {

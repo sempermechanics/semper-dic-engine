@@ -173,6 +173,21 @@ struct FieldCapture {
     cv::Mat deformed_gray;
 };
 
+// The one place solve parameters are checked, for run_full_field and
+// IncrementalSession::init alike, against a width x height reference.
+// Returns 0 with `p` normalised, or the code to return:
+//   -3  subset_size not odd and >= 3 (the subset is built symmetrically
+//       around its centre pixel, so an even size overruns its buffers), or
+//       an image too large to index with int;
+//   -2  step <= 0, or nothing of the rect left once it is clipped to the
+//       image, or a grid of no nodes.
+// The rect is clipped to the image without moving the grid lattice: the
+// near edge advances by whole steps, so every node keeps the position
+// rect_x + i * step it had. Nodes off the image were never solvable; what
+// clipping changes is that the anchor lattice and the seeding health slots
+// are planned over the part of the grid that exists.
+int validate_params(FullFieldParams &p, int width, int height);
+
 // run_full_field with an optional capture. capture == nullptr is exactly
 // run_full_field.
 int run_full_field_impl(

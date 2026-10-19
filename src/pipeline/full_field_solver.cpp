@@ -24,6 +24,8 @@
 #include <thread>
 #include <vector>
 #include <algorithm>
+#include <cstdint>
+#include <limits>
 
 #undef LOG_TAG
 #define LOG_TAG "SemperPipeline"
@@ -73,11 +75,43 @@ int run_full_field(
 
 namespace internal {
 
+namespace {
+
+// Clips [lo, lo + len) to [0, extent) on one axis, moving `lo` forward by
+// whole steps so the lattice lo + i * step is kept. 64-bit throughout: a
+// caller's lo + len can overflow int. False if nothing is left.
+bool clip_axis(int &lo, int &len, int step, int extent) {
+    int64_t a = lo;
+    const int64_t b = std::min<int64_t>((int64_t)lo + (int64_t)len, extent);
+    if (a < 0) a += ((-a + step - 1) / step) * (int64_t)step;
+    if (b <= a) return false;
+    lo = (int)a;
+    len = (int)(b - a);
+    return true;
+}
+
+} // namespace
+
+int validate_params(FullFieldParams &p, int width, int height) {
+    if (width <= 0 || height <= 0) return -3;
+    // Every pixel index in the engine is an int.
+    if ((int64_t)width * (int64_t)height > (int64_t)std::numeric_limits<int>::max()) return -3;
+    // step <= 0 would divide by zero forming the grid; it has always been
+    // reported as an invalid ROI.
+    if (p.step <= 0) return -2;
+    if (p.subset_size < 3 || p.subset_size % 2 == 0) return -3;
+    if (p.rect_w <= 0 || p.rect_h <= 0) return -2;
+    if (!clip_axis(p.rect_x, p.rect_w, p.step, width)) return -2;
+    if (!clip_axis(p.rect_y, p.rect_h, p.step, height)) return -2;
+    if (p.rect_w / p.step <= 0 || p.rect_h / p.step <= 0) return -2;
+    return 0;
+}
+
 int run_full_field_impl(
     ReferenceCache& cache,
     const cv::Mat& def_gray,
     const cv::Mat& roi_mask,
-    const FullFieldParams& params,
+    const FullFieldParams& params_in,
     float* output_ptr,
     int output_capacity,
     float* metrics,
@@ -93,12 +127,9 @@ int run_full_field_impl(
 
         // 🚀 PRIORITY 3: Return -3 for memory/init errors
         if (output_ptr == nullptr || cache.ref_img == nullptr || def_gray.empty()) return -3;
-        // step <= 0 would divide-by-zero at `rect_w / step` below (a SIGFPE in
-        // release builds, where the assert is compiled out). Guard it with the
-        // same -2 ROI code the degenerate-grid check already returns.
-        if (params.step <= 0) return -2;
-        SEMPER_ASSERT(params.subset_size > 0);
-        SEMPER_ASSERT(params.step > 0);
+        FullFieldParams params = params_in;
+        const int param_rc = validate_params(params, cache.width, cache.height);
+        if (param_rc != 0) return param_rc;
         SEMPER_ASSERT(output_capacity >= 0);
         // Clear any leftover cancel from a previous solve so this run starts fresh.
         // The flag is process-global; without this, a caller that cancelled and
@@ -128,9 +159,10 @@ int run_full_field_impl(
 
         int safe_cores = std::max(1, (int)std::thread::hardware_concurrency());
 
-        int gridW = params.rect_w / params.step;
-        int gridH = params.rect_h / params.step;
-        if (gridW <= 0 || gridH <= 0) return -2; // 🚀 PRIORITY 3: Return -2 for ROI Errors
+        // validate_params clipped the rect to the image, so the grid holds at
+        // most one node per pixel and every count below fits an int.
+        const int gridW = params.rect_w / params.step;
+        const int gridH = params.rect_h / params.step;
 
         // The VSG strain fit needs 3 grid nodes inside the strain window to
         // solve for a plane. That count is fixed by (step, strain_window)
@@ -160,7 +192,7 @@ int run_full_field_impl(
         int path_c_seed_x = gridW / 2;
         int path_c_seed_y = gridH / 2;
 
-        ResultGrid resultGrid(gridH, std::vector<GridPoint>(gridW));
+        ResultGrid resultGrid((size_t)gridH, std::vector<GridPoint>((size_t)gridW));
         int total_valid_points = 0;
 
         // The scan below and the Hessian pre-pass depend only on the reference,

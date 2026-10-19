@@ -125,6 +125,29 @@ TEST_CASE(SubsetPrecomputer, RejectsSubsetOffImageBoundary) {
     CHECK(!data.is_initialized);
 }
 
+// A subset is (2 * (dim / 2) + 1)^2 pixels, built around its centre. An even
+// dim made the loops write (dim + 1)^2 values into dim^2 buffers, and dim 0
+// wrote into empty ones. run_full_field rejects such a dim up front; these
+// are the second line, for every direct caller (incremental re-anchoring
+// calls precompute_subset itself).
+TEST_CASE(SubsetPrecomputer, EvenDimRejected) {
+    Image img = test_image();
+    const CachedHessianData good = SubsetPrecomputer::compute_hessian_only(img, 64, 64, DIM);
+    REQUIRE(good.valid);
+    for (int dim : {20, 0, 1, 2, -21}) {
+        CHECK(!SubsetPrecomputer::compute_hessian_only(img, 64, 64, dim).valid);
+
+        SubsetData data;
+        SubsetPrecomputer::precompute_subset(data, img, 64, 64, dim);
+        CHECK(!data.is_initialized);
+
+        // Even with a valid pool entry, which belongs to another dim.
+        SubsetData fast;
+        SubsetPrecomputer::precompute_subset_fast(fast, img, 64, 64, dim, good);
+        CHECK(!fast.is_initialized);
+    }
+}
+
 // The cached-Hessian fast path must produce the same state as the full
 // precompute — it is used interchangeably by the JNI batch pipeline.
 TEST_CASE(SubsetPrecomputer, FastPathMatchesFullPrecompute) {
