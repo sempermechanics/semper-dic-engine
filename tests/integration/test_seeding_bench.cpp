@@ -286,8 +286,9 @@ void measure_seed(Row &row, const TruthFn &truth,
         PhaseTimings t;
         auto t0 = std::chrono::high_resolution_clock::now();
         const CpuClock c0 = CpuClock::now();
+        Semper::pipeline::CancelToken never;
         seeds = solve_anchor_seeds(cache, def_gray, def_img, params, gridW, gridH,
-                                   cores, pool, g, st, t);
+                                   cores, pool, g, st, t, never);
         // Publishing is a separate step in the pipeline now, but it is still
         // part of what the seeding phase costs, and `grid` below is expected to
         // carry the published anchors -- so time it here too.

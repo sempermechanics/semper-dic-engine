@@ -13,9 +13,12 @@
 #include <semper/pipeline.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <opencv2/core.hpp>
+#include <thread>
 #include <vector>
 
 using Semper::pipeline::FullFieldParams;
@@ -603,6 +606,81 @@ TEST_CASE(FullField, RefCache_CancelledSolveDoesNotPoisonCache) {
     CHECK(rc == kCancelled || rc > 0);
     CHECK(bit_equal(solve_on(shared, frames[0], cv::Mat(), p),
                     solve_fresh(ref_gray, frames[0], cv::Mat(), p)));
+}
+
+// ---------------------------------------------------------------------------
+// Two engines, two tokens, one process. Until 0.5.0 the token overload bound
+// its token into one process-global "active" pointer for the duration of the
+// solve, so with two solves in flight both polled whichever was bound last:
+// cancelling one stopped the other, or nothing, and a solve that outlived its
+// token left the global pointing at a dead object. Tokens now travel with the
+// solve. Run under TSan this is also the test that sees two solves at once.
+// ---------------------------------------------------------------------------
+TEST_CASE(CancelToken, ConcurrentEnginesCancelIndependently) {
+    cv::Mat ref_gray, def_gray;
+    make_pair(ref_gray, def_gray);
+    FullFieldParams p = params_for(W, H);
+    p.step = 5;
+    p.strain_window = 31;
+    const int cap = (W / 5) * (H / 5) * 8;
+
+    // The uncontested result B has to reproduce.
+    std::vector<float> want((size_t)cap, 0.0f);
+    int n_want = 0;
+    {
+        ReferenceCache cache;
+        cache.set_from_gray(ref_gray, cv::Mat());
+        float metrics[23] = {};
+        n_want = run_full_field(cache, def_gray, cv::Mat(), p, want.data(), cap, metrics, 23, nullptr);
+    }
+    REQUIRE(n_want > 0);
+
+    using Clock = std::chrono::steady_clock;
+    auto wait_for = [](const std::atomic<bool> &flag) {
+        const auto until = Clock::now() + std::chrono::seconds(20);
+        while (!flag.load() && Clock::now() < until)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    };
+
+    Semper::pipeline::CancelToken token_a, token_b;
+    std::atomic<bool> b_running(false), a_done(false);
+    int rc_a = 0, rc_b = 0;
+    std::vector<float> out_b((size_t)cap, 0.0f);
+
+    // B starts first and, from its progress thread, holds its solve open
+    // (the solve joins that thread before returning) until A has finished,
+    // so the two overlap for all of A.
+    std::thread tb([&] {
+        ReferenceCache cache;
+        cache.set_from_gray(ref_gray, cv::Mat());
+        float metrics[23] = {};
+        bool first = true;
+        rc_b = run_full_field(cache, def_gray, cv::Mat(), p, out_b.data(), cap, metrics, 23,
+                              token_b, [&](int) {
+                                  if (!first) return;
+                                  first = false;
+                                  b_running = true;
+                                  wait_for(a_done);
+                              });
+    });
+    wait_for(b_running);
+    std::thread ta([&] {
+        ReferenceCache cache;
+        cache.set_from_gray(ref_gray, cv::Mat());
+        std::vector<float> out((size_t)cap, 0.0f);
+        float metrics[23] = {};
+        rc_a = run_full_field(cache, def_gray, cv::Mat(), p, out.data(), cap, metrics, 23,
+                              token_a, [&](int) { token_a.request(); });
+        a_done = true;
+    });
+    ta.join();
+    tb.join();
+
+    CHECK(rc_a == kCancelled);
+    CHECK(rc_b == n_want);
+    CHECK(!token_b.requested());
+    if (rc_b == n_want)
+        CHECK(std::memcmp(want.data(), out_b.data(), (size_t)n_want * 8 * sizeof(float)) == 0);
 }
 
 #else

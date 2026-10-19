@@ -93,21 +93,20 @@ TEST_CASE(CancelToken, InstancesAreIndependent) {
     CHECK(!a.requested());
 }
 
-// While a per-solve token is bound (as the CancelToken run_full_field overload
-// does), the process-global polls the solver uses route to that token, and the
-// default target is restored afterwards.
-TEST_CASE(CancelToken, ScopedBindRoutesGlobalPollsToToken) {
-    clear_cancel();  // default token starts clear
-    CancelToken solve;
-    {
-        Semper::pipeline::detail::ScopedCancelToken bind(solve);
-        CHECK(!cancel_requested());
-        request_cancel();          // stands in for the JNI setCancelRequested(true)
-        CHECK(cancel_requested());
-        CHECK(solve.requested());  // ...which set the bound token, not the default
-    }
-    // Out of scope: polls route back to the untouched default token.
-    CHECK(!cancel_requested());
-    CHECK(solve.requested());      // the per-solve token kept its own state
+// The free functions act on one process-wide token: the one the token-less
+// run_full_field overload (the JNI path) hands to the solver. A caller-owned
+// token is never touched by them, which is what lets two solves with their
+// own tokens run at once (CancelToken.ConcurrentEnginesCancelIndependently).
+TEST_CASE(CancelToken, FreeFunctionsActOnTheGlobalTokenOnly) {
     clear_cancel();
+    CancelToken solve;
+    CancelToken& global = Semper::pipeline::detail::global_cancel_token();
+    request_cancel();          // stands in for the JNI setCancelRequested(true)
+    CHECK(global.requested());
+    CHECK(cancel_requested());
+    CHECK(!solve.requested()); // a per-solve token never sees it
+    solve.request();
+    clear_cancel();
+    CHECK(!global.requested());
+    CHECK(solve.requested());  // ...nor is it cleared by it
 }

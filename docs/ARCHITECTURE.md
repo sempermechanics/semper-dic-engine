@@ -335,16 +335,19 @@ thread**; `SubsetData` buffers are reused across grid points via the
 
 ### Cancellation — `include/semper/cancel.hpp`
 
-A process-wide flag (`request_cancel` / `clear_cancel` / `cancel_requested`),
-polled by `run_full_field` inside its point loops, so a cancel lands within a
-point or two instead of at the end of the frame. One relaxed atomic load per
-point is nothing against an ICGN solve.
+A `CancelToken` per solve, passed down to every phase (`SolveContext::cancel`,
+and to `solve_anchor_seeds`) and polled inside the point loops, so a cancel
+lands within a point or two instead of at the end of the frame. One relaxed
+atomic load per point is nothing against an ICGN solve. The process-wide
+functions (`request_cancel` / `clear_cancel` / `cancel_requested`) act on the
+token that the overloads without one pass down; nothing is shared between
+solves that bring their own.
 
 Where it is polled, and why there:
 
 | Site | Shape |
 |---|---|
-| Hessian pre-pass, Path A mesh execution | `if (cancel_requested()) continue;` — OpenMP forbids breaking out of a parallel `for`, so a cancel skips the remaining iterations |
+| Hessian pre-pass, anchor lattice, Path A mesh execution | `if (cancel.requested()) continue;` — OpenMP forbids breaking out of a parallel `for`, so a cancel skips the remaining iterations |
 | Path B workers | the flag in the condition-variable predicate, then `return` |
 | Path B's CV wait | bounded (`wait_for`, 20 ms) — a worker waiting for the next round has no one to notify it of a cancel, so it re-checks on a timer |
 | After Path A, after Path B | `return kCancelled` — a cancelled field is partial, so strain and packing are never run on it |

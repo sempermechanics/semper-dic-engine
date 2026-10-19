@@ -389,6 +389,8 @@ pinned here is the contract those polls rest on.
 | `StartsClear` / `RequestIsObserved` | The flag reads back what was set |
 | `StaysSetUntilCleared` | Sticky across a thousand polls — the caller must clear it before a run, which is why both run paths assign `false` on entry |
 | `CrossesThreads` | A worker spinning on the flag sees a request made from another thread — the flag is set on the UI thread, read by solver workers |
+| `FreeFunctionsActOnTheGlobalTokenOnly` | `request_cancel` / `clear_cancel` set and clear the process-wide token and never touch a caller-owned one |
+| `ConcurrentEnginesCancelIndependently` (in `test_full_field_contracts.cpp`) | Two solves in flight on two threads: cancelling A returns `-99` from A, and B finishes with the uncontested field byte for byte. Failed before v0.5.0, when the token was bound into one global pointer and B was cancelled by A's request | A token leaked between concurrent engines again (the SDK / Python case) |
 | `CancelledCodeIsDistinctFromEngineErrors` | `kCancelled` is −99, matching `AnalysisRunCodes.ERROR_CANCELLED`, and is neither the −2 ROI nor the −3 init failure |
 
 `cancel.cpp` is deliberately its own translation unit with no OpenCV in it, so

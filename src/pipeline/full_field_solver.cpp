@@ -33,15 +33,14 @@
 namespace Semper {
 namespace pipeline {
 
-// Cooperative cancel (the flag itself lives in cancel.cpp). Polled in the hot
-// point loops: the cost is one relaxed atomic load per point against a full ICGN
-// solve, and a late poll only means one more point, never a wrong result.
+// Cooperative cancel. The token is passed down to every phase (SolveContext)
+// and polled in the hot point loops: the cost is one relaxed atomic load per
+// point against a full ICGN solve, and a late poll only means one more point,
+// never a wrong result.
 
 using namespace Semper::pipeline::internal;
 
-// Re-entrant overload: bind the caller-owned token as the active cancel target for
-// the duration of the solve, then run the shared implementation below unchanged —
-// its clear_cancel()/cancel_requested() calls route to `cancel` while bound.
+// Re-entrant overload: the solve polls the caller-owned token and nothing else.
 int run_full_field(
     ReferenceCache& cache,
     const cv::Mat& def_gray,
@@ -53,9 +52,9 @@ int run_full_field(
     int metrics_len,
     CancelToken& cancel,
     ProgressCallback on_progress) {
-    detail::ScopedCancelToken bind(cancel);
-    return run_full_field(cache, def_gray, roi_mask, params, output_ptr,
-                          output_capacity, metrics, metrics_len, on_progress);
+    return run_full_field_impl(cache, def_gray, roi_mask, params, output_ptr,
+                               output_capacity, metrics, metrics_len,
+                               std::move(on_progress), nullptr, cancel);
 }
 
 int run_full_field(
@@ -70,7 +69,8 @@ int run_full_field(
     ProgressCallback on_progress) {
     return run_full_field_impl(cache, def_gray, roi_mask, params, output_ptr,
                                output_capacity, metrics, metrics_len,
-                               std::move(on_progress), nullptr);
+                               std::move(on_progress), nullptr,
+                               detail::global_cancel_token());
 }
 
 namespace internal {
@@ -117,7 +117,8 @@ int run_full_field_impl(
     float* metrics,
     int metrics_len,
     ProgressCallback on_progress,
-    FieldCapture* capture) {
+    FieldCapture* capture,
+    CancelToken& cancel) {
 
         std::string local_debug_dir = cache.debug_dir;
         cache.debug_dir.clear();
@@ -132,13 +133,11 @@ int run_full_field_impl(
         if (param_rc != 0) return param_rc;
         SEMPER_ASSERT(output_capacity >= 0);
         // Clear any leftover cancel from a previous solve so this run starts fresh.
-        // The flag is process-global; without this, a caller that cancelled and
-        // then started a new solve without resetting would get an instant -99.
-        clear_cancel();
-        if (cancel_requested()) return kCancelled;
+        // Without this, a caller that cancelled and then started a new solve
+        // without resetting would get an instant -99.
+        cancel.clear();
 
-        static int s_frame_count = 0; s_frame_count++;
-        LOGD("=== FRAME %d computeFullFieldDirect (HYBRID CORE) START ===", s_frame_count);
+        LOGD("=== computeFullFieldDirect (HYBRID CORE) START ===");
 
         auto t_prep_start = std::chrono::high_resolution_clock::now();
         cv::Mat defMat = def_gray;
@@ -312,7 +311,7 @@ int run_full_field_impl(
         struct ThreadJoinGuard {
             std::thread &t; std::atomic<bool> &stop_flag; std::condition_variable &cv;
             std::mutex &cv_mutex; bool &detached_flag;
-            ~ThreadJoinGuard() {
+            void stop() {
                 stop_flag.store(true, std::memory_order_release);
                 {
                     std::unique_lock<std::mutex> lk(cv_mutex);
@@ -320,6 +319,7 @@ int run_full_field_impl(
                 }
                 if (t.joinable()) t.join();
             }
+            ~ThreadJoinGuard() { stop(); }
         };
         ThreadJoinGuard progressGuard{progress_thread, progress_thread_should_stop, progress_cv, progress_cv_mutex, progress_thread_detached};
 
@@ -338,7 +338,7 @@ int run_full_field_impl(
             // OpenMP forbids breaking out of a parallel for, so a cancel skips
             // the remaining iterations instead — the same shape the existing
             // exception guard in Path A uses.
-            if (cancel_requested()) continue;
+            if (cancel.requested()) continue;
             int gx = pool_idx % gridW, gy = pool_idx / gridW;
             if (!resultGrid[gy][gx].solved) {
                 int realX = params.rect_x + gx * params.step, realY = params.rect_y + gy * params.step;
@@ -349,7 +349,7 @@ int run_full_field_impl(
         // The cancel flag only ever goes up during a solve, so if it is still
         // clear here every iteration above ran: the pool is complete and safe
         // to reuse. Otherwise it stays marked stale for the next solve.
-        if (!cancel_requested()) {
+        if (!cancel.requested()) {
             pre.rect_x = params.rect_x; pre.rect_y = params.rect_y;
             pre.rect_w = params.rect_w; pre.rect_h = params.rect_h;
             pre.step = params.step; pre.subset_size = params.subset_size;
@@ -373,7 +373,7 @@ int run_full_field_impl(
         std::vector<ThreadStats> stats_anchors(safe_cores);
         MeshSeedResult seeds = solve_anchor_seeds(
                 cache, defMat, defImg, params, gridW, gridH, safe_cores,
-                hessian_pool, resultGrid, stats_anchors, timings);
+                hessian_pool, resultGrid, stats_anchors, timings, cancel);
 
         // Now apply them. Nodes that clear the result gate *and* survive the
         // median test are marked solved, so Path A skips them and Path B takes
@@ -404,7 +404,7 @@ int run_full_field_impl(
         const bool have_seed = seeds.solved > 0 || seeds.accepted >= 3;
         bool execute_path_c = (mesh_quality == MeshQuality::NONE) && !have_seed;
 
-        if (cancel_requested()) return kCancelled;
+        if (cancel.requested()) return kCancelled;
 
         std::vector<AffineTriangle> affTriangles;
         MeshGuessField guess = build_mesh_guess_field(
@@ -413,7 +413,8 @@ int run_full_field_impl(
                 resultGrid, affTriangles, timings);
 
         const SolveContext ctx{cache, params, defImg, gridW, gridH, safe_cores,
-                               hessian_pool, global_points_solved, compute_order_counter};
+                               hessian_pool, global_points_solved, compute_order_counter,
+                               cancel};
 
         if (execute_path_c) {
             // Path C now runs in cases a bare phase lock used to suppress (see
@@ -437,7 +438,7 @@ int run_full_field_impl(
 
         // Path A is done or abandoned; a cancelled field is incomplete, so stop
         // before spending anything on strain and packing.
-        if (cancel_requested()) return kCancelled;
+        if (cancel.requested()) return kCancelled;
 
         {
             ScopedTimer pathB_timer(timings.pathB);
@@ -447,7 +448,7 @@ int run_full_field_impl(
 
         // Path B's workers have been joined by their guard. A cancelled field is
         // partial, so there is nothing worth deriving strain from.
-        if (cancel_requested()) return kCancelled;
+        if (cancel.requested()) return kCancelled;
 
         if (capture) {
             capture->gridW = gridW;
@@ -473,6 +474,9 @@ int run_full_field_impl(
             LOGE("Output buffer full at %d points (capacity %d floats); remaining points dropped.", valid_count, output_capacity);
         }
 
+        // The ticker is joined first, so the callback is never entered from
+        // two threads at once (the final 100 used to race the last tick).
+        progressGuard.stop();
         if (on_progress) {
             try { on_progress(100); } catch (...) {
                 LOGE("on_progress(100) callback threw; ignoring");

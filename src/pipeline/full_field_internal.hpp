@@ -189,7 +189,8 @@ struct FieldCapture {
 int validate_params(FullFieldParams &p, int width, int height);
 
 // run_full_field with an optional capture. capture == nullptr is exactly
-// run_full_field.
+// run_full_field. `cancel` is the one token this solve clears on entry and
+// polls; it is passed down explicitly so concurrent solves never share one.
 int run_full_field_impl(
         ReferenceCache &cache,
         const cv::Mat &def_gray,
@@ -200,7 +201,8 @@ int run_full_field_impl(
         float *metrics,
         int metrics_len,
         ProgressCallback on_progress,
-        FieldCapture *capture);
+        FieldCapture *capture,
+        CancelToken &cancel);
 
 // Everything the three solve paths read out of run_full_field's frame. Passed
 // by const reference so the extracted phases keep the same view of the solve
@@ -215,6 +217,7 @@ struct SolveContext {
     const HessianPool &hessian_pool;
     std::atomic<int> &global_points_solved;
     std::atomic<int> &compute_order_counter;
+    const CancelToken &cancel;   // this solve's, polled by every phase
 };
 
 // Per-phase wall clock, aggregated for the profiling log and the metrics array.
@@ -348,7 +351,8 @@ MeshSeedResult solve_anchor_seeds(
         const HessianPool &hessian_pool,
         const ResultGrid &resultGrid,
         std::vector<ThreadStats> &stats,
-        PhaseTimings &timings);
+        PhaseTimings &timings,
+        const CancelToken &cancel);
 
 // Applies the anchors that cleared the strict gate AND survived the median
 // test. Returns how many were published. Serial by design — compute_order

@@ -259,7 +259,7 @@ void run_path_b(
     // sorted order, before the flood starts — all of them, as the threaded
     // version did on any device with at least as many cores as seeds.
     for (const auto& seed : global_seeds) {
-        if (cancel_requested()) return;
+        if (ctx.cancel.requested()) return;
         const int flat = seed.y_idx * gridW + seed.x_idx;
         if (claimed[flat]) continue;
         claimed[flat] = 1;
@@ -351,8 +351,8 @@ void run_path_b(
                         return false;
                     };
                     cv.wait_for(lk, std::chrono::milliseconds(tuning::kCancelPollMs),
-                                [&] { return done || cancel_requested() || has_work(); });
-                    if (done || cancel_requested()) return;
+                                [&] { return done || ctx.cancel.requested() || has_work(); });
+                    if (done || ctx.cancel.requested()) return;
                     if (round == nullptr) continue;
 
                     // Oldest round first: that is the one blocking the next commit.

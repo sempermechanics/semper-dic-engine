@@ -89,8 +89,11 @@ int run_full_field(..., CancelToken& token, ProgressCallback on_progress = nullp
 - **Metrics** *(Frozen layout)*: when `metrics != nullptr && metrics_len >= 16`,
   fill telemetry; 23 slots preferred. Slot indices are frozen.
 - **Cancellation**: the legacy overload clears the process-global cancel flag on
-  entry and polls it inside point loops. The `CancelToken&` overload binds that
-  token for the duration of the solve.
+  entry and polls it inside point loops. The `CancelToken&` overload clears and
+  polls only that token, so solves with their own tokens can run concurrently
+  and cancel independently, and `request_cancel()` does not reach them. (Until
+  v0.5.0 the token was bound into one process-global pointer for the duration
+  of the solve, so two concurrent solves polled whichever was bound last.)
 - **You may** make it faster or more accurate (Internal). **You may not** change
   return-code meanings, 8-float packing, the capacity-drop rule, or metric slot
   indices without a major bump.
@@ -206,7 +209,9 @@ bool cancel_requested();
 // Plus CancelToken for per-instance cancel (SDK / Python)
 ```
 
-The free functions stay — JNI `setCancelRequested` maps to them.
+The free functions stay — JNI `setCancelRequested` maps to them. They act on
+one process-wide token, the one every solve started without a token polls.
+`detail::ScopedCancelToken` (never documented here) was removed in v0.5.0.
 
 ### Image I/O — `include/semper/io.hpp` · *Stable*
 

@@ -52,7 +52,7 @@ void run_path_a(
 #pragma omp for schedule(dynamic, 32)
         for (int idx = 0; idx < gridW * gridH; ++idx) {
             if (omp_region_threw.load(std::memory_order_relaxed)) continue;
-            if (cancel_requested()) continue;
+            if (ctx.cancel.requested()) continue;
             if (!guess.in_mesh[idx]) continue;
             int x = idx % gridW, y = idx / gridW;
             if (resultGrid[y][x].solved) continue;

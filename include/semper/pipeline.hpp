@@ -94,9 +94,10 @@ int run_full_field(
 /**
  * Re-entrant overload: cancellation is driven by the caller-owned [cancel] token
  * instead of the process-global flag, so an embedded engine instance (SDK / Python)
- * can stop its own solve without touching any other. Behaviour is otherwise
- * identical to the overload above; the token is bound as the active cancel target
- * for the duration of the call (and cleared on entry, like the global flag).
+ * can stop its own solve without touching any other, and several solves can run
+ * at once in one process. Behaviour is otherwise identical to the overload above;
+ * the solve polls only `cancel` (cleared on entry, like the global flag), so
+ * request_cancel() does not reach it.
  */
 int run_full_field(
     ReferenceCache& cache,

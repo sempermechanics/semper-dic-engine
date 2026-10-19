@@ -134,7 +134,8 @@ MeshSeedResult solve_anchor_seeds(
         const HessianPool& hessian_pool,
         const ResultGrid& resultGrid,
         std::vector<ThreadStats>& stats,
-        PhaseTimings& timings) {
+        PhaseTimings& timings,
+        const CancelToken& cancel) {
 
     MeshSeedResult out;
     if (cache.ref_img == nullptr || gridW <= 0 || gridH <= 0) return out;
@@ -247,7 +248,7 @@ MeshSeedResult solve_anchor_seeds(
             // does not move when the chunk does. docs/SEEDING_BENCHMARK.md 5.1.
 #pragma omp for schedule(dynamic, 4)
             for (int idx = 0; idx < n_anchor; ++idx) {
-                if (cancel_requested()) continue;
+                if (cancel.requested()) continue;
 
                 const int gx = lat_x[(size_t)(idx % LW)];
                 const int gy = lat_y[(size_t)(idx / LW)];
