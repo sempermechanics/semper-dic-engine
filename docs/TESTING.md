@@ -685,6 +685,7 @@ times the fixed-reference cache (first frame vs the rest) against any
 | `Fit_CorrIsWorstUsed` | The fit's ZNSSD is the worst of the nodes inside the radius, not of the field |
 | `AnchorNeed_DropRefreshKeep` | Far from any gap: drop the anchor; clean with a gap or the grid edge within reach: cut a new one; a hole inside its own subset: keep the old one |
 | `Anchor_MatchesTheNodeWhereItMoved` | An anchor cut at a sub-pixel node position and matched 1 px off from where it moved lands within 0.05 px; a match further from the guess than allowed, or on another texture, fails; a patch leaving the image is not cut |
+| `MatchAnchor_RejectsUnconvergedSolve` | A match whose IC-GN hard-rejects at its starting guess (status 1, score 2.0) does not confirm the node, however close to the guess it stopped; a real match still does. Before v0.5.0 it confirmed with corr 2.0 |
 | `MaskWarp_ZeroDisplacement_IsIdentity` / `_Translation_ShiftsMask` / `_Stretch_ScalesArea` | The forward mask warp is exact for identity and translation, and the area of a stretched mask is within 1% |
 | `MaskWarp_LargeRotation_IsTheRotatedMask` | An 84° turn, with the material reaching 16 px past the outer nodes: area within 2%, no pixel set more than 1 px outside the analytically rotated square, none missing more than 1 px inside it |
 | `MaskWarp_NoValidNode_IsEmpty` | No tracked node, no material |
