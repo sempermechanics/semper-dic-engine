@@ -31,7 +31,7 @@ res = eng.run(
 
 res.count            # number of solved points
 res.points           # (N, 8) float32: x, y, u, v, exx, eyy, exy, corr
-res.metrics          # (23,) float32 telemetry
+res.metrics          # (24,) float32 telemetry
 ```
 
 Call `eng.cancel()` from another thread to stop a run in flight.

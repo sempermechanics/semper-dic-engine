@@ -3,6 +3,7 @@
 
 #include <semper/cancel.hpp>
 #include <semper/image.hpp>
+#include <semper/metrics.hpp>
 #include <opencv2/core.hpp>
 #include <functional>
 #include <memory>
@@ -74,11 +75,13 @@ struct FullFieldParams {
  * Run the hybrid full-field DIC pipeline.
  * @return number of valid output points, or negative error code
  *   (-2 ROI, -3 init, [kBadStrainWindow] if strain_window is too small for
- *   step, [kCancelled] if cancelled mid-solve).
+ *   step, [kSeedFailed] if no seed could be found, [kCancelled] if cancelled
+ *   mid-solve).
  * Writes packed points to output_ptr (8 floats each: x,y,u,v,exx,eyy,exy,corr).
  * output_capacity is the number of floats output_ptr can hold; the solver never
  * writes past it (points beyond the capacity are dropped rather than overflowing).
- * If metrics != nullptr and metrics_len >= 16, fills engine telemetry (23 floats preferred).
+ * If metrics != nullptr and metrics_len >= 16, fills engine telemetry: the
+ * metrics_prefix_len(metrics_len) leading slots, kMetricsLen preferred.
  */
 int run_full_field(
     ReferenceCache& cache,

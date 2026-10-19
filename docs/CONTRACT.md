@@ -25,9 +25,9 @@ usual. Respect the surface described here, and declare your change's
 | Tier | What it covers | Rule for contributors |
 |---|---|---|
 | **Frozen** | Binary/data formats: output packing, metrics layout, error codes, and the *meaning* of existing `FullFieldParams` fields | Never change in place. A change here is a **major** version bump and requires a coordinated change in the downstream app. |
-| **Stable** | Public function **signatures** in `include/semper/{pipeline,incremental,io,cancel,version}.hpp` and `include/semper/semper_c.h` | May be **extended additively** (new overloads / new functions). Existing signatures, parameter order, defaults, and semantics must not change without a **major** bump. |
+| **Stable** | Public function **signatures** in `include/semper/{pipeline,incremental,io,cancel,metrics,version}.hpp` and `include/semper/semper_c.h` | May be **extended additively** (new overloads / new functions). Existing signatures, parameter order, defaults, and semantics must not change without a **major** bump. |
 | **Additive-only** | Deliberate growth points: trailing `FullFieldParams` fields, unused metrics slots | Append only, each with a default that reproduces prior behavior. Never reorder or repurpose an existing entry. |
-| **Internal** | Everything in `src/`, `tuning.hpp` constants, `types.hpp`, `seeding.hpp`, algorithm internals, private headers. Living under `include/semper/` does **not** make a header Stable — only the five named above and `semper_c.h` are. | Change freely. Behavior is guarded by the golden test, not by this contract. |
+| **Internal** | Everything in `src/`, `tuning.hpp` constants, `types.hpp`, `seeding.hpp`, algorithm internals, private headers. Living under `include/semper/` does **not** make a header Stable — only the six named above and `semper_c.h` are (`guarded_call.hpp`, added v0.5.0, is Internal). | Change freely. Behavior is guarded by the golden test, not by this contract. |
 
 **Semantic versioning** (`include/semper/version.hpp` / `SEMPER_VERSION`):
 
@@ -69,7 +69,9 @@ int run_full_field(..., CancelToken& token, ProgressCallback on_progress = nullp
 ```
 
 - **Returns** *(Frozen)*: `>= 0` → number of valid output points. `-2` → invalid ROI.
-  `-3` → init/argument failure. `-99` (`kCancelled`) → cancelled mid-solve.
+  `-3` → init/argument failure. `-4` (`kBadStrainWindow`) → strain window too
+  small for the step. `-5` (`kSeedFailed`, v0.5.0) → nothing could seed the
+  solve. `-99` (`kCancelled`) → cancelled mid-solve.
   A non-positive `params.step` is treated as an invalid ROI (`-2`) — it would
   otherwise divide-by-zero when forming the grid. This is a clarification of the
   existing `-2` meaning, not a new code.
@@ -94,7 +96,8 @@ int run_full_field(..., CancelToken& token, ProgressCallback on_progress = nullp
   [A.4](#a4-frozen-data-formats)). Points beyond capacity are **dropped, never
   overflow**.
 - **Metrics** *(Frozen layout)*: when `metrics != nullptr && metrics_len >= 16`,
-  fill telemetry; 23 slots preferred. Slot indices are frozen.
+  fill the `metrics_prefix_len(metrics_len)` leading slots; `kMetricsLen` (24)
+  preferred (`include/semper/metrics.hpp`). Slot indices are frozen.
 - **Cancellation**: the legacy overload clears the process-global cancel flag on
   entry and polls it inside point loops. The `CancelToken&` overload clears and
   polls only that token, so solves with their own tokens can run concurrently
@@ -324,14 +327,15 @@ index:  0   1   2   3     4     5     6      7
 field:  x   y   u   v    exx   eyy   exy   corr
 ```
 
-### Metrics buffer — **23 × `float32`**
+### Metrics buffer — **24 × `float32`**
 
 Slot indices are Frozen; new telemetry appends. `metrics_len == 16` is the
-minimum honored; **23 preferred**. The writer copies the largest prefix the
-caller's buffer can hold (16, 17, 19, 20, 21, 22 or 23 slots), so an existing
-caller that still passes 17 keeps working unchanged. The JNI adapter honours
-this from v0.4.1; before that it copied at most 19 slots, so slots 19–22 never
-reached Kotlin.
+minimum honored; **24 preferred** (`kMetricsLen`, `SEMPER_METRICS_LEN`). The
+writer copies the largest prefix the caller's buffer can hold (16, 17, 19, 20,
+21, 22, 23 or 24 slots; `metrics_prefix_len` is the one table, used by the
+solver and the JNI copy-back alike), so an existing caller that still passes
+17 or 23 keeps working unchanged. The JNI adapter honours this from v0.4.1;
+before that it copied at most 19 slots, so slots 19–22 never reached Kotlin.
 
 **Slot 10 semantic change (v0.2.2).** The index, type and layout are unchanged
 and remain Frozen. Its *meaning* changed from "AKAZE + RANSAC time (ms)" to
@@ -355,16 +359,21 @@ than repurpose either Frozen slot, v0.3.0 **appends** the missing terms:
 | 20 | Converged, then discarded by the VSG strain post-filter | v0.3.0 |
 | 21 | Phase-correlation lock: `1` = locked, `0` = no lock | v0.3.0 |
 | 22 | Mesh coverage: convex hull of the accepted anchors / ROI area, `0..1` | v0.3.0 |
+| 23 | Converged, then rejected by the displacement median test before packing | v0.5.0 |
 
-With slot 19 and slot 20 present the point accounting closes exactly, as
+With slots 19, 20 and 23 present the point accounting closes exactly, as
 long as the output buffer was large enough to hold the whole field:
 
 ```
-metrics[3] + metrics[4] + metrics[19] == metrics[1] + metrics[20]
+metrics[3] + metrics[4] + metrics[19] == metrics[1] + metrics[20] + metrics[23]
 ```
 
-That is, every point some path solved is either in the output buffer or was
-dropped by the strain post-filter. Slot 20 was previously invisible: a caller
+That is, every point some path solved is either in the output buffer, was
+rejected as a displacement outlier, or was dropped by the strain
+post-filter. Until v0.5.0 the identity had no slot 23 and failed whenever the
+median test rejected anything (`FullField.MetricsIdentityHoldsWithOutliers`);
+a caller reading a 23-slot buffer can still recover slot 23 as the
+difference. Slot 20 was previously invisible: a caller
 seeing slot 1 fall short of slots 3 + 4 had no way to distinguish a point that
 never converged from one that converged and was then discarded because its
 strain fit was rank-deficient.
@@ -427,6 +436,7 @@ and smoke test in this repo was on the wrong side of it before v0.3.0.
 | `-2` | invalid ROI |
 | `-3` | init / argument failure |
 | `-4` | `strain_window` too small for `step` (**added v0.3.0**) |
+| `-5` | no seed: no anchor converged, phase correlation did not lock, and the fallback search failed (**added v0.5.0**; this case returned an undocumented `-1` before) |
 | `-99` (`kCancelled`) | cancelled mid-solve |
 
 ---

@@ -412,7 +412,8 @@ void run_path_b(
 // ---------------------------------------------------------------------------
 
 // Returns 0 on success (globalU/globalV and the seed indices are updated), or
-// the negative error code run_full_field should return to its caller.
+// the negative error code run_full_field should return to its caller: -2 when
+// no node is left to seed from, kSeedFailed when the seed search fails.
 int run_path_c(
         const SolveContext &ctx,
         const std::vector<cv::Point2f> &seed_ref_pts,
@@ -482,6 +483,7 @@ void fill_engine_metrics(
         int total_valid_points,
         int valid_count,
         int dropped_by_post_filter,
+        int dropped_as_outlier,
         const MeshSeedResult &seeds,
         MeshQuality mesh_quality);
 

@@ -32,6 +32,7 @@ __all__ = [
     "ERR_ROI",
     "ERR_INIT",
     "ERR_STRAIN_WINDOW",
+    "ERR_SEED",
     "ERR_CANCELLED",
     "__version__",
 ]
@@ -40,12 +41,14 @@ __all__ = [
 ERR_ROI = -2
 ERR_INIT = -3
 ERR_STRAIN_WINDOW = -4
+ERR_SEED = -5
 ERR_CANCELLED = -99
 
 _MESSAGES = {
     ERR_ROI: "invalid ROI",
     ERR_INIT: "init/argument failure (was set_reference called?)",
     ERR_STRAIN_WINDOW: "strain_window too small for step (need >= 2 * step)",
+    ERR_SEED: "no seed found (no anchor converged and phase correlation did not lock)",
     ERR_CANCELLED: "cancelled",
 }
 
@@ -63,7 +66,7 @@ class Result:
     """One solve's output.
 
     ``points`` is an ``(N, 8)`` float32 array with columns
-    ``[x, y, u, v, exx, eyy, exy, corr]``; ``metrics`` is the ``(23,)`` telemetry.
+    ``[x, y, u, v, exx, eyy, exy, corr]``; ``metrics`` is the ``(24,)`` telemetry.
     """
 
     count: int

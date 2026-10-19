@@ -16,6 +16,7 @@
 // =====================================================================
 #include "framework/test_framework.h"
 #include <semper/cancel.hpp>
+#include <semper/metrics.hpp>
 
 #include <atomic>
 #include <thread>
@@ -109,4 +110,22 @@ TEST_CASE(CancelToken, FreeFunctionsActOnTheGlobalTokenOnly) {
     clear_cancel();
     CHECK(!global.requested());
     CHECK(solve.requested());  // ...nor is it cleared by it
+}
+
+// The metrics writer copies the largest prefix the caller's buffer holds;
+// every adapter goes through this one table. 18 is not a prefix the contract
+// offers (slots 17 and 18 came in together), so an 18-float buffer gets 17.
+TEST_CASE(Metrics, PrefixLenTable) {
+    using Semper::pipeline::kMetricsLen;
+    using Semper::pipeline::metrics_prefix_len;
+    CHECK(kMetricsLen == 24);
+    CHECK(metrics_prefix_len(-1) == 0);
+    CHECK(metrics_prefix_len(0) == 0);
+    CHECK(metrics_prefix_len(15) == 0);
+    CHECK(metrics_prefix_len(16) == 16);
+    CHECK(metrics_prefix_len(17) == 17);
+    CHECK(metrics_prefix_len(18) == 17);
+    for (int n = 19; n <= 24; ++n) CHECK(metrics_prefix_len(n) == n);
+    CHECK(metrics_prefix_len(25) == 24);
+    CHECK(metrics_prefix_len(1000) == 24);
 }

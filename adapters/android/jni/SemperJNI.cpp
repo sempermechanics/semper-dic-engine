@@ -115,22 +115,19 @@ bool decode_optional(JNIEnv* env, jbyteArray bytes, int w, int h, cv::Mat& out) 
     return true;
 }
 
-// Metrics slots handed to the solver: all 23 (CONTRACT.md "Metrics buffer").
-constexpr int kJniMetricsLen = 23;
+// Metrics slots handed to the solver: all of them (CONTRACT.md "Metrics buffer").
+constexpr int kJniMetricsLen = Semper::pipeline::kMetricsLen;
 
 int metrics_capacity(JNIEnv* env, jfloatArray out_metrics) {
     if (out_metrics == nullptr) return 0;
     return env->GetArrayLength(out_metrics) >= 16 ? kJniMetricsLen : 0;
 }
 
-// Copies the largest prefix the Kotlin array holds: 16, 17, 19, 20, 21, 22 or
-// 23 slots. 18 is not a prefix the contract offers (slots 17 and 18 came in
-// together), so an 18-float array gets 17.
+// Copies the largest prefix the Kotlin array holds, by the engine's own table
+// (metrics_prefix_len: 16, 17, 19 ... 24 slots; an 18-float array gets 17).
 void copy_metrics(JNIEnv* env, jfloatArray out_metrics, const float* metrics_buf) {
-    const int metrics_len = env->GetArrayLength(out_metrics);
-    int ncopy = metrics_len >= kJniMetricsLen ? kJniMetricsLen : metrics_len;
-    if (ncopy == 18) ncopy = 17;
-    env->SetFloatArrayRegion(out_metrics, 0, ncopy, metrics_buf);
+    const int ncopy = Semper::pipeline::metrics_prefix_len(env->GetArrayLength(out_metrics));
+    if (ncopy > 0) env->SetFloatArrayRegion(out_metrics, 0, ncopy, metrics_buf);
 }
 
 // Float capacity of a direct ByteBuffer, or -1 if it is not usable.

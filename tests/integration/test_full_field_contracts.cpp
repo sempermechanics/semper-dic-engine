@@ -495,6 +495,58 @@ TEST_CASE(FullField, MetricsPointCountsAccountForEverySolvedPoint) {
     CHECK(metrics[18] > 0.0f);
 }
 
+// The median test rejects converged-but-wrong points before packing. Those
+// were counted by their solving path (slots 3/4/19) and then appeared in
+// neither slot 1 nor slot 20, so the documented identity failed whenever it
+// fired. Slot 23 (v0.5.0) counts them. Here a 44 px block of the deformed
+// image moves 4 px further than the rest: its inner nodes converge cleanly to
+// the block's motion and the median test peels them off as a cluster.
+TEST_CASE(FullField, MetricsIdentityHoldsWithOutliers) {
+    cv::Mat ref_gray, def_gray;
+    make_pair(ref_gray, def_gray);
+    cv::Mat block = def_gray(cv::Rect(100, 100, 44, 44)).clone();
+    block.copyTo(def_gray(cv::Rect(104, 100, 44, 44)));
+
+    FullFieldParams params = params_for(W, H);
+    params.step = 5;
+    params.strain_window = 31;
+    const int cap = (W / 5) * (H / 5) * 8;
+    ReferenceCache cache;
+    cache.set_from_gray(ref_gray, cv::Mat());
+    std::vector<float> out((size_t)cap, 0.0f);
+    float metrics[Semper::pipeline::kMetricsLen];
+    for (float &m : metrics) m = -1.0f;
+    const int n = run_full_field(cache, def_gray, cv::Mat(), params, out.data(), cap,
+                                 metrics, Semper::pipeline::kMetricsLen, nullptr);
+    REQUIRE(n > 0);
+    std::printf("    3:%g + 4:%g + 19:%g  vs  1:%g + 20:%g + 23:%g\n", metrics[3], metrics[4],
+                metrics[19], metrics[1], metrics[20], metrics[23]);
+    CHECK(metrics[23] > 0.0f);
+    CHECK(metrics[3] + metrics[4] + metrics[19] == metrics[1] + metrics[20] + metrics[23]);
+}
+
+// Path C is the last resort when the anchor lattice found nothing and phase
+// correlation did not lock. Its failure returned -1, a code no header,
+// binding or document defined. It is kSeedFailed (-5) now.
+TEST_CASE(FullField, UnseedableField_ReturnsDocumentedCode) {
+    // A blank frame (lens cap, dropped frame): nothing to correlate with.
+    // (An unrelated speckle frame is not enough -- the unlocked lattice's
+    // own search finds a few spurious matches on it and seeds from those.)
+    cv::Mat ref_gray, def_gray;
+    make_pair(ref_gray, def_gray);
+    const cv::Mat unrelated(H, W, CV_8UC1, cv::Scalar(128));
+    ReferenceCache cache;
+    cache.set_from_gray(ref_gray, cv::Mat());
+    const int cap = 8 * ((W / STEP) * (H / STEP) + 8);
+    std::vector<float> out((size_t)cap, 0.0f);
+    float metrics[Semper::pipeline::kMetricsLen] = {};
+    const int rc = run_full_field(cache, unrelated, cv::Mat(), params_for(W, H), out.data(), cap,
+                                  metrics, Semper::pipeline::kMetricsLen, nullptr);
+    std::printf("    rc = %d\n", rc);
+    CHECK(rc == Semper::pipeline::kSeedFailed);
+    CHECK(Semper::pipeline::kSeedFailed == -5);
+}
+
 // ---------------------------------------------------------------------------
 // Reference precompute cache. A batch against one reference reuses the grid
 // scan, the Hessian pool and the reference side of the phase correlation.

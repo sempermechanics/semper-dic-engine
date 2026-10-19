@@ -396,6 +396,7 @@ pinned here is the contract those polls rest on.
 | `CrossesThreads` | A worker spinning on the flag sees a request made from another thread — the flag is set on the UI thread, read by solver workers |
 | `FreeFunctionsActOnTheGlobalTokenOnly` | `request_cancel` / `clear_cancel` set and clear the process-wide token and never touch a caller-owned one |
 | `ConcurrentEnginesCancelIndependently` (in `test_full_field_contracts.cpp`) | Two solves in flight on two threads: cancelling A returns `-99` from A, and B finishes with the uncontested field byte for byte. Failed before v0.5.0, when the token was bound into one global pointer and B was cancelled by A's request | A token leaked between concurrent engines again (the SDK / Python case) |
+| `Metrics.PrefixLenTable` | `metrics_prefix_len`: nothing below 16, 18 → 17, 19..24 as given, 24 above | The one prefix table drifts from CONTRACT §A.4 |
 | `CancelledCodeIsDistinctFromEngineErrors` | `kCancelled` is −99, matching `AnalysisRunCodes.ERROR_CANCELLED`, and is neither the −2 ROI nor the −3 init failure |
 
 `cancel.cpp` is deliberately its own translation unit with no OpenCV in it, so
@@ -450,7 +451,7 @@ Compile-time `static_assert`s pin `ReferenceCache` as non-copyable/non-movable
 ## Suite: `FullField` — `integration/test_full_field_contracts.cpp`
 
 Host characterization of `run_full_field` — the Frozen return codes, the
-capacity-drop rule, and the 23-float metrics layout — without depending on solve
+capacity-drop rule, and the metrics layout — without depending on solve
 quality. OpenCV-gated.
 
 | Test | Proves | Failure would mean |
@@ -471,6 +472,8 @@ quality. OpenCV-gated.
 | `RefCache_SequenceOnOneCache_BitIdenticalToFresh` | Five frames solved against one cache give the same bytes as five fresh caches, on a DFT-optimal ROI with the 6×6 interpolator | The per-reference cache (grid scan, Hessian pool, phase-correlation reference) changed a result. This test caught `cv::phaseCorrelate` windowing a cached input in place |
 | `RefCache_InvalidatesOnParamsOrMask` | Changing `step`, `subset_size`, `rect` or the mask between solves gives the same result as a fresh cache | A stale grid scan or Hessian pool reused for a different grid |
 | `RefCache_CancelledSolveDoesNotPoisonCache` | A solve cancelled during the pre-pass, then repeated, matches a fresh solve | A partly filled Hessian pool cached as complete |
+| `MetricsIdentityHoldsWithOutliers` | A 44 px block moved 4 px further than the rest: the median test rejects its inner nodes and `3 + 4 + 19 == 1 + 20 + 23` still holds, with slot 23 > 0 | Points the median test drops fall out of the accounting again (before v0.5.0 there was no slot 23 and the identity failed whenever the test fired) |
+| `UnseedableField_ReturnsDocumentedCode` | A blank deformed frame → `kSeedFailed` (`-5`) | Path C's failure leaks an undocumented code again (it was `-1`), or a blank crop "locks" phase correlation again (it did, at zero shift, and the solve returned 0 points with success) |
 | `MetricsPointCountsAccountForEverySolvedPoint` | `metrics[3] + metrics[4] + metrics[19] == metrics[1] + metrics[20]`, anchors > 0, mean ICGN iters ≥ 1, slot 18 > 0 | A solving path or a post-filter drop stops being counted — the failure mode that hid the anchor lattice from slots 3/4 and the strain post-filter from everything |
 
 ## Suite: `GoldenCorpus` — `integration/test_golden_corpus.cpp`
@@ -724,7 +727,7 @@ Where `c/smoke.c` proves the happy path runs, `c/contract.c` pins the **Frozen
 ABI surface** the private downstream app and any external C/C#/Rust caller depend
 on. It runs in the `c-sdk-smoke` CI job and returns non-zero on any breach:
 
-- Compile-time `_Static_assert` on every Frozen constant (`SEMPER_ERR_*`,
+- Compile-time `_Static_assert` on every Frozen constant (`SEMPER_ERR_*` incl. `SEMPER_ERR_SEED`,
   `SEMPER_FLOATS_PER_POINT`, `SEMPER_METRICS_LEN`) and on `sizeof`/`offsetof` of
   all eight `semper_params` fields — a reordered field is a build failure, not a
   silent parameter mis-read.

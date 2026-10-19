@@ -18,7 +18,8 @@
 /* ---- Compile-time Frozen shape. A break here is a build failure, not a
  *      silent runtime mis-read in a caller that was not recompiled. ---- */
 _Static_assert(SEMPER_FLOATS_PER_POINT == 8, "packed point stride is Frozen at 8");
-_Static_assert(SEMPER_METRICS_LEN == 23, "metrics length grew to 23 in v0.3.0");
+_Static_assert(SEMPER_METRICS_LEN == 24, "metrics length grew to 23 in v0.3.0 and 24 in v0.5.0");
+_Static_assert(SEMPER_ERR_SEED == -5, "SEMPER_ERR_SEED is Frozen at -5 (v0.5.0)");
 _Static_assert(SEMPER_ERR_ROI == -2, "SEMPER_ERR_ROI is Frozen at -2");
 _Static_assert(SEMPER_ERR_INIT == -3, "SEMPER_ERR_INIT is Frozen at -3");
 _Static_assert(SEMPER_ERR_CANCELLED == -99, "SEMPER_ERR_CANCELLED is Frozen at -99");

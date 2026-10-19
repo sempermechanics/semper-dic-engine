@@ -122,9 +122,9 @@ int run_path_c(
             LOGD("PATH C SUCCESS: Seed locked at u=%.2f, v=%.2f", globalU, globalV);
         } else {
             LOGE("PATH C FAILED: Central anchor search diverged.");
-            return -1;
+            return kSeedFailed;
         }
-    } else { return -1; }
+    } else { return kSeedFailed; }
 
     return 0;
 }

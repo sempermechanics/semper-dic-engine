@@ -516,7 +516,8 @@ int run_full_field_impl(
         // ==========================================
         fill_engine_metrics(metrics, metrics_len, timings, summary,
                             total_valid_points, valid_count,
-                            packed.dropped_by_post_filter, seeds, mesh_quality);
+                            packed.dropped_by_post_filter, packed.dropped_as_outlier,
+                            seeds, mesh_quality);
 
         if (capture && capture->keep_deformed) {
             capture->deformed = std::move(defImgOwner);

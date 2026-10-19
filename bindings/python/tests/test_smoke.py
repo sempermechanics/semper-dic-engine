@@ -41,7 +41,7 @@ def test_recovers_rigid_translation():
 
     assert res.count > 0
     assert res.points.shape[1] == 8
-    assert res.metrics.shape == (23,)
+    assert res.metrics.shape == (24,)
     # Column 2 is u (x-displacement). Recovered median should match the shift.
     u = res.points[:, 2]
     assert np.median(u) == pytest.approx(dx, abs=0.5)
@@ -77,7 +77,7 @@ def test_degenerate_roi_no_raise_returns_negative_result():
     # metrics is still the full (17,) array.
     assert res.count == semper.ERR_ROI
     assert res.points.shape == (0, 8)
-    assert res.metrics.shape == (23,)
+    assert res.metrics.shape == (24,)
 
 
 def test_set_reference_rejects_non_2d():
@@ -126,6 +126,8 @@ def test_error_codes_and_messages():
     assert semper.ERR_ROI == -2
     assert semper.ERR_INIT == -3
     assert semper.ERR_STRAIN_WINDOW == -4
+    assert semper.ERR_SEED == -5
+    assert "seed" in str(semper.DicError(semper.ERR_SEED))
     assert semper.ERR_CANCELLED == -99
     # DicError carries the code and maps to the documented human message.
     err = semper.DicError(semper.ERR_ROI)

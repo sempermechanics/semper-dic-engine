@@ -140,6 +140,11 @@ bool phase_correlate_roi(const PhaseCorrRef &ref, const cv::Mat &def,
 
     cv::Mat def32;
     def(r).convertTo(def32, CV_32F);
+    // A blank crop (lens cap, dropped frame) has no phase to correlate, but
+    // its windowed spectrum still peaks: it used to "lock" at zero shift.
+    cv::Scalar mean, stddev;
+    cv::meanStdDev(def32, mean, stddev);
+    if (!(stddev[0] > 1e-3)) return false;
     // cv::phaseCorrelate multiplies the window into its inputs IN PLACE when
     // their size is already DFT-optimal (no padding copy), so the stored crop
     // must not be handed over directly or every reuse would window it again.

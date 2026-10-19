@@ -1,5 +1,5 @@
 // pybind11 bindings for the Semper DIC engine — wraps the C++ core directly.
-// NumPy in, (N, 8) points + (23,) metrics out. Behavior is identical to the
+// NumPy in, (N, 8) points + (24,) metrics out. Behavior is identical to the
 // Android/JNI path; see docs/CONTRACT.md for the frozen formats.
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
@@ -77,7 +77,7 @@ public:
     }
 
     // Returns (code, points|None, metrics). code >= 0 is the point count; negative
-    // is a SEMPER error (-2 ROI, -3 init, -99 cancelled). points is (code, 8) f32.
+    // is a SEMPER error (-2 ROI, -3 init, -4 strain window, -5 seed, -99 cancelled). points is (code, 8) f32.
     py::tuple run(const py::object& deformed, const py::object& mask,
                   std::array<int, 4> rect, int step, int subset, int strain_window,
                   bool use_6x6, const py::object& progress) {
@@ -106,7 +106,7 @@ public:
         const size_t rows = step > 0 ? static_cast<size_t>(std::max(0, span_h / step + 1)) : 0;
         const size_t max_pts = cols * rows;
         std::vector<float> out(max_pts * 8, 0.0f);
-        float metrics[23] = {0};
+        float metrics[Semper::pipeline::kMetricsLen] = {0};
 
         ProgressCallback cb = to_callback(progress);
 
@@ -114,10 +114,10 @@ public:
         {
             py::gil_scoped_release rel;  // long solve must not hold the GIL
             n = run_full_field(cache_, def, roi, p, out.data(),
-                               static_cast<int>(out.size()), metrics, 23, cancel_, cb);
+                               static_cast<int>(out.size()), metrics, Semper::pipeline::kMetricsLen, cancel_, cb);
         }
 
-        py::array_t<float> met(23);
+        py::array_t<float> met(Semper::pipeline::kMetricsLen);
         std::memcpy(met.mutable_data(), metrics, sizeof(metrics));
         if (n < 0) {
             return py::make_tuple(n, py::none(), met);
@@ -182,7 +182,7 @@ public:
         cv::Mat def = to_gray(deformed, width_, height_);
         if (def.empty()) throw std::runtime_error("failed to decode deformed image");
         std::vector<float> out(static_cast<size_t>(std::max(session_.max_points(), 1)) * 8, 0.0f);
-        float metrics[23] = {0};
+        float metrics[Semper::pipeline::kMetricsLen] = {0};
         Semper::pipeline::IncrementalFrameInfo fi;
         ProgressCallback cb = to_callback(progress);
 
@@ -190,10 +190,10 @@ public:
         {
             py::gil_scoped_release rel;  // long solve must not hold the GIL
             n = session_.process_frame(def, out.data(), static_cast<int>(out.size()),
-                                       metrics, 23, cancel_, cb, &fi);
+                                       metrics, Semper::pipeline::kMetricsLen, cancel_, cb, &fi);
         }
 
-        py::array_t<float> met(23);
+        py::array_t<float> met(Semper::pipeline::kMetricsLen);
         std::memcpy(met.mutable_data(), metrics, sizeof(metrics));
         py::dict info;
         info["reference_frame"] = fi.reference_frame;
