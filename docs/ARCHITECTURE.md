@@ -118,8 +118,12 @@ valid in the interior `[2, dim−3]`; the border ring is zero.
 
 All three are *interpolating* kernels: they reproduce pixel values exactly at
 integer coordinates and reproduce linear ramps exactly at sub-pixel positions.
-The engine treats intensity `< 0` as "dead pixel" — hence bilinear's `0.0f`
-return is a sentinel further filtered by callers (`val > 0` checks).
+IC-GN and the Simplex never call them where bilinear demotion could happen:
+their 4 px guard (`sample_warped_subset`) is stricter than every demotion
+boundary, and a sample's validity is decided by that guard and the reference
+mask, never by its value. A deformed intensity of `0` is black, not missing.
+(Until v0.5.0 IC-GN dropped every sample not `> 0`, so saturated black speckle
+and cubic undershoot next to it were treated as off-image.)
 
 ---
 
@@ -189,9 +193,19 @@ Synthetic test data must be generated with this exact convention
   normalizes (ZNSSD → invariant to affine intensity changes `a·I + b`),
   accumulates the gradient via `simd::znssd_error_and_gradient`, then updates
   `W ← W · ΔW⁻¹`. Converges when `‖Δp‖ < 0.001`, max 50 iterations.
-- **Guards:** ≥ 90% of warped pixels must land inside the image; post-convergence
+- **Sampling:** `sample_warped_subset` is the one place the deformed image is
+  read through a warp, for IC-GN and the Simplex alike; it fills values and a
+  per-pixel validity mask (inside the 4 px guard and not in the Ghost Wall).
+- **Guards:** ≥ 90% of warped pixels must be valid; post-convergence
   texture check (sum of squared gradients of surviving pixels) rejects
-  texture-less matches.
+  texture-less matches. An iteration that loses pixels steps with its own
+  masked Hessian, and only if that Hessian passes the same 6×6 conditioning
+  test as the reference one (`hessian::well_conditioned`: 1-norm rcond with the
+  gradient rows scaled by the half-width, `tuning::kHessianMinRcond`); the
+  next full iteration is back on the reference Hessian. A step with a
+  non-invertible `ΔW`, or one that would make `W` non-finite (checked on the
+  bits, since `-ffast-math` folds `isfinite`), ends the solve as a failure on
+  the last good warp.
 - **Levenberg-Marquardt option** (`lm_enabled`, `lm_alpha`): adds `α` to
   `H(0,0)`/`H(1,1)` only (translation DOFs), DICe-compatible. Off by default.
 - **Simplex** (Nelder-Mead on ZNSSD): derivative-free rescue for bad seeds;

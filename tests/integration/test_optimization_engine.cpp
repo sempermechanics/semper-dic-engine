@@ -23,6 +23,12 @@
 #include <semper/solver.hpp>
 #include <semper/subset.hpp>
 
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+
 using Semper::Image;
 using Semper::SubsetData;
 using Semper::SubsetPrecomputer;
@@ -305,4 +311,125 @@ TEST_CASE(Engine, LmDampingPreservesWellPosedSolution) {
     REQUIRE(res.status == 0);
     CHECK_NEAR(res.u, u_true, TOL_TRANS);
     CHECK_NEAR(res.v, v_true, TOL_TRANS);
+}
+
+// ---------------------------------------------------------------------
+// IC-GN validity, inverses and degeneracy (v0.5.0)
+// ---------------------------------------------------------------------
+namespace {
+
+    // std::isfinite folds to true under -ffast-math, which this suite is
+    // built with; look at the exponent bits instead.
+    bool finite_bits(float f) {
+        uint32_t u;
+        std::memcpy(&u, &f, sizeof u);
+        return (u & 0x7f800000u) != 0x7f800000u;
+    }
+
+    bool all_finite(const AnalysisResult &r) {
+        return finite_bits(r.u) && finite_bits(r.v) && finite_bits(r.ux) && finite_bits(r.uy) &&
+               finite_bits(r.vx) && finite_bits(r.vy) && finite_bits(r.correlation_score);
+    }
+
+    // A pointwise intensity map commutes with the warp, so applying it to
+    // both images keeps the ground truth exact.
+    void saturate_dark(Image &img, float floor) {
+        for (float &v : img.intensities) v = std::max(0.0f, v - floor);
+        img.prepare_data(false);
+    }
+
+} // namespace
+
+// Black is a valid intensity. IC-GN used to drop every deformed sample that
+// was not > 0 -- a speckle saturated to 0, or a cubic undershoot next to one
+// -- as if it had left the image, and failed the 90% valid-pixel guard once a
+// tenth of the subset was black. Validity is now where the sample was taken,
+// not what it read.
+TEST_CASE(Engine, SaturatedBlackSpeckle_Converges) {
+    const auto truth = centered(2.25f, -1.5f);
+    dictest::SpeckleField field(1234, W, H);
+    Image ref = dictest::make_reference_image(field, W, H);
+    Image def = dictest::make_deformed_image(field, W, H, truth);
+    saturate_dark(ref, 100.0f);
+    saturate_dark(def, 100.0f);
+
+    SubsetData subset;
+    SubsetPrecomputer::precompute_subset(subset, ref, CX, CY, DIM);
+    REQUIRE(subset.is_initialized);
+    int black = 0;
+    for (float v : subset.ref_intensities) black += (v == 0.0f) ? 1 : 0;
+    std::printf("    black pixels in subset: %d of %d\n", black, DIM * DIM);
+    REQUIRE(black > DIM * DIM / 10);
+
+    for (bool use6x6 : {false, true}) {
+        OptimizationEngine engine;
+        engine.use_6x6_interpolator = use6x6;
+        auto res = engine.calculate_deformation(subset, def, 2.0f, -1.0f, 0.0f, 0.0f, 0.0f,
+                                                0.0f, INIT_NO_SIMPLEX);
+        // The clip at 0 is a kink no cubic reproduces, so the bias near it
+        // is larger than on smooth speckle (measured 0.026 px in v).
+        CHECK(res.status == 0);
+        CHECK_NEAR(res.u, 2.25f, 0.05f);
+        CHECK_NEAR(res.v, -1.5f, 0.05f);
+    }
+}
+
+// Once an iteration has every pixel back on the image, IC-GN must step with
+// the reference Hessian again. It kept the inverse of the last masked
+// Hessian instead. To make that visible, the AoS steepest-descent images
+// (which only the masked branch reads) are scaled by 10, so a masked
+// Hessian is 100x the real one: a full iteration stepping with its inverse
+// moves 1/100 of the way and runs out of iterations.
+TEST_CASE(Engine, MaskedThenFullIteration_MatchesFullOnlyPath) {
+    const auto truth = centered(-60.5f, 0.0f);
+    dictest::SpeckleField field(97, W, H);
+    Image ref = dictest::make_reference_image(field, W, H);
+    Image def = dictest::make_deformed_image(field, W, H, truth);
+
+    SubsetData subset;
+    SubsetPrecomputer::precompute_subset(subset, ref, CX, CY, DIM);
+    REQUIRE(subset.is_initialized);
+
+    OptimizationEngine engine;
+    // Reference: started with every pixel on the image, the full path only.
+    auto full_only = engine.calculate_deformation(subset, def, -60.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                                  0.0f, INIT_NO_SIMPLEX);
+    REQUIRE(full_only.status == 0);
+    // Half-pixel phase 4.5 px from the image edge: the usual 0.02 is too tight.
+    CHECK_NEAR(full_only.u, -60.5f, 0.05f);
+
+    for (auto &sd : subset.steepest_descent_images) sd *= 10.0f;
+    // Started with the left column past the 4 px guard: the first
+    // iterations are masked, the rest are not.
+    auto res = engine.calculate_deformation(subset, def, -62.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                            0.0f, INIT_NO_SIMPLEX);
+    CHECK(res.status == 0);
+    CHECK_NEAR(res.u, full_only.u, 1e-3);
+    CHECK_NEAR(res.v, full_only.v, 1e-3);
+}
+
+// A masked Hessian that is singular in its strain block passes the 2x2
+// translation check. Its inverse was taken anyway, and the step came out
+// huge or NaN -- (int)NaN in the pixel guard is undefined behaviour, and
+// the result carried the garbage out. It must fail as a failure: status 1,
+// finite values, not far from where it started.
+TEST_CASE(Engine, DegenerateMaskedHessian_FailsCleanly) {
+    dictest::SpeckleField field(55, W, H);
+    Image ref = dictest::make_reference_image(field, W, H);
+    Image def = dictest::make_deformed_image(field, W, H, centered(-60.0f, 0.0f));
+
+    SubsetData subset;
+    SubsetPrecomputer::precompute_subset(subset, ref, CX, CY, DIM);
+    REQUIRE(subset.is_initialized);
+    // Column 3 (d/d uy) a copy of column 0 times 2: exactly rank-deficient,
+    // while the translation block is untouched.
+    for (auto &sd : subset.steepest_descent_images) sd(3) = 2.0f * sd(0);
+
+    OptimizationEngine engine;
+    auto res = engine.calculate_deformation(subset, def, -62.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                            0.0f, INIT_NO_SIMPLEX);
+    CHECK(res.status != 0);
+    CHECK(all_finite(res));
+    CHECK(std::fabs(res.u + 62.0f) < 5.0f);
+    CHECK(std::fabs(res.uy) < 0.5f);
 }

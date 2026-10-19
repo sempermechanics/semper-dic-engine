@@ -1,4 +1,6 @@
 #include <semper/subset.hpp>
+#include <semper/tuning.hpp>
+#include "math/hessian.hpp"
 #include "util/log.hpp"
 #include <cmath>
 
@@ -82,7 +84,7 @@ namespace Semper {
                 data.gy_vec[idx] = gy_row[x];
 
                 // 🚀 DICe PARITY: Intensity-only Ghost Wall detection
-                if (int_row[x] >= -5.0f) {
+                if (int_row[x] >= tuning::kGhostWallThreshold) {
                     sum += int_row[x];
                     valid_pixels++;
                 }
@@ -101,7 +103,7 @@ namespace Semper {
 
         for (int i = 0; i < n; ++i) {
             // 🚀 DICe PARITY: Intensity-only check
-            if (data.ref_intensities[i] < -5.0f) continue;
+            if (data.ref_intensities[i] < tuning::kGhostWallThreshold) continue;
             float diff = data.ref_intensities[i] - data.mean_intensity;
             sum_sq_diff += diff * diff;
         }
@@ -140,19 +142,18 @@ namespace Semper {
                 data.sdi_planes[5 * n + idx] = sd(5);
 
                 // 🚀 DICe PARITY: Intensity-only check
-                if (data.ref_intensities[idx] >= -5.0f) {
+                if (data.ref_intensities[idx] >= tuning::kGhostWallThreshold) {
                     H.noalias() += sd * sd.transpose();
                 }
                 idx++;
             }
         }
 
-        float det = H.determinant();
         float det_2x2 = H(0,0)*H(1,1) - H(1,0)*H(0,1);
         float norm_2x2 = H(0,0)*H(0,0) + H(0,1)*H(0,1) + H(1,0)*H(1,0) + H(1,1)*H(1,1);
         float cond_2x2 = (std::abs(det_2x2) > 1e-12f) ? (norm_2x2 / std::abs(det_2x2)) : 1.0e13f;
 
-        if (std::abs(det) < 1e-6f || cond_2x2 > 1.0e12f) {
+        if (cond_2x2 > 1.0e12f || !hessian::well_conditioned(H, half)) {
             data.H_inv = Eigen::Matrix<float, 6, 6>::Zero();
             data.is_initialized = false;
             return;
@@ -189,8 +190,8 @@ namespace Semper {
             for (int ox = 0; ox < dim; ++ox) {
                 // === 🚀 PHASE 2 FIX: UNIFIED GHOST WALL THRESHOLD ===
                 // Previously < 1e-6f, which killed natural black speckles.
-                // The Ghost Wall uses -10.0f. The safe threshold is -5.0f.
-                if (int_row[ox] < -5.0f) continue;
+                // The Ghost Wall uses kGhostWallValue (-10); real black is 0.
+                if (int_row[ox] < tuning::kGhostWallThreshold) continue;
                 // ====================================================
                 sum += int_row[ox];
                 valid_pixels++;
@@ -210,7 +211,7 @@ namespace Semper {
             const float* int_row = &ref_img.intensities[(cy + oy) * ref_img.width + cx - half];
             for (int ox = 0; ox < dim; ++ox) {
                 // 🚀 DICe PARITY: Negative Signature check for the Mask
-                if (int_row[ox] < -5.0f) continue;
+                if (int_row[ox] < tuning::kGhostWallThreshold) continue;
                 float d = int_row[ox] - mean;
                 sum_sq += d * d;
             }
@@ -235,7 +236,7 @@ namespace Semper {
             for (int ox = -half; ox <= half; ++ox) {
                 // === 🚀 PHASE 2 FIX: UNIFIED GHOST WALL THRESHOLD ===
                 // Allow valid black speckles (intensity 0.0) into the Hessian gradients.
-                if (int_row[ox + half] < -5.0f) continue;
+                if (int_row[ox + half] < tuning::kGhostWallThreshold) continue;
                 // ====================================================
 
                 const float gx = gx_row[ox + half] * inv_std;
@@ -261,7 +262,6 @@ namespace Semper {
             for (int c = 0; c < r; ++c)
                 H(r, c) = H(c, r);
 
-        const float det = H.determinant();
         float det_2x2 = H(0,0)*H(1,1) - H(1,0)*H(0,1);
         float norm_2x2 = H(0,0)*H(0,0) + H(0,1)*H(0,1) + H(1,0)*H(1,0) + H(1,1)*H(1,1);
         float cond_2x2 = (std::abs(det_2x2) > 1e-12f) ? (norm_2x2 / std::abs(det_2x2)) : 1.0e13f;
@@ -270,7 +270,7 @@ namespace Semper {
         result.H = H;   // preserve raw Hessian before it is inverted
         // ────────────────────────────────────────────────────────────────────────
 
-        if (std::abs(det) < 1e-6f || cond_2x2 > 1.0e12f) {
+        if (cond_2x2 > 1.0e12f || !hessian::well_conditioned(H, half)) {
             result.H_inv = Eigen::Matrix<float, 6, 6>::Zero();
             result.valid = false;
             return result;

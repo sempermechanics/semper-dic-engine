@@ -2,6 +2,7 @@
 #define SEMPER_SOLVER_HPP
 
 #include <semper/image.hpp>
+#include <semper/tuning.hpp>
 #include <semper/types.hpp>
 
 namespace Semper {
@@ -33,6 +34,12 @@ namespace Semper {
         // Prevents memory aliasing and silent data corruption between the two solvers
         std::vector<float> icgn_buffer;
         std::vector<float> simplex_buffer;
+        // Per-pixel validity of the sample in the matching buffer: 1 when the
+        // warped pixel was inside the interpolation guard and its reference
+        // pixel is not in the Ghost Wall. Validity is where a sample was taken,
+        // never what it read -- 0 is a black pixel, not a missing one.
+        std::vector<unsigned char> icgn_valid;
+        std::vector<unsigned char> simplex_valid;
 
         // 🚀 UPDATED SIGNATURE: Now accepts full 6-DOF guess
         AnalysisResult calculate_deformation(const SubsetData &subset,
@@ -55,7 +62,16 @@ namespace Semper {
 
         float evaluate_znssd(const SubsetData &subset, const Image &def_img, float u,
                              float v, float ux, float uy, float vx, float vy,
-                             std::vector<float> &buffer, const std::vector<bool> *ref_valid_mask = nullptr);
+                             const std::vector<bool> &ref_valid);
+
+        // The one place the deformed image is sampled through a warp, for
+        // IC-GN and the Simplex alike: vals[i] and valid[i] for every subset
+        // pixel, the sum of the valid values in `sum`, and their count as the
+        // return value.
+        int sample_warped_subset(const SubsetData &subset, const Image &def_img,
+                                 const Eigen::Matrix3f &W, const std::vector<bool> &ref_valid,
+                                 std::vector<float> &vals, std::vector<unsigned char> &valid,
+                                 float &sum) const;
         // 🚀 NEW: Centralized mask builder
         // build_ref_valid stays vector<bool> until a measured A/B proves a
         // packed bitmask (or similar) still clears ≥95% of bd44af0 throughput.
@@ -64,7 +80,7 @@ namespace Semper {
             const size_t n = subset.x_offsets.size();
             std::vector<bool> rv(n, true);
             for (size_t i = 0; i < n; ++i) {
-                if (subset.ref_intensities[i] < -5.0f) rv[i] = false;
+                if (subset.ref_intensities[i] < tuning::kGhostWallThreshold) rv[i] = false;
             }
             return rv;
         }

@@ -286,6 +286,9 @@ end-to-end (ICGN, Simplex, auto-search, guards).
 | `LmDampingPreservesWellPosedSolution` | LM damping (α=1e-3) doesn't shift a good solution | LM applied to wrong DOFs or damping leaking into the answer |
 | `RepeatSolve_BitIdentical` | The same solve twice is bit-identical | Threading race, uninitialized buffer, or run-to-run nondeterminism |
 | `SuccessfulSolve_CorrelationNonNegative` | Successful solves report ZNSSD ≥ 0 | Sentinel contract broken — the JNI layer marks failed/skipped points with `CORR_INVALID = -1`, so a real score must never be negative |
+| `SaturatedBlackSpeckle_Converges` | A subset with > 10% pixels saturated to exactly 0 converges with both interpolators (0.05 px: the clip is a kink no cubic reproduces) | Validity is read off the sample value again: before v0.5.0 every sample not > 0 was dropped as if off the image, the 4×4 path failed the 90% guard and the 6×6 one solved on the masked path |
+| `MaskedThenFullIteration_MatchesFullOnlyPath` | After iterations that lost pixels, a full iteration steps with the reference Hessian again (made visible by scaling the AoS images only the masked branch reads) | The masked inverse is reused for the rest of the call |
+| `DegenerateMaskedHessian_FailsCleanly` | A masked Hessian singular in its strain block (translation block fine) ends in status 1 with finite values near the start | Its inverse is taken anyway and Inf/NaN reaches the warp, the `(int)` pixel guard and the result |
 
 ## Suite: `DiceTranslationSynthetic` — `dice/test_translation_synthetic.cpp`
 
@@ -345,7 +348,7 @@ Interpolation ladder + gradients + blur, validated via mathematical identities
 | `InterpolatorsExactOnLinearRamp` | Catmull-Rom & Keys reproduce degree-1 polynomials exactly at any sub-pixel position |
 | `GradientOfLinearRampIsExactSlope` | 5-point central difference is exact for degree ≤ 4 |
 | `BlurPreservesConstantImage` | Normalized kernel ⇒ constant in = constant out |
-| `BilinearOutOfBoundsReturnsZero` | The `0.0f` dead-pixel sentinel contract that ICGN's `val > 0` guard relies on |
+| `BilinearOutOfBoundsReturnsZero` | Bilinear returns `0.0f` outside its support (IC-GN's 4 px guard keeps it from ever being sampled there; validity is not read from values) |
 | `BoundaryDemotionLadderIsContinuousInRange` | 6×6→bilinear and 4×4→bilinear demotion never extrapolates outside [0,255] |
 
 ## Suite: `SubsetPrecomputer` — `unit/test_subset_precomputer.cpp`
@@ -358,6 +361,8 @@ Interpolation ladder + gradients + blur, validated via mathematical identities
 | `HessianIsSymmetricAndInverseIsValid` | `H = Hᵀ` and `H·H⁻¹ ≈ I` |
 | `RejectsSubsetOffImageBoundary` | Boundary subsets → `is_initialized == false` (never solved) |
 | `FastPathMatchesFullPrecompute` | `compute_hessian_only` + `precompute_subset_fast` ≡ full `precompute_subset` — the batch pipeline treats them as interchangeable |
+| `LargeSubset_HinvFinite` | A 301 px subset is accepted and `H·H⁻¹ ≈ I` with a finite inverse | The conditioning test overflows with subset size again (the old `\|det H\|` did past ~170 px) |
+| `IllConditioned_Rejected` | Vertical stripes (2×2 check) and a pattern symmetric about the subset centre, which cannot see rotation, are rejected at 21 and 201 px. The second had `det H` of +1e9 to +8e16 and was accepted with a meaningless inverse before v0.5.0 | The 6×6 Hessian is no longer checked as a whole (`hessian::well_conditioned`, `tuning::kHessianMinRcond`) |
 | `EvenDimRejected` | An even, zero, one or negative `dim` gives an uninitialized subset from all three functions, even with a valid pool entry. Before v0.5.0 an even `dim` wrote `(dim+1)²` values into `dim²` buffers (heap overflow under ASan) |
 
 ## Suite: `Strain` — `unit/test_strain_calculator.cpp`

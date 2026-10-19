@@ -15,6 +15,11 @@
 #include "framework/synthetic.h"
 #include <semper/subset.hpp>
 
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <vector>
+
 using Semper::Image;
 using Semper::SubsetData;
 using Semper::SubsetPrecomputer;
@@ -180,4 +185,63 @@ TEST_CASE(SubsetPrecomputer, FastPathMatchesFullPrecompute) {
     for (int r = 0; r < 6; ++r)
         for (int c = 0; c < 6; ++c)
             CHECK_REL(fast.H_inv(r, c), full.H_inv(r, c), 5e-3);
+}
+
+// The conditioning test used to be |det H| < 1e-6, and det H scales with the
+// subset: the four gradient rows and columns grow as (dim/2)^2. A singular
+// Hessian's rounding noise alone cleared the floor by twenty orders of
+// magnitude, and past ~170 px a healthy one overflowed float. It is now an
+// rcond estimate with those rows and columns divided by dim/2.
+TEST_CASE(SubsetPrecomputer, LargeSubset_HinvFinite) {
+    dictest::SpeckleField field(5, 320, 320);
+    const Image img = dictest::make_reference_image(field, 320, 320);
+    SubsetData data;
+    SubsetPrecomputer::precompute_subset(data, img, 160, 160, 301);
+    REQUIRE(data.is_initialized);
+    for (int r = 0; r < 6; ++r)
+        for (int c = 0; c < 6; ++c) CHECK(std::fabs(data.H_inv(r, c)) < 1e30f);
+    const Eigen::Matrix<float, 6, 6> prod = data.H * data.H_inv;
+    for (int r = 0; r < 6; ++r)
+        for (int c = 0; c < 6; ++c)
+            CHECK_NEAR(prod(r, c), (r == c) ? 1.0f : 0.0f, 5e-2);
+}
+
+TEST_CASE(SubsetPrecomputer, IllConditioned_Rejected) {
+    // Vertical stripes: no y gradient, so the v and every d/dy column of the
+    // steepest-descent images vanish. The 2x2 translation check catches it.
+    {
+        const int w = 96, h = 96;
+        std::vector<uint8_t> zero((size_t)w * h, 0);
+        Image img(w, h, zero.data());
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x)
+                img.intensities[(size_t)y * w + x] = 128.0f + 80.0f * std::sin(x * 0.7f);
+        img.prepare_data(false);
+        SubsetData data;
+        SubsetPrecomputer::precompute_subset(data, img, 48, 48, 21);
+        CHECK(!data.is_initialized);
+        CHECK(!SubsetPrecomputer::compute_hessian_only(img, 48, 48, 21).valid);
+    }
+    // A pattern symmetric about the subset centre cannot see a rotation about
+    // it: on x^2 + y^2 the 5-point gradients are exact, gx*y == gy*x at every
+    // pixel, and the d/dy-of-u and d/dx-of-v columns coincide. The translation
+    // block is perfectly conditioned, so only the full 6x6 test can catch it;
+    // det H came out at +1e9 (21 px) to +8e16 (201 px), or negative, and the
+    // subset was accepted with a meaningless inverse.
+    for (int dim : {21, 201}) {
+        const int w = dim + 40, h = dim + 40, c = w / 2;
+        const float k = 0.3f * (41.0f / dim) * (41.0f / dim);
+        std::vector<uint8_t> zero((size_t)w * h, 0);
+        Image img(w, h, zero.data());
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                const float dx = (float)(x - c), dy = (float)(y - c);
+                img.intensities[(size_t)y * w + x] = k * (dx * dx + dy * dy);
+            }
+        img.prepare_data(false);
+        SubsetData data;
+        SubsetPrecomputer::precompute_subset(data, img, c, c, dim);
+        CHECK(!data.is_initialized);
+        CHECK(!SubsetPrecomputer::compute_hessian_only(img, c, c, dim).valid);
+    }
 }

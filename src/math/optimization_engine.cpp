@@ -1,6 +1,7 @@
 #include <semper/solver.hpp>
 #include <semper/simd.hpp>
 #include <semper/tuning.hpp>
+#include "math/hessian.hpp"
 #include "util/log.hpp"
 #include <algorithm>
 #include <chrono>
@@ -17,6 +18,8 @@ namespace Semper {
         if (simplex_buffer.size() != subset.x_offsets.size()) {
             simplex_buffer.resize(subset.x_offsets.size());
         }
+        icgn_valid.resize(subset.x_offsets.size());
+        simplex_valid.resize(subset.x_offsets.size());
 
         AnalysisResult res;
 
@@ -86,6 +89,129 @@ namespace Semper {
         }
     }
 
+    namespace {
+
+        // DICe's explicit 4-pixel guard, with its rounding: the pixel a warped
+        // point rounds to must be at least 4 px inside the image. Written on
+        // floats -- the old (int) casts were undefined for a NaN or huge
+        // warp -- and exactly equivalent for every finite point below 2^23:
+        // for x >= 0 the rounded pixel is floor(x + 0.5), and x + 0.5f is exact.
+        inline bool inside_guard(float x, float y, int width, int height) {
+            const float rx = x + 0.5f, ry = y + 0.5f;
+            return rx >= 4.0f && rx < (float)(width - 4) &&
+                   ry >= 4.0f && ry < (float)(height - 4);
+        }
+
+        Eigen::Matrix3f warp_matrix(float u, float v, float ux, float uy, float vx, float vy) {
+            Eigen::Matrix3f W = Eigen::Matrix3f::Identity();
+            W(0, 0) = 1.0f + ux;
+            W(0, 1) = uy;
+            W(0, 2) = u;
+            W(1, 0) = vx;
+            W(1, 1) = 1.0f + vy;
+            W(1, 2) = v;
+            return W;
+        }
+
+        AnalysisResult result_from(const Eigen::Matrix3f &W, int status, float score, int iters,
+                                   int invalid_ref_pixels) {
+            AnalysisResult r = {W(0, 2), W(1, 2), W(0, 0) - 1.0f, W(0, 1), W(1, 0), W(1, 1) - 1.0f,
+                                status, score, iters};
+            r.invalid_ref_pixels = invalid_ref_pixels;
+            return r;
+        }
+
+    } // namespace
+
+    // Batches interpolation 4 pixels at a time via interpolate_keys_fourth_x4
+    // / interpolate_bicubic_x4 when 4 consecutive pixels are available and all
+    // pass the guard — those _x4 functions do the identical per-lane
+    // arithmetic in the identical order interpolate_keys_fourth /
+    // interpolate_bicubic would (see image.hpp), so this changes no single
+    // pixel's interpolated value, only how many are computed per call. Any
+    // pixel that can't be batched (guard failure in the group, or fewer than
+    // 4 pixels left) falls back to the one-at-a-time scalar call — same
+    // function, same result. `sum` accumulates in i = 0..n-1 order either way.
+    int OptimizationEngine::sample_warped_subset(const SubsetData &subset, const Image &def_img,
+                                                 const Eigen::Matrix3f &W,
+                                                 const std::vector<bool> &ref_valid,
+                                                 std::vector<float> &vals,
+                                                 std::vector<unsigned char> &valid,
+                                                 float &sum) const {
+        const size_t n = subset.x_offsets.size();
+        int count = 0;
+        sum = 0.0f;
+        size_t i = 0;
+        while (i < n) {
+            float x = subset.x_offsets_f[i];
+            float y = subset.y_offsets_f[i];
+            float final_x = subset.cx + W(0, 0) * x + W(0, 1) * y + W(0, 2);
+            float final_y = subset.cy + W(1, 0) * x + W(1, 1) * y + W(1, 2);
+
+            if (!inside_guard(final_x, final_y, def_img.width, def_img.height)) {
+                vals[i] = 0.0f;
+                valid[i] = 0;
+                ++i;
+                continue;
+            }
+
+            bool batched = false;
+            if (i + 4 <= n) {
+                float fx[4] = {final_x, 0.0f, 0.0f, 0.0f};
+                float fy[4] = {final_y, 0.0f, 0.0f, 0.0f};
+                bool group_ok = true;
+                for (int k = 1; k < 4; ++k) {
+                    size_t idx = i + static_cast<size_t>(k);
+                    float xk = subset.x_offsets_f[idx];
+                    float yk = subset.y_offsets_f[idx];
+                    float fxk = subset.cx + W(0, 0) * xk + W(0, 1) * yk + W(0, 2);
+                    float fyk = subset.cy + W(1, 0) * xk + W(1, 1) * yk + W(1, 2);
+                    if (!inside_guard(fxk, fyk, def_img.width, def_img.height)) {
+                        group_ok = false;
+                        break;
+                    }
+                    fx[k] = fxk;
+                    fy[k] = fyk;
+                }
+
+                if (group_ok) {
+                    float v4[4];
+                    if (use_6x6_interpolator) {
+                        def_img.interpolate_keys_fourth_x4(fx, fy, v4);
+                    } else {
+                        def_img.interpolate_bicubic_x4(fx, fy, v4);
+                    }
+                    for (int k = 0; k < 4; ++k) {
+                        size_t idx = i + static_cast<size_t>(k);
+                        vals[idx] = v4[k];
+                        // DICe LAYER 2: only pixels valid in the reference mask too.
+                        valid[idx] = ref_valid[idx] ? 1 : 0;
+                        if (valid[idx]) {
+                            sum += v4[k];
+                            count++;
+                        }
+                    }
+                    i += 4;
+                    batched = true;
+                }
+            }
+
+            if (!batched) {
+                float val = use_6x6_interpolator ?
+                            def_img.interpolate_keys_fourth(final_x, final_y) :
+                            def_img.interpolate_bicubic(final_x, final_y);
+                vals[i] = val;
+                valid[i] = ref_valid[i] ? 1 : 0;
+                if (valid[i]) {
+                    sum += val;
+                    count++;
+                }
+                ++i;
+            }
+        }
+        return count;
+    }
+
     // --- PURE ICGN SOLVER ---
     AnalysisResult OptimizationEngine::solve_icgn(const SubsetData &subset,
                                                   const Image &def_img,
@@ -93,23 +219,21 @@ namespace Semper {
                                                   float init_ux, float init_uy,
                                                   float init_vx, float init_vy) {
         size_t n = subset.x_offsets.size();
+        const int half = subset.dim / 2;
 
         // 🚀 Form the initial shape matrix properly using the 6-DOF inputs!
-        Eigen::Matrix3f W = Eigen::Matrix3f::Identity();
-        W(0, 0) = 1.0f + init_ux;
-        W(0, 1) = init_uy;
-        W(0, 2) = init_u;
-        W(1, 0) = init_vx;
-        W(1, 1) = 1.0f + init_vy;
-        W(1, 2) = init_v;
+        Eigen::Matrix3f W = warp_matrix(init_u, init_v, init_ux, init_uy, init_vx, init_vy);
         // ── LM ADDITION ─────────────────────────────────────────────────────────
-        // Precompute the matrix to use for the Newton step ONCE, before the loop.
+        // The step matrix for an iteration that sees the whole subset, fixed
+        // for the call. An iteration that loses pixels steps with its own
+        // masked Hessian instead, and the next full iteration is back on this
+        // one (it used to keep the masked inverse for the rest of the call).
         //
         // When LM is disabled (lm_enabled == false OR lm_alpha == 0):
-        //   H_solve = subset.H_inv   ← identical to the original code path.
+        //   H_ref_solve = subset.H_inv   ← identical to the original code path.
         //
         // When LM is enabled:
-        //   H_solve = (H + diag([α, α, 0, 0, 0, 0]))⁻¹
+        //   H_ref_solve = (H + diag([α, α, 0, 0, 0, 0]))⁻¹
         //   This exactly replicates DICe's computeUpdateFast:
         //     H(0,0) += alpha;   // u translation DOF
         //     H(1,1) += alpha;   // v translation DOF
@@ -119,8 +243,7 @@ namespace Semper {
         // for all iterations of this call. Cost: one 6×6 inversion per
         // calculate_deformation call, not per iteration.
         // ────────────────────────────────────────────────────────────────────────
-        Eigen::Matrix<float, 6, 6> H_solve;
-
+        Eigen::Matrix<float, 6, 6> H_ref_solve = subset.H_inv;
         if (lm_enabled && lm_alpha > 0.0f) {
             // Copy the raw (undamped) Hessian stored at precompute time.
             Eigen::Matrix<float, 6, 6> H_damped = subset.H;
@@ -129,20 +252,14 @@ namespace Semper {
             H_damped(0, 0) += lm_alpha;
             H_damped(1, 1) += lm_alpha;
 
-            const float det = H_damped.determinant();
-            if (std::abs(det) < 1e-6f) {
-                // Damped matrix is still singular — fall back to the
-                // pre-inverted H_inv so the point at least attempts a step.
-                H_solve = subset.H_inv;
-            } else {
-                H_solve = H_damped.inverse();
-            }
-        } else {
-            // LM disabled: identical to original behaviour.
-            H_solve = subset.H_inv;
+            // Damping only adds to the diagonal, so this practically always
+            // holds; if it does not, fall back to the pre-inverted H_inv so
+            // the point at least attempts a step.
+            if (hessian::well_conditioned(H_damped, half)) H_ref_solve = H_damped.inverse();
         }
         // ── END LM ADDITION ─────────────────────────────────────────────────────
         std::vector<float> &def_vals = this->icgn_buffer;
+        std::vector<unsigned char> &valid = this->icgn_valid;
         float final_score = 1.0f;
         int max_iter = tuning::kIcgnMaxIter;
 
@@ -150,122 +267,32 @@ namespace Semper {
         std::vector<bool> ref_valid = build_ref_valid(subset);
         // invalid_ref_pixels is a pure function of ref_valid — the same count at
         // every return site below regardless of iteration/convergence outcome.
-        // Computed once here instead of re-summed at each of the 5 returns.
         int invalid_ref_count = 0;
         for (size_t k = 0; k < n; ++k) { if (!ref_valid[k]) invalid_ref_count++; }
+        // Every rejection reports where the warp stood when it was rejected,
+        // with the 2.0 sentinel score.
+        auto reject = [&](int iters) { return result_from(W, 1, 2.0f, iters, invalid_ref_count); };
+
         for (int iter = 0; iter < max_iter; ++iter) {
+            // 1. Affine warp & interpolation (shared with the Simplex).
             float def_sum = 0.0f;
-            int valid_pixels = 0;
-
-            // 1. Unrolled Affine Warp & Interpolation
-            //
-            // Batches interpolation 4 pixels at a time via interpolate_keys_fourth_x4
-            // / interpolate_bicubic_x4 when 4 consecutive pixels are available and all
-            // pass their own px/py guard — those _x4 functions do the identical
-            // per-lane arithmetic in the identical order interpolate_keys_fourth /
-            // interpolate_bicubic would (see image.hpp), so this changes no single
-            // pixel's interpolated value, only how many are computed per call. Any
-            // pixel that can't be batched (guard failure in the group, or fewer than
-            // 4 pixels left) falls back to the original one-at-a-time scalar call —
-            // same function, same result, just not batched. def_sum/valid_pixels
-            // accumulate in the same i=0..n-1 order either way.
-            size_t i = 0;
-            while (i < n) {
-                float x = subset.x_offsets_f[i];
-                float y = subset.y_offsets_f[i];
-                float final_x = subset.cx + W(0, 0) * x + W(0, 1) * y + W(0, 2);
-                float final_y = subset.cy + W(1, 0) * x + W(1, 1) * y + W(1, 2);
-
-                // 🚀 DICe PARITY: Explicit 4-Pixel Guard (WITH ROUNDING)
-                int px = ((int)(final_x + 0.5f) == (int)(final_x)) ? (int)(final_x) : (int)(final_x) + 1;
-                int py = ((int)(final_y + 0.5f) == (int)(final_y)) ? (int)(final_y) : (int)(final_y) + 1;
-                if (px < 4 || px >= def_img.width - 4 ||
-                    py < 4 || py >= def_img.height - 4) {
-                    def_vals[i] = -1.0f;
-                    ++i;
-                    continue;
-                }
-
-                bool batched = false;
-                if (i + 4 <= n) {
-                    float fx[4] = {final_x, 0.0f, 0.0f, 0.0f};
-                    float fy[4] = {final_y, 0.0f, 0.0f, 0.0f};
-                    bool group_ok = true;
-                    for (int k = 1; k < 4; ++k) {
-                        size_t idx = i + static_cast<size_t>(k);
-                        float xk = subset.x_offsets_f[idx];
-                        float yk = subset.y_offsets_f[idx];
-                        float fxk = subset.cx + W(0, 0) * xk + W(0, 1) * yk + W(0, 2);
-                        float fyk = subset.cy + W(1, 0) * xk + W(1, 1) * yk + W(1, 2);
-                        int pxk = ((int)(fxk + 0.5f) == (int)(fxk)) ? (int)(fxk) : (int)(fxk) + 1;
-                        int pyk = ((int)(fyk + 0.5f) == (int)(fyk)) ? (int)(fyk) : (int)(fyk) + 1;
-                        if (pxk < 4 || pxk >= def_img.width - 4 || pyk < 4 || pyk >= def_img.height - 4) {
-                            group_ok = false;
-                            break;
-                        }
-                        fx[k] = fxk;
-                        fy[k] = fyk;
-                    }
-
-                    if (group_ok) {
-                        float vals[4];
-                        if (use_6x6_interpolator) {
-                            def_img.interpolate_keys_fourth_x4(fx, fy, vals);
-                        } else {
-                            def_img.interpolate_bicubic_x4(fx, fy, vals);
-                        }
-                        for (int k = 0; k < 4; ++k) {
-                            size_t idx = i + static_cast<size_t>(k);
-                            float val = vals[k];
-                            // DICe LAYER 2: The Mask-Aware Drop — only accept pixels
-                            // valid in both the reference mask and the deformed image.
-                            if (val > 0.0f && ref_valid[idx]) {
-                                def_vals[idx] = val;
-                                def_sum += val;
-                                valid_pixels++;
-                            } else {
-                                def_vals[idx] = -1.0f;
-                            }
-                        }
-                        i += 4;
-                        batched = true;
-                    }
-                }
-
-                if (!batched) {
-                    float val = use_6x6_interpolator ?
-                                def_img.interpolate_keys_fourth(final_x, final_y) :
-                                def_img.interpolate_bicubic(final_x, final_y);
-
-                    // DICe LAYER 2: The Mask-Aware Drop
-                    // Only accept pixels that are physically valid in BOTH the reference mask and the deformed image
-                    if (val > 0.0f && ref_valid[i]) {
-                        def_vals[i] = val;
-                        def_sum += val;
-                        valid_pixels++;
-                    } else {
-                        def_vals[i] = -1.0f;
-                    }
-                    ++i;
-                }
-            }
+            const int valid_pixels = sample_warped_subset(subset, def_img, W, ref_valid,
+                                                          def_vals, valid, def_sum);
 
             // === 🚀 PHASE 3 FIX: GUARD DIVISION BY ZERO ===
             // If the entire subset is dragged off the image (e.g., at high strain),
             // valid_pixels becomes 0. We must abort BEFORE the division to prevent
             // a NaN injection that destroys the Newton-Raphson matrix.
             // DICe PARITY: 90% survival threshold.
-            if (valid_pixels < static_cast<int>(n * 0.90f)) {
-                AnalysisResult res = {W(0, 2), W(1, 2), W(0, 0) - 1.0f, W(0, 1), W(1, 0), W(1, 1) - 1.0f, 1, 2.0f, iter};
-                res.invalid_ref_pixels = invalid_ref_count;
-                return res;
-            }
+            if (valid_pixels < static_cast<int>(n * 0.90f)) return reject(iter);
 
             float def_mean = def_sum / static_cast<float>(valid_pixels);
             // ==============================================
             float def_sum_sq = 0.0f;
             Eigen::Matrix<float, 6, 1> dp_sum = Eigen::Matrix<float, 6, 1>::Zero();
             float error_sum_sq = 0.0f;
+            Eigen::Matrix<float, 6, 6> H_masked_solve;
+            const Eigen::Matrix<float, 6, 6> *H_step = &H_ref_solve;
 
             // 🚀 FAST-PATH: All pixels are safely inside the image boundaries.
             // Portable SIMD kernels — one codepath compiled to NEON on ARM
@@ -290,7 +317,7 @@ namespace Semper {
             } else {
                 Eigen::Matrix<float, 6, 6> H_dynamic = Eigen::Matrix<float, 6, 6>::Zero();
                 for (size_t i = 0; i < n; ++i) {
-                    if (def_vals[i] >= 0.0f) {
+                    if (valid[i]) {
                         float diff = def_vals[i] - def_mean;
                         def_sum_sq += diff * diff;
                     }
@@ -301,7 +328,7 @@ namespace Semper {
                 float inv_std = 1.0f / def_std;
 
                 for (size_t i = 0; i < n; ++i) {
-                    if (def_vals[i] >= 0.0f) {
+                    if (valid[i]) {
                         float norm_def = (def_vals[i] - def_mean) * inv_std;
                         float diff = subset.norm_ref_intensities[i] - norm_def;
                         error_sum_sq += diff * diff;
@@ -315,20 +342,23 @@ namespace Semper {
                 float norm_2x2 = H_dynamic(0,0)*H_dynamic(0,0) + H_dynamic(0,1)*H_dynamic(0,1) + H_dynamic(1,0)*H_dynamic(1,0) + H_dynamic(1,1)*H_dynamic(1,1);
                 float cond_2x2 = (std::abs(det_2x2) > 1e-12f) ? (norm_2x2 / std::abs(det_2x2)) : 1.0e13f;
 
-                if (cond_2x2 > 1.0e12f) {
-                    return {W(0, 2), W(1, 2), W(0, 0) - 1.0f, W(0, 1), W(1, 0), W(1, 1) - 1.0f, 1, 2.0f, iter};
-                }
+                if (cond_2x2 > 1.0e12f) return reject(iter);
 
                 if (lm_enabled && lm_alpha > 0.0f) {
                     H_dynamic(0, 0) += lm_alpha;
                     H_dynamic(1, 1) += lm_alpha;
                 }
-                H_solve = H_dynamic.inverse();
+                // The 2x2 check sees only the translation block; a masked
+                // Hessian can still be singular in its strain block, and its
+                // inverse is then Inf/NaN.
+                if (!hessian::well_conditioned(H_dynamic, half)) return reject(iter);
+                H_masked_solve = H_dynamic.inverse();
+                H_step = &H_masked_solve;
             }
 
             final_score = error_sum_sq / valid_pixels;
 
-            Eigen::Matrix<float, 6, 1> delta_p = -H_solve     * dp_sum;
+            Eigen::Matrix<float, 6, 1> delta_p = -(*H_step) * dp_sum;
             Eigen::Matrix3f dW = Eigen::Matrix3f::Identity();
             dW(0, 0) += delta_p(2);
             dW(0, 1) += delta_p(3);
@@ -337,7 +367,14 @@ namespace Semper {
             dW(1, 1) += delta_p(5);
             dW(1, 2) += delta_p(1);
 
-            W = W * dW.inverse();
+            // The inverse-compositional update needs dW invertible, and a
+            // non-finite step must never reach W: stop on the last good warp.
+            const float det_dW = dW(0, 0) * dW(1, 1) - dW(0, 1) * dW(1, 0);
+            if (!hessian::all_finite_bits(delta_p) || !(std::abs(det_dW) > 1e-6f))
+                return reject(iter + 1);
+            const Eigen::Matrix3f W_next = W * dW.inverse();
+            if (!hessian::all_finite_bits(W_next)) return reject(iter + 1);
+            W = W_next;
 
             if (delta_p.norm() < 0.001f) {
                 // 🚀 DICe PARITY: Post-Match Sigma (Texture) Check
@@ -347,7 +384,7 @@ namespace Semper {
 
                 for (size_t k = 0; k < n; ++k) {
                     // Skip pixels that hit the Ghost Wall (mask) OR the Out-of-Bounds guard
-                    if (!ref_valid[k] || def_vals[k] < 0.0f) continue;
+                    if (!valid[k]) continue;
 
                     // Access the un-normalized gradients stored during pre-computation
                     sum_gx_sq += subset.gx_vec[k] * subset.gx_vec[k];
@@ -356,75 +393,32 @@ namespace Semper {
                 }
 
                 // 🚀 DICe 100% Deactivation Check
-                if (valid_survivors == 0) {
-                    AnalysisResult res = {W(0, 2), W(1, 2), W(0, 0) - 1.0f, W(0, 1), W(1, 0), W(1, 1) - 1.0f, 1, 2.0f, iter + 1};
-                    res.invalid_ref_pixels = invalid_ref_count;
-                    return res;
-                }
+                if (valid_survivors == 0) return reject(iter + 1);
 
                 // 🚀 DICe Minimum Gradient Check (The Barcode Killer)
+                // Reject: surviving pixels lack 2D physical texture (sigma returns -1.0 in DICe)
                 float sum_grad = std::min(sum_gx_sq, sum_gy_sq);
+                if (sum_grad <= 0.0f) return reject(iter + 1);
 
-                if (sum_grad <= 0.0f) {
-                    // Reject: Surviving pixels lack 2D physical texture (sigma returns -1.0 in DICe)
-                    AnalysisResult res = {W(0, 2), W(1, 2), W(0, 0) - 1.0f, W(0, 1), W(1, 0), W(1, 1) - 1.0f, 1, 2.0f, iter + 1};
-                    res.invalid_ref_pixels = invalid_ref_count;
-                    return res;
-                }
-
-                AnalysisResult res = {W(0, 2), W(1, 2), W(0, 0) - 1.0f, W(0, 1), W(1, 0), W(1, 1) - 1.0f, 0, final_score, iter + 1};
-                res.invalid_ref_pixels = invalid_ref_count;
-                return res;
+                if (!hessian::finite_bits(final_score)) return reject(iter + 1);
+                return result_from(W, 0, final_score, iter + 1, invalid_ref_count);
             }
         }
 
-        AnalysisResult res = {W(0, 2), W(1, 2), W(0, 0) - 1.0f, W(0, 1), W(1, 0), W(1, 1) - 1.0f, 1, final_score, max_iter};
-        res.invalid_ref_pixels = invalid_ref_count;
-        return res;
+        return result_from(W, 1, final_score, max_iter, invalid_ref_count);
     }
 
     float OptimizationEngine::evaluate_znssd(const SubsetData &subset,
                                              const Image &def_img, float u, float v,
                                              float ux, float uy, float vx, float vy,
-                                             std::vector<float> &buffer,
-                                             const std::vector<bool> *ref_valid_mask) {
+                                             const std::vector<bool> &ref_valid) {
         size_t n = subset.x_offsets.size();
+        std::vector<float> &buffer = this->simplex_buffer;
+        std::vector<unsigned char> &valid = this->simplex_valid;
         float def_mean = 0.0f;
-        int valid_pixels = 0;
-
-        for (size_t i = 0; i < n; ++i) {
-            // 🚀 Ghost Wall exclusion: skip pixels that are void in reference
-            if (ref_valid_mask && !(*ref_valid_mask)[i]) {
-                buffer[i] = -1.0f;
-                continue;
-            }
-
-            float dx = subset.x_offsets_f[i];
-            float dy = subset.y_offsets_f[i];
-
-            float final_x = subset.cx + u + (1.0f + ux) * dx + uy * dy;
-            float final_y = subset.cy + v + vx * dx + (1.0f + vy) * dy;
-
-            // 🚀 DICe PARITY: Explicit 4-Pixel Guard (WITH ROUNDING)
-            int px = ((int)(final_x + 0.5f) == (int)(final_x)) ? (int)(final_x) : (int)(final_x) + 1;
-            int py = ((int)(final_y + 0.5f) == (int)(final_y)) ? (int)(final_y) : (int)(final_y) + 1;
-            if (px < 4 || px >= def_img.width - 4 ||
-                py < 4 || py >= def_img.height - 4) {
-                buffer[i] = -1.0f;
-                continue;
-            }
-
-            float val = use_6x6_interpolator ?
-                        def_img.interpolate_keys_fourth(final_x, final_y) :
-                        def_img.interpolate_bicubic(final_x, final_y);
-            if (val >= 0.0f) {
-                buffer[i] = val;
-                def_mean += val;
-                valid_pixels++;
-            } else {
-                buffer[i] = -1.0f;
-            }
-        }
+        const int valid_pixels = sample_warped_subset(subset, def_img,
+                                                      warp_matrix(u, v, ux, uy, vx, vy),
+                                                      ref_valid, buffer, valid, def_mean);
 
         // === 🚀 PHASE 3 FIX: GUARD ZNSSD DIVISION BY ZERO ===
         if (valid_pixels == 0) {
@@ -448,7 +442,7 @@ namespace Semper {
                                     n, def_mean, inv_std);
         } else {
             for (size_t i = 0; i < n; ++i) {
-                if (buffer[i] >= 0.0f) {
+                if (valid[i]) {
                     float diff = buffer[i] - def_mean;
                     def_sum_sq += diff * diff;
                 }
@@ -458,7 +452,7 @@ namespace Semper {
                 def_std = 1.0f;
 
             for (size_t i = 0; i < n; ++i) {
-                if (buffer[i] >= 0.0f) {
+                if (valid[i]) {
                     float norm_def = (buffer[i] - def_mean) / def_std;
                     float diff = subset.norm_ref_intensities[i] - norm_def;
                     znssd += diff * diff;
@@ -466,7 +460,10 @@ namespace Semper {
             }
         }
 
-        return znssd / valid_pixels;
+        const float score = znssd / valid_pixels;
+        // A NaN score would compare false against everything and stall the
+        // Simplex ordering; make it the worst instead.
+        return hessian::finite_bits(score) ? score : 2.0f;
     }
 
 // --- SIMPLEX RESCUE METHOD ---
@@ -487,9 +484,9 @@ namespace Semper {
         auto eval_pt = [&](const float *pt) {
             if (translation_only)
                 return evaluate_znssd(subset, def_img, pt[0], pt[1], 0.0f, 0.0f, 0.0f,
-                                      0.0f, this->simplex_buffer, &ref_valid);
+                                      0.0f, ref_valid);
             return evaluate_znssd(subset, def_img, pt[0], pt[1], pt[2], pt[3], pt[4],
-                                  pt[5], this->simplex_buffer, &ref_valid);
+                                  pt[5], ref_valid);
         };
 
         p[0][0] = start.u;
