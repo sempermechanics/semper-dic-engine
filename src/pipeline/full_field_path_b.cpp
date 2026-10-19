@@ -101,21 +101,14 @@ void solve_cell(const SolveContext& ctx, OptimizationEngine& engine, SubsetData&
     const FullFieldParams& params = ctx.params;
     const int flat = t.y * ctx.gridW + t.x;
     const int realX = params.rect_x + t.x * params.step, realY = params.rect_y + t.y * params.step;
-
-    auto th1 = std::chrono::high_resolution_clock::now();
-    SubsetPrecomputer::precompute_subset_fast(subset, *ctx.cache.ref_img, realX, realY, params.subset_size, ctx.hessian_pool[flat]);
-    t.hessian_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - th1).count();
-    t.initialized = subset.is_initialized;
-    if (!t.initialized) return;
-
-    const int simplex_count_before = engine.count_simplex;
-    auto search_flag = ALLOW_SIMPLEX_RESCUE ? INIT_NO_SEARCH : INIT_NO_SIMPLEX;
-    t.res = engine.calculate_deformation(subset, ctx.def_img, t.gu, t.gv, t.gux, t.guy, t.gvx, t.gvy, search_flag);
-    // Matters more here than on Path A: an accepted cell seeds every point
-    // that floods out from it, so a subset sitting in the mask must not pass.
-    reject_if_ghosted(t.res, params.subset_size);
-    t.needed_rescue = (engine.count_simplex > simplex_count_before);
-    if (!ALLOW_SIMPLEX_RESCUE && t.res.status != 0) { t.res.correlation_score = 1.0f; }
+    const float guess[6] = {t.gu, t.gv, t.gux, t.guy, t.gvx, t.gvy};
+    const NodeSolve node = solve_node(engine, subset, *ctx.cache.ref_img, ctx.def_img, realX, realY,
+                                      params.subset_size, ctx.hessian_pool[flat], guess,
+                                      INIT_NO_SEARCH);
+    t.hessian_ms = node.hessian_ms;
+    t.initialized = node.initialized;
+    t.needed_rescue = node.needed_rescue;
+    if (t.initialized) t.res = node.res;
 }
 
 // Serial: record one solved cell in the grid, the stats and the queue.
@@ -237,14 +230,9 @@ void run_path_b(
     // solves. calculate_deformation and precompute_subset_fast overwrite all
     // they read, so which worker solves a cell cannot change its result (Path
     // A relies on the same property under schedule(dynamic)).
-    std::vector<OptimizationEngine> engines(safe_cores);
+    std::vector<OptimizationEngine> engines((size_t)safe_cores,
+                                           make_engine(params.use_6x6_interpolator));
     SubsetPool subsets(safe_cores);
-    for (auto& e : engines) {
-        // 🚀 ENABLE LEVENBERG-MARQUARDT - PATH B
-        e.lm_enabled = true;
-        e.lm_alpha = tuning::kLmAlpha; // <--- TUNE THIS VALUE
-        e.use_6x6_interpolator = params.use_6x6_interpolator;
-    }
     struct StatsFlush {
         std::vector<OptimizationEngine>& engines; std::vector<ThreadStats>& stats;
         ~StatsFlush() {

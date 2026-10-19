@@ -360,7 +360,7 @@ Interpolation ladder + gradients + blur, validated via mathematical identities
 | `SteepestDescentImagesFollowDefinition` | `sd = [gx, gy, gx·x, gx·y, gy·x, gy·y]/σ` at spot-checked pixels |
 | `HessianIsSymmetricAndInverseIsValid` | `H = Hᵀ` and `H·H⁻¹ ≈ I` |
 | `RejectsSubsetOffImageBoundary` | Boundary subsets → `is_initialized == false` (never solved) |
-| `FastPathMatchesFullPrecompute` | `compute_hessian_only` + `precompute_subset_fast` ≡ full `precompute_subset` — the batch pipeline treats them as interchangeable |
+| `FastPathMatchesFullPrecompute` | `compute_hessian_only` + `precompute_subset_fast` ≡ full `precompute_subset`, byte for byte (v0.5.0: the full path is built from the other two); an invalid pool entry gives an uninitialized subset |
 | `LargeSubset_HinvFinite` | A 301 px subset is accepted and `H·H⁻¹ ≈ I` with a finite inverse | The conditioning test overflows with subset size again (the old `\|det H\|` did past ~170 px) |
 | `IllConditioned_Rejected` | Vertical stripes (2×2 check) and a pattern symmetric about the subset centre, which cannot see rotation, are rejected at 21 and 201 px. The second had `det H` of +1e9 to +8e16 and was accepted with a meaningless inverse before v0.5.0 | The 6×6 Hessian is no longer checked as a whole (`hessian::well_conditioned`, `tuning::kHessianMinRcond`) |
 | `EvenDimRejected` | An even, zero, one or negative `dim` gives an uninitialized subset from all three functions, even with a valid pool entry. Before v0.5.0 an even `dim` wrote `(dim+1)²` values into `dim²` buffers (heap overflow under ASan) |
@@ -475,6 +475,7 @@ quality. OpenCV-gated.
 | `RefCache_CancelledSolveDoesNotPoisonCache` | A solve cancelled during the pre-pass, then repeated, matches a fresh solve | A partly filled Hessian pool cached as complete |
 | `MetricsIdentityHoldsWithOutliers` | A 44 px block moved 4 px further than the rest: the median test rejects its inner nodes and `3 + 4 + 19 == 1 + 20 + 23` still holds, with slot 23 > 0 | Points the median test drops fall out of the accounting again (before v0.5.0 there was no slot 23 and the identity failed whenever the test fired) |
 | `UnseedableField_ReturnsDocumentedCode` | A blank deformed frame → `kSeedFailed` (`-5`) | Path C's failure leaks an undocumented code again (it was `-1`), or a blank crop "locks" phase correlation again (it did, at zero shift, and the solve returned 0 points with success) |
+| `PathC.UsesSameEngineConfig` | `make_engine` sets LM damping (`kLmAlpha`) and the interpolator; every pipeline solve builds its engine through it (Path C used to leave LM off) | The engine configurations drift apart again |
 | `Telemetry.RescueClassifiedByTriggeringRun` | A Simplex rescue after an IC-GN run that used its whole budget is counted as a timeout, even when the IC-GN after the rescue is short | The crash/timeout split reads the post-rescue run again (it did until v0.5.0) |
 | `MetricsPointCountsAccountForEverySolvedPoint` | `metrics[3] + metrics[4] + metrics[19] == metrics[1] + metrics[20]`, anchors > 0, mean ICGN iters ≥ 1, slot 18 > 0 | A solving path or a post-filter drop stops being counted — the failure mode that hid the anchor lattice from slots 3/4 and the strain post-filter from everything |
 

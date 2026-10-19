@@ -111,10 +111,6 @@ private:
 // corr==0 convention silently discarded.
 inline constexpr float CORR_INVALID = tuning::kCorrInvalid;
 
-// Toggle Simplex ON or OFF. constexpr so the dead branches fold away exactly
-// as they did when this was a function-local `bool ... = true`.
-inline constexpr bool ALLOW_SIMPLEX_RESCUE = true;
-
 // Default-initialized so a new field can never leave a call site
 // reading indeterminate memory. The aggregate-init sites below fill the
 // first 15 members positionally, in this exact order:
@@ -269,6 +265,33 @@ inline void reject_if_ghosted(AnalysisResult &res, int subset_size) {
     }
 }
 
+// The one engine configuration every solve in the pipeline uses -- anchor
+// lattice, Paths A, B and C, incremental re-anchoring: DICe-style LM damping
+// of the translation DOFs (tuning::kLmAlpha) and the caller's interpolator.
+// Path C used to set up its own engine and left LM off.
+inline OptimizationEngine make_engine(bool use_6x6_interpolator) {
+    OptimizationEngine engine;
+    engine.lm_enabled = true;
+    engine.lm_alpha = tuning::kLmAlpha;
+    engine.use_6x6_interpolator = use_6x6_interpolator;
+    return engine;
+}
+
+// One grid node's solve, shared by the anchor lattice and Paths A, B and C:
+// the subset from its pool entry, the IC-GN (with the Simplex rescue the mode
+// allows), and the Ghost Wall rejection.
+struct NodeSolve {
+    bool initialized = false;   // the subset fit the image and its pool entry was valid
+    bool needed_rescue = false; // a Simplex ran
+    double hessian_ms = 0.0;    // time spent preparing the subset
+    AnalysisResult res;
+};
+
+NodeSolve solve_node(OptimizationEngine &engine, SubsetData &subset, const Image &ref_img,
+                     const Image &def_img, int realX, int realY, int subset_size,
+                     const CachedHessianData &cached, const float guess[6],
+                     InitializationMode mode);
+
 // Classify a Simplex rescue by the IC-GN run that triggered it (crash: it
 // stopped early; timeout: it used the whole budget), then record whether the
 // rescue saved the point or died. It used to read `iters`, which is the run
@@ -282,7 +305,7 @@ inline void record_simplex_outcome(ThreadStats &bucket, const AnalysisResult &re
         bucket.simplex_from_crash++;
     }
 
-    if (res.status == 0 && res.correlation_score <= tuning::kCorrAccept && ALLOW_SIMPLEX_RESCUE) {
+    if (res.status == 0 && res.correlation_score <= tuning::kCorrAccept) {
         bucket.simplex_saved++;
     } else {
         bucket.simplex_dead++;

@@ -13,6 +13,10 @@
 #include <opencv2/imgcodecs.hpp>
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <unordered_map>
 #include <atomic>
 #include <chrono>
 #include <string>
@@ -51,35 +55,44 @@ MeshGuessField build_mesh_guess_field(
 
     auto t_mesh_start = std::chrono::high_resolution_clock::now();
 
+    // Every seed that goes into the triangulation, keyed by its exact float
+    // coordinates: getTriangleList hands back the inserted points bit for bit,
+    // so a triangle's vertices are looked up, not searched for (that was an
+    // O(triangles x seeds) nearest-point scan). A vertex not found is one of
+    // Subdiv2D's virtual outer vertices, and its triangle is skipped -- the
+    // old test only looked at x. On duplicate coordinates the first seed wins,
+    // as the nearest-point scan's strict `<` did.
+    auto key = [](const cv::Point2f &p) {
+        uint32_t bx, by;
+        std::memcpy(&bx, &p.x, sizeof bx);
+        std::memcpy(&by, &p.y, sizeof by);
+        return ((uint64_t)bx << 32) | by;
+    };
+    std::unordered_map<uint64_t, size_t> seed_of;
     cv::Subdiv2D subdiv(cv::Rect(0, 0, cache.width, cache.height));
     for (size_t i = 0; i < seed_ref_pts.size(); i++) {
         if (seed_ref_pts[i].x > 0 && seed_ref_pts[i].x < cache.width &&
             seed_ref_pts[i].y > 0 && seed_ref_pts[i].y < cache.height) {
             subdiv.insert(seed_ref_pts[i]);
+            seed_of.emplace(key(seed_ref_pts[i]), i);
         }
     }
 
     std::vector<cv::Vec6f> triangleList;
     subdiv.getTriangleList(triangleList);
 
-    auto getDefPt = [&](cv::Point2f pt) -> cv::Point2f {
-        float min_dist = 1e9; cv::Point2f best_pt = pt;
-        for (size_t i = 0; i < seed_ref_pts.size(); i++) {
-            float d = (seed_ref_pts[i].x - pt.x) * (seed_ref_pts[i].x - pt.x) + (seed_ref_pts[i].y - pt.y) * (seed_ref_pts[i].y - pt.y);
-            if (d < min_dist) { min_dist = d; best_pt = seed_def_pts[i]; }
-        }
-        return best_pt;
-    };
-
     try {
         for (size_t i = 0; i < triangleList.size(); i++) {
             cv::Vec6f t = triangleList[i]; cv::Point2f pt[3];
             pt[0] = cv::Point2f(t[0], t[1]); pt[1] = cv::Point2f(t[2], t[3]); pt[2] = cv::Point2f(t[4], t[5]);
-            if (pt[0].x < 0 || pt[0].x >= cache.width || pt[1].x < 0 || pt[1].x >= cache.width || pt[2].x < 0 || pt[2].x >= cache.width) continue;
             cv::Point2f dst[3];
-            dst[0] = getDefPt(pt[0]);
-            dst[1] = getDefPt(pt[1]);
-            dst[2] = getDefPt(pt[2]);
+            bool real = true;
+            for (int k = 0; k < 3 && real; ++k) {
+                const auto it = seed_of.find(key(pt[k]));
+                if (it == seed_of.end()) real = false;
+                else dst[k] = seed_def_pts[it->second];
+            }
+            if (!real) continue;
 
             // OpenCV returns: [ x_def ] = [ M00 M01 M02 ] * [ x_ref ]
             //                 [ y_def ]   [ M10 M11 M12 ]   [ y_ref ]
@@ -98,6 +111,11 @@ MeshGuessField build_mesh_guess_field(
             double M10 = warp_mat.at<double>(1, 0);
             double M11 = warp_mat.at<double>(1, 1);
             double M12 = warp_mat.at<double>(1, 2);
+
+            // A collapsed triangle (collinear seeds, or one folded flat by a
+            // bad vertex) has no affine map worth guessing from.
+            const double detF = M00 * M11 - M01 * M10;
+            if (!(std::abs(detF) > 1e-3)) continue;
 
             // Strain/Shear derivatives (Ux = du/dx)
             at.ux = M00 - 1.0;

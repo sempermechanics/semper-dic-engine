@@ -29,7 +29,8 @@ namespace Semper {
 
     class SubsetPrecomputer {
     public:
-        // --- Existing full precompute (used as fallback) ---
+        // Full precompute: compute_hessian_only, then precompute_subset_fast
+        // from it. For callers without a Hessian pool (tests, re-anchoring).
         static void precompute_subset(SubsetData& data, const Image& ref_img,
                                       int_t cx, int_t cy, int_t dim);
 
@@ -39,7 +40,8 @@ namespace Semper {
                                                       int_t cx, int_t cy, int_t dim);
 
         // 🚀 NEW: Fast precompute that skips H re-accumulation using the pool.
-        //    Saves ~65% of precompute FP work per call site.
+        //    Saves ~65% of precompute FP work per call site. An invalid
+        //    `cached` gives an uninitialized subset.
         static void precompute_subset_fast(SubsetData& data, const Image& ref_img,
                                            int_t cx, int_t cy, int_t dim,
                                            const CachedHessianData& cached);

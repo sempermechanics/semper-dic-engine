@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 using Semper::Image;
@@ -156,6 +157,9 @@ TEST_CASE(SubsetPrecomputer, EvenDimRejected) {
 // The cached-Hessian fast path must produce the same state as the full
 // precompute — it is used interchangeably by the JNI batch pipeline.
 TEST_CASE(SubsetPrecomputer, FastPathMatchesFullPrecompute) {
+    // precompute_subset is compute_hessian_only + precompute_subset_fast, so
+    // the two are the same bytes, not merely close (before v0.5.0 it was a
+    // separate implementation, equal to ~1e-3).
     Image img = test_image();
 
     SubsetData full;
@@ -166,25 +170,26 @@ TEST_CASE(SubsetPrecomputer, FastPathMatchesFullPrecompute) {
             SubsetPrecomputer::compute_hessian_only(img, 60, 70, DIM);
     REQUIRE(cached.valid);
 
-    CHECK_REL(cached.mean_intensity, full.mean_intensity, 1e-4);
-    CHECK_REL(cached.std_dev, full.std_dev, 1e-4);
-
     SubsetData fast;
     SubsetPrecomputer::precompute_subset_fast(fast, img, 60, 70, DIM, cached);
     REQUIRE(fast.is_initialized);
 
-    size_t n = (size_t) DIM * DIM;
-    for (size_t i = 0; i < n; i += 13) {
-        CHECK_NEAR(fast.norm_ref_intensities[i], full.norm_ref_intensities[i], 1e-3);
-        for (int k = 0; k < 6; ++k) {
-            CHECK_NEAR(fast.steepest_descent_images[i](k),
-                       full.steepest_descent_images[i](k), 1e-3);
-            CHECK_NEAR(fast.sdi_planes[k * n + i], full.sdi_planes[k * n + i], 1e-3);
-        }
-    }
-    for (int r = 0; r < 6; ++r)
-        for (int c = 0; c < 6; ++c)
-            CHECK_REL(fast.H_inv(r, c), full.H_inv(r, c), 5e-3);
+    const size_t n = (size_t) DIM * DIM;
+    auto same = [](const void *a, const void *b, size_t bytes) { return std::memcmp(a, b, bytes) == 0; };
+    CHECK(fast.mean_intensity == full.mean_intensity);
+    CHECK(fast.std_dev == full.std_dev);
+    CHECK(same(fast.norm_ref_intensities.data(), full.norm_ref_intensities.data(), n * sizeof(float)));
+    CHECK(same(fast.sdi_planes.data(), full.sdi_planes.data(), 6 * n * sizeof(float)));
+    CHECK(same(fast.H_inv.data(), full.H_inv.data(), sizeof(float) * 36));
+    CHECK(same(fast.H.data(), full.H.data(), sizeof(float) * 36));
+    for (size_t i = 0; i < n; ++i)
+        for (int k = 0; k < 6; ++k)
+            CHECK(fast.steepest_descent_images[i](k) == full.steepest_descent_images[i](k));
+
+    // An invalid pool entry is final for the fast path.
+    SubsetData none;
+    SubsetPrecomputer::precompute_subset_fast(none, img, 60, 70, DIM, CachedHessianData{});
+    CHECK(!none.is_initialized);
 }
 
 // The conditioning test used to be |det H| < 1e-6, and det H scales with the

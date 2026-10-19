@@ -129,12 +129,14 @@ and cubic undershoot next to it were treated as off-image.)
 
 ## Module: `include/semper/subset.hpp`
 
-Static factory for `SubsetData`. Three entry points with one contract:
-**all paths must produce interchangeable state** (guarded by
-`FastPathMatchesFullPrecompute`).
+Static factory for `SubsetData`. Three entry points, one implementation:
+`precompute_subset` is `compute_hessian_only` followed by
+`precompute_subset_fast`, so the two routes give the same bytes (guarded,
+bit for bit, by `FastPathMatchesFullPrecompute`; v0.5.0 — it was a third copy
+of the arithmetic before).
 
 ```cpp
-// Full precompute: stats + gradients + SDI + Hessian + inverse.
+// Full precompute: compute_hessian_only, then precompute_subset_fast from it.
 static void precompute_subset(SubsetData&, const Image& ref, int cx, int cy, int dim);
 
 // Stats + Hessian only — for the batch pipeline's Hessian pool.
@@ -147,8 +149,15 @@ static void precompute_subset_fast(SubsetData&, const Image& ref,
 ```
 
 Failure modes (→ `is_initialized = false` / `cached.valid = false`):
-subset crosses the image boundary; > 50% masked pixels; singular or
-ill-conditioned Hessian (`cond(H₂ₓ₂) > 1e12`).
+`dim` not odd and ≥ 3; subset crosses the image boundary; > 50% masked pixels;
+ill-conditioned Hessian (`cond(H₂ₓ₂) > 1e12`, or the 6×6 rcond test
+`hessian::well_conditioned`). `precompute_subset_fast` with an invalid pool
+entry gives an uninitialized subset (no recomputation: it would fail again).
+
+Every solve in the pipeline goes through `solve_node` (pool entry → subset →
+`calculate_deformation` → Ghost-Wall rejection) on an engine from
+`make_engine` (LM damping `tuning::kLmAlpha`, the caller's interpolator):
+anchor lattice, Paths A, B and C, and incremental re-anchoring.
 
 ---
 

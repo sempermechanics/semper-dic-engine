@@ -584,6 +584,19 @@ TEST_CASE(Telemetry, RescueClassifiedByTriggeringRun) {
     CHECK(bucket.simplex_from_crash == 0);
 }
 
+// Every solve in the pipeline -- anchors, Paths A, B and C, re-anchoring --
+// builds its engine through make_engine. Path C used to set up its own and
+// left LM damping off, so the one seed that has to work without any other
+// help was solved by a differently configured engine.
+TEST_CASE(PathC, UsesSameEngineConfig) {
+    for (bool use6x6 : {false, true}) {
+        const Semper::OptimizationEngine e = Semper::pipeline::internal::make_engine(use6x6);
+        CHECK(e.lm_enabled);
+        CHECK(e.lm_alpha == Semper::tuning::kLmAlpha);
+        CHECK(e.use_6x6_interpolator == use6x6);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reference precompute cache. A batch against one reference reuses the grid
 // scan, the Hessian pool and the reference side of the phase correlation.

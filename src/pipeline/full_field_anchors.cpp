@@ -221,11 +221,8 @@ MeshSeedResult solve_anchor_seeds(
 #pragma omp parallel num_threads(safe_cores)
         {
             const int tid = omp_get_thread_num();
-            OptimizationEngine engine;
+            OptimizationEngine engine = make_engine(params.use_6x6_interpolator);
             Semper::SubsetData subset;
-            engine.lm_enabled = true;
-            engine.lm_alpha = tuning::kLmAlpha;
-            engine.use_6x6_interpolator = params.use_6x6_interpolator;
             double local_hessian = 0.0, local_wait = 0.0;
             // Stays 0: the anchor phase no longer publishes, so points_solved is
             // credited in publish_anchor_results once the median test has spoken.
@@ -253,30 +250,23 @@ MeshSeedResult solve_anchor_seeds(
                     const int realY = params.rect_y + gy * params.step;
                     attempted.fetch_add(1, std::memory_order_relaxed);
 
-                    auto th1 = std::chrono::high_resolution_clock::now();
-                    SubsetPrecomputer::precompute_subset_fast(subset, *cache.ref_img, realX, realY,
-                                                              params.subset_size,
-                                                              hessian_pool[(size_t)pool_idx]);
-                    local_hessian += std::chrono::duration<double, std::milli>(
-                            std::chrono::high_resolution_clock::now() - th1).count();
-                    if (!subset.is_initialized) continue;
-
-                    const int simplex_before = engine.count_simplex;
                     // Under the similarity each anchor starts where the rotation puts
                     // it, with the rotation's gradients: the one global shift is off
                     // by 2 r sin(theta/2) at radius r.
-                    AnalysisResult res = sim
-                            ? engine.calculate_deformation(
-                                    subset, def_img,
-                                    model_u((float)realX, (float)realY),
-                                    model_v((float)realX, (float)realY),
-                                    gux, guy, gvx, gvy, init_mode)
-                            : engine.calculate_deformation(
-                                    subset, def_img, r.globalU, r.globalV,
-                                    0.0f, 0.0f, 0.0f, 0.0f, init_mode);
-                    reject_if_ghosted(res, params.subset_size);
+                    const float guess_sim[6] = {model_u((float)realX, (float)realY),
+                                                model_v((float)realX, (float)realY),
+                                                gux, guy, gvx, gvy};
+                    const float guess_shift[6] = {r.globalU, r.globalV, 0.0f, 0.0f, 0.0f, 0.0f};
+                    const NodeSolve node = solve_node(engine, subset, *cache.ref_img, def_img,
+                                                      realX, realY, params.subset_size,
+                                                      hessian_pool[(size_t)pool_idx],
+                                                      sim ? guess_sim : guess_shift, init_mode);
+                    local_hessian += node.hessian_ms;
+                    if (!node.initialized) continue;
+
+                    const AnalysisResult& res = node.res;
+                    const bool needed_rescue = node.needed_rescue;
                     stats[tid].icgn_iters += res.iters;
-                    const bool needed_rescue = (engine.count_simplex > simplex_before);
                     if (needed_rescue) record_simplex_outcome(stats[tid], res);
 
                     if (res.status != 0) continue;

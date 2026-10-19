@@ -107,6 +107,28 @@ int validate_params(FullFieldParams &p, int width, int height) {
     return 0;
 }
 
+NodeSolve solve_node(OptimizationEngine &engine, SubsetData &subset, const Image &ref_img,
+                     const Image &def_img, int realX, int realY, int subset_size,
+                     const CachedHessianData &cached, const float guess[6],
+                     InitializationMode mode) {
+    NodeSolve out;
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    SubsetPrecomputer::precompute_subset_fast(subset, ref_img, realX, realY, subset_size, cached);
+    out.hessian_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - t0).count();
+    out.initialized = subset.is_initialized;
+    if (!out.initialized) return out;
+
+    const int simplex_before = engine.count_simplex;
+    out.res = engine.calculate_deformation(subset, def_img, guess[0], guess[1], guess[2],
+                                           guess[3], guess[4], guess[5], mode);
+    // VSG protector: a subset that reaches into the Ghost Wall must not pass,
+    // least of all on Path B, where an accepted cell seeds its neighbours.
+    reject_if_ghosted(out.res, subset_size);
+    out.needed_rescue = engine.count_simplex > simplex_before;
+    return out;
+}
+
 int run_full_field_impl(
     ReferenceCache& cache,
     const cv::Mat& def_gray,

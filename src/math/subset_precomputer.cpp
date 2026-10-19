@@ -22,148 +22,14 @@ namespace Semper {
     } // namespace
 
     // =========================================================
-    // EXISTING: Full Precompute (Fallback / Original logic)
+    // Full precompute: the pool entry, then the fast fill from it. There is
+    // one implementation of the subset statistics and the Hessian, so a
+    // subset prepared either way is bit-identical (FastPathMatchesFull-
+    // Precompute). It used to be a third copy of the same arithmetic, with
+    // divisions where the other two multiply by 1/std.
     // =========================================================
     void SubsetPrecomputer::precompute_subset(SubsetData& data, const Image& ref_img, int_t cx, int_t cy, int_t dim) {
-        data.cx = cx;
-        data.cy = cy;
-        // Before anything is sized from dim: a subset that does not fit the
-        // image is rejected without allocating for it.
-        if (!dim_ok(dim) || !subset_on_image(ref_img, cx, cy, dim / 2)) {
-            data.is_initialized = false;
-            return;
-        }
-        int n = dim * dim;
-        int half = dim / 2;
-
-        if (data.dim != dim) {
-            data.dim = dim;
-            data.x_offsets.resize(n);
-            data.y_offsets.resize(n);
-            // 🚀 Resize the new float arrays
-            data.x_offsets_f.resize(n);
-            data.y_offsets_f.resize(n);
-            data.ref_intensities.resize(n);
-            data.norm_ref_intensities.resize(n);
-            data.gx_vec.resize(n);
-            data.gy_vec.resize(n);
-            data.steepest_descent_images.resize(n);
-
-            int idx = 0;
-            for (int y = -half; y <= half; ++y) {
-                for (int x = -half; x <= half; ++x) {
-                    data.x_offsets[idx] = x;
-                    data.y_offsets[idx] = y;
-                    // 🚀 Cast and store the float versions once
-                    data.x_offsets_f[idx] = static_cast<float>(x);
-                    data.y_offsets_f[idx] = static_cast<float>(y);
-                    idx++;
-                }
-            }
-        }
-
-        // 🚀 Float conversion
-        float sum = 0.0f;
-        int valid_pixels = 0;
-        int idx = 0;
-
-        // ==========================================
-        // 🚀 CONTIGUOUS MEMORY SCAN (Hardware Prefetching)
-        // ==========================================
-        int start_y = cy - half;
-        int start_x = cx - half;
-
-        for (int y = 0; y < dim; ++y) {
-            const scalar_t* int_row = &ref_img.intensities[(start_y + y) * ref_img.width + start_x];
-            const scalar_t* gx_row = &ref_img.grad_x[(start_y + y) * ref_img.width + start_x];
-            const scalar_t* gy_row = &ref_img.grad_y[(start_y + y) * ref_img.width + start_x];
-
-            for (int x = 0; x < dim; ++x) {
-                data.ref_intensities[idx] = int_row[x];
-                data.gx_vec[idx] = gx_row[x];
-                data.gy_vec[idx] = gy_row[x];
-
-                // 🚀 DICe PARITY: Intensity-only Ghost Wall detection
-                if (int_row[x] >= tuning::kGhostWallThreshold) {
-                    sum += int_row[x];
-                    valid_pixels++;
-                }
-                idx++;
-            }
-        }
-
-        // Abort if subset is mostly hanging off into the void
-        if (valid_pixels < n * 0.5f) {
-            data.is_initialized = false;
-            return;
-        }
-
-        data.mean_intensity = sum / static_cast<float>(valid_pixels);
-        float sum_sq_diff = 0.0f;
-
-        for (int i = 0; i < n; ++i) {
-            // 🚀 DICe PARITY: Intensity-only check
-            if (data.ref_intensities[i] < tuning::kGhostWallThreshold) continue;
-            float diff = data.ref_intensities[i] - data.mean_intensity;
-            sum_sq_diff += diff * diff;
-        }
-        data.std_dev = std::sqrt(sum_sq_diff / static_cast<float>(valid_pixels));
-        if (data.std_dev < 1e-5f) data.std_dev = 1.0f;
-
-        for (int i = 0; i < n; ++i) {
-            data.norm_ref_intensities[i] = (data.ref_intensities[i] - data.mean_intensity) / data.std_dev;
-        }
-
-        // 🚀 Convert to Matrix<float>
-        Eigen::Matrix<float, 6, 6> H = Eigen::Matrix<float, 6, 6>::Zero();
-        idx = 0;
-
-        // 🚀 SIMD SoA mirror must track n (see Types.h / SimdKernels.h)
-        if (data.sdi_planes.size() != static_cast<size_t>(n) * 6)
-            data.sdi_planes.resize(static_cast<size_t>(n) * 6);
-
-        // Exact Hessian Computation using direct relative coordinates
-        for (int y = -half; y <= half; ++y) {
-            for (int x = -half; x <= half; ++x) {
-                float gx = data.gx_vec[idx] / data.std_dev;
-                float gy = data.gy_vec[idx] / data.std_dev;
-
-                Eigen::Matrix<float, 6, 1> sd;
-                sd << gx, gy, gx * (float)x, gx * (float)y, gy * (float)x, gy * (float)y;
-
-                data.steepest_descent_images[idx] = sd;
-
-                // 🚀 SoA mirror for the portable SIMD hot loop
-                data.sdi_planes[idx]         = sd(0);
-                data.sdi_planes[n + idx]     = sd(1);
-                data.sdi_planes[2 * n + idx] = sd(2);
-                data.sdi_planes[3 * n + idx] = sd(3);
-                data.sdi_planes[4 * n + idx] = sd(4);
-                data.sdi_planes[5 * n + idx] = sd(5);
-
-                // 🚀 DICe PARITY: Intensity-only check
-                if (data.ref_intensities[idx] >= tuning::kGhostWallThreshold) {
-                    H.noalias() += sd * sd.transpose();
-                }
-                idx++;
-            }
-        }
-
-        float det_2x2 = H(0,0)*H(1,1) - H(1,0)*H(0,1);
-        float norm_2x2 = H(0,0)*H(0,0) + H(0,1)*H(0,1) + H(1,0)*H(1,0) + H(1,1)*H(1,1);
-        float cond_2x2 = (std::abs(det_2x2) > 1e-12f) ? (norm_2x2 / std::abs(det_2x2)) : 1.0e13f;
-
-        if (cond_2x2 > 1.0e12f || !hessian::well_conditioned(H, half)) {
-            data.H_inv = Eigen::Matrix<float, 6, 6>::Zero();
-            data.is_initialized = false;
-            return;
-        } else {
-            data.H_inv = H.inverse();
-        }
-        // ── LM ADDITION ─────────────────────────────────────────────────────────
-        data.H = H;   // preserve raw Hessian for LM damping in solve_icgn
-        // ────────────────────────────────────────────────────────────────────────
-        data.is_initialized = true;
+        precompute_subset_fast(data, ref_img, cx, cy, dim, compute_hessian_only(ref_img, cx, cy, dim));
     }
 
 
@@ -304,9 +170,10 @@ namespace Semper {
             return;
         }
 
-        // Safety: degrade gracefully if the pool entry was invalid (boundary overshoot, etc.)
+        // An invalid pool entry (too few unmasked pixels, an ill-conditioned
+        // Hessian) is final: recomputing it would only fail again.
         if (!cached.valid) {
-            precompute_subset(data, ref_img, cx, cy, dim);
+            data.is_initialized = false;
             return;
         }
 
