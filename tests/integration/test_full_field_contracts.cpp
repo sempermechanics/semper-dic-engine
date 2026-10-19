@@ -13,6 +13,10 @@
 #include <semper/cancel.hpp>
 #include <semper/strain.hpp>
 #include <semper/pipeline.hpp>
+#include <semper/solver.hpp>
+#include <semper/subset.hpp>
+#include <semper/tuning.hpp>
+#include "pipeline/full_field_internal.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -545,6 +549,39 @@ TEST_CASE(FullField, UnseedableField_ReturnsDocumentedCode) {
     std::printf("    rc = %d\n", rc);
     CHECK(rc == Semper::pipeline::kSeedFailed);
     CHECK(Semper::pipeline::kSeedFailed == -5);
+}
+
+// The rescue telemetry (metrics 5-7 and the profile's crash/timeout split)
+// classified a Simplex rescue by the iterations of the IC-GN run *after* the
+// rescue, which usually converges quickly, so a rescued timeout was counted
+// as a crash. It is classified by the run that triggered it now. Here the
+// first run is made to time out by scaling the SoA steepest-descent planes
+// (the full-subset gradient) to 1/20: every step is 1/20 of the way.
+TEST_CASE(Telemetry, RescueClassifiedByTriggeringRun) {
+    using namespace Semper;
+    dictest::SpeckleField field(/*seed=*/31, 160, 160);
+    dictest::AffineDeformation truth;
+    truth.u = 1.0f; truth.v = -0.5f; truth.cx = 80.0f; truth.cy = 80.0f;
+    const Image ref = dictest::make_reference_image(field, 160, 160);
+    const Image def = dictest::make_deformed_image(field, 160, 160, truth);
+    SubsetData subset;
+    SubsetPrecomputer::precompute_subset(subset, ref, 80, 80, 31);
+    REQUIRE(subset.is_initialized);
+    for (float &v : subset.sdi_planes) v *= 0.05f;
+
+    OptimizationEngine engine;
+    const AnalysisResult res = engine.calculate_deformation(subset, def, 0.0f, 0.0f, 0.0f, 0.0f,
+                                                           0.0f, 0.0f, INIT_NO_SEARCH);
+    std::printf("    simplex runs %d, final iters %d, status %d\n", engine.count_simplex, res.iters,
+                res.status);
+    REQUIRE(engine.count_simplex == 1);
+    REQUIRE(res.iters < tuning::kIcgnMaxIter);   // the run after the rescue was short
+
+    Semper::pipeline::internal::ThreadStats bucket;
+    Semper::pipeline::internal::record_simplex_outcome(bucket, res);
+    CHECK(bucket.simplex_calls == 1);
+    CHECK(bucket.simplex_from_timeout == 1);
+    CHECK(bucket.simplex_from_crash == 0);
 }
 
 // ---------------------------------------------------------------------------

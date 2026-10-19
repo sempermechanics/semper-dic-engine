@@ -343,19 +343,25 @@ int run_full_field_impl(
         if (!grid_cached) {
         pre.hessian_pool.assign((size_t)gridW * gridH, CachedHessianData());
         HessianPool& hessian_pool = pre.hessian_pool;
+        RegionErrors prepass_errors;
 
     #pragma omp parallel for schedule(static) num_threads(safe_cores)
         for (int pool_idx = 0; pool_idx < gridW * gridH; ++pool_idx) {
-            // OpenMP forbids breaking out of a parallel for, so a cancel skips
-            // the remaining iterations instead — the same shape the existing
-            // exception guard in Path A uses.
-            if (cancel.requested()) continue;
-            int gx = pool_idx % gridW, gy = pool_idx / gridW;
-            if (!resultGrid[gy][gx].solved) {
-                int realX = params.rect_x + gx * params.step, realY = params.rect_y + gy * params.step;
-                hessian_pool[pool_idx] = SubsetPrecomputer::compute_hessian_only(*cache.ref_img, realX, realY, params.subset_size);
+            // OpenMP forbids breaking out of a parallel for, so a cancel (or
+            // an exception, see RegionErrors) skips the remaining iterations.
+            if (cancel.requested() || prepass_errors.failed()) continue;
+            try {
+                int gx = pool_idx % gridW, gy = pool_idx / gridW;
+                if (!resultGrid[gy][gx].solved) {
+                    int realX = params.rect_x + gx * params.step, realY = params.rect_y + gy * params.step;
+                    hessian_pool[pool_idx] = SubsetPrecomputer::compute_hessian_only(*cache.ref_img, realX, realY, params.subset_size);
+                }
+            } catch (...) {
+                prepass_errors.capture();
             }
         }
+        // The pool is left marked stale (grid_valid is false until below).
+        prepass_errors.rethrow_if_any();
 
         // The cancel flag only ever goes up during a solve, so if it is still
         // clear here every iteration above ran: the pool is complete and safe

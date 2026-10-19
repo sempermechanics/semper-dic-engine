@@ -47,15 +47,19 @@ namespace Semper {
             AnalysisResult start_guess = {(float)est_u, (float)est_v, 0.0f, 0.0f, 0.0f, 0.0f, 0, 1.0f};
             AnalysisResult coarse_res = run_simplex(start_guess, true);
             res = run_icgn(coarse_res.u, coarse_res.v, 0.0f, 0.0f, 0.0f, 0.0f);
+            res.trigger_iters = res.iters;
         } else {
             // 🚀 Pass the PERFECT Delaunay 6-DOF guess directly into ICGN!
             res = run_icgn(guess_u, guess_v, guess_ux, guess_uy, guess_vx, guess_vy);
+            res.trigger_iters = res.iters;
 
             // 🚀 THE KILL SWITCH: Only run Simplex if the mode IS NOT INIT_NO_SIMPLEX!
             if ((res.status != 0 || res.correlation_score > tuning::kCorrSimplexTrigger) && init_mode != INIT_NO_SIMPLEX) {
                 AnalysisResult start_guess = {guess_u, guess_v, guess_ux, guess_uy, guess_vx, guess_vy, 0, 1.0f};
                 AnalysisResult rescue_res = run_simplex(start_guess, false);
+                const int trigger_iters = res.iters;
                 res = run_icgn(rescue_res.u, rescue_res.v, rescue_res.ux, rescue_res.uy, rescue_res.vx, rescue_res.vy);
+                res.trigger_iters = trigger_iters;
             }
         }
         return res;

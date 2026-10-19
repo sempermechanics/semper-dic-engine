@@ -381,6 +381,7 @@ precision, not "close enough".
 | `OutlierTestRejectsASingleSpike` | One point 3 px off is the only one rejected |
 | `OutlierTestRejectsAWholeCluster` | A 4x4 block 20 px off is rejected whole (its inner points only on a later pass), and strain beside it is the field's again |
 | `OutlierTestKeepsAStraightJump` | A 5 px step along a column (a crack) is not an outlier on either side |
+| `Median.EvenCountAveragesMiddlePair` | `util::median_inplace` averages the middle pair for an even count (the anchor lattice's own median took the upper one) | The two medians diverge again |
 | `OutlierTestSkipsSparseAndInvalidPoints` | Under 3 neighbours, no test; an already invalid point is neither counted nor used |
 
 ## Suite: `CancelToken` — `unit/test_cancel_token.cpp`
@@ -474,6 +475,7 @@ quality. OpenCV-gated.
 | `RefCache_CancelledSolveDoesNotPoisonCache` | A solve cancelled during the pre-pass, then repeated, matches a fresh solve | A partly filled Hessian pool cached as complete |
 | `MetricsIdentityHoldsWithOutliers` | A 44 px block moved 4 px further than the rest: the median test rejects its inner nodes and `3 + 4 + 19 == 1 + 20 + 23` still holds, with slot 23 > 0 | Points the median test drops fall out of the accounting again (before v0.5.0 there was no slot 23 and the identity failed whenever the test fired) |
 | `UnseedableField_ReturnsDocumentedCode` | A blank deformed frame → `kSeedFailed` (`-5`) | Path C's failure leaks an undocumented code again (it was `-1`), or a blank crop "locks" phase correlation again (it did, at zero shift, and the solve returned 0 points with success) |
+| `Telemetry.RescueClassifiedByTriggeringRun` | A Simplex rescue after an IC-GN run that used its whole budget is counted as a timeout, even when the IC-GN after the rescue is short | The crash/timeout split reads the post-rescue run again (it did until v0.5.0) |
 | `MetricsPointCountsAccountForEverySolvedPoint` | `metrics[3] + metrics[4] + metrics[19] == metrics[1] + metrics[20]`, anchors > 0, mean ICGN iters ≥ 1, slot 18 > 0 | A solving path or a post-filter drop stops being counted — the failure mode that hid the anchor lattice from slots 3/4 and the strain post-filter from everything |
 
 ## Suite: `GoldenCorpus` — `integration/test_golden_corpus.cpp`

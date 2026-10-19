@@ -1,6 +1,7 @@
 #include <semper/strain.hpp>
 #include <semper/tuning.hpp>
 #include "util/log.hpp"
+#include "util/median.hpp"
 #include <Eigen/Dense>
 #include <algorithm>
 #include <cmath>
@@ -147,25 +148,13 @@ namespace Semper {
 
     namespace {
 
-        // Median of vals (reordered). The mean of the middle two when the count
-        // is even, so it matches numpy's median.
-        float median_of(std::vector<float>& vals) {
-            const size_t n = vals.size();
-            const size_t mid = n / 2;
-            std::nth_element(vals.begin(), vals.begin() + mid, vals.end());
-            float hi = vals[mid];
-            if (n % 2 == 1) return hi;
-            float lo = *std::max_element(vals.begin(), vals.begin() + mid);
-            return 0.5f * (lo + hi);
-        }
-
         // Normalized residual of centre against its neighbours: distance from
         // their median over the median of their own distances from it, plus eps.
         float normalized_residual(float centre, std::vector<float>& nb, std::vector<float>& scratch) {
-            float med = median_of(nb);
+            float med = util::median_inplace(nb.data(), nb.size());
             scratch.resize(nb.size());
             for (size_t i = 0; i < nb.size(); ++i) scratch[i] = std::abs(nb[i] - med);
-            float spread = median_of(scratch);
+            float spread = util::median_inplace(scratch.data(), scratch.size());
             return std::abs(centre - med) / (spread + tuning::kOutlierEpsPx);
         }
 

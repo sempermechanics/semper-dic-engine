@@ -22,7 +22,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <exception>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -43,9 +45,9 @@ struct ThreadStats {
     int simplex_saved = 0;
     int simplex_dead = 0;
 
-    // Track WHY it went to Simplex
-    int simplex_from_crash = 0;   // Failed in < 20 iters (Bad guess / out of bounds)
-    int simplex_from_timeout = 0; // Failed at exactly 20 iters (Non-convergence)
+    // Track WHY it went to Simplex, from the IC-GN run that triggered it
+    int simplex_from_crash = 0;   // stopped before kIcgnMaxIter: a hard reject or a bad score
+    int simplex_from_timeout = 0; // ran out of kIcgnMaxIter iterations
 };
 
 struct EngineStatFlusher {
@@ -77,6 +79,30 @@ struct ScopedTimer {
         out_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::high_resolution_clock::now() - start).count();
     }
+};
+
+// An exception must not leave an OpenMP region: the runtime terminates the
+// process. Each region body catches into one of these; the remaining
+// iterations see failed() and skip, and once the region has joined the solve
+// rethrows the first exception, which the C / JNI entry points turn into -3
+// (guarded_call). Path B's std::thread workers have their own handler.
+class RegionErrors {
+public:
+    bool failed() const { return failed_.load(std::memory_order_relaxed); }
+    // Call from a catch (...) block inside the region.
+    void capture() noexcept {
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (!first_) first_ = std::current_exception();
+        failed_.store(true, std::memory_order_relaxed);
+    }
+    void rethrow_if_any() {
+        if (first_) std::rethrow_exception(first_);
+    }
+
+private:
+    std::atomic<bool> failed_{false};
+    std::mutex mutex_;
+    std::exception_ptr first_;
 };
 
 // Sentinel for "no valid correlation here" (skipped or failed point).
@@ -243,12 +269,14 @@ inline void reject_if_ghosted(AnalysisResult &res, int subset_size) {
     }
 }
 
-// Classify a Simplex rescue on the REAL iteration count against kIcgnMaxIter,
-// then record whether it saved the point or died.
+// Classify a Simplex rescue by the IC-GN run that triggered it (crash: it
+// stopped early; timeout: it used the whole budget), then record whether the
+// rescue saved the point or died. It used to read `iters`, which is the run
+// after the rescue, so a rescued timeout was usually counted as a crash.
 inline void record_simplex_outcome(ThreadStats &bucket, const AnalysisResult &res) {
     bucket.simplex_calls++;
 
-    if (res.iters >= tuning::kIcgnMaxIter) {
+    if (res.trigger_iters >= tuning::kIcgnMaxIter) {
         bucket.simplex_from_timeout++;
     } else {
         bucket.simplex_from_crash++;

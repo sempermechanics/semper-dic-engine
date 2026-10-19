@@ -32,6 +32,10 @@ namespace Semper {
         float correlation_score = 0.0f;
         int iters = 0;
         int invalid_ref_pixels = 0; // 🚀 NEW: Tracks Ghost Wall overlap
+        // Iterations of the IC-GN run that decided on a Simplex rescue: the
+        // first run when one followed, otherwise `iters` itself. The rescue
+        // telemetry classifies on this; `iters` is the run after the rescue.
+        int trigger_iters = 0;
     };
 
     // Seed node for reliability-guided propagation
