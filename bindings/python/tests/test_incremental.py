@@ -27,7 +27,7 @@ def test_totals_accumulate_across_reference_updates(interval):
         res = s.process(frame)
         assert res.count > 0
         assert res.points.shape == (res.count, 8)
-        assert res.metrics.shape == (23,)
+        assert res.metrics.shape == (24,)
         # Total from the first image, not the increment from the last reference.
         assert np.median(res.points[:, 2]) == pytest.approx(i + 1, abs=0.25)
         assert res.info["reference_frame"] == (i // interval) * interval

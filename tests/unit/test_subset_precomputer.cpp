@@ -15,6 +15,12 @@
 #include "framework/synthetic.h"
 #include <semper/subset.hpp>
 
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <vector>
+
 using Semper::Image;
 using Semper::SubsetData;
 using Semper::SubsetPrecomputer;
@@ -125,9 +131,35 @@ TEST_CASE(SubsetPrecomputer, RejectsSubsetOffImageBoundary) {
     CHECK(!data.is_initialized);
 }
 
+// A subset is (2 * (dim / 2) + 1)^2 pixels, built around its centre. An even
+// dim made the loops write (dim + 1)^2 values into dim^2 buffers, and dim 0
+// wrote into empty ones. run_full_field rejects such a dim up front; these
+// are the second line, for every direct caller (incremental re-anchoring
+// calls precompute_subset itself).
+TEST_CASE(SubsetPrecomputer, EvenDimRejected) {
+    Image img = test_image();
+    const CachedHessianData good = SubsetPrecomputer::compute_hessian_only(img, 64, 64, DIM);
+    REQUIRE(good.valid);
+    for (int dim : {20, 0, 1, 2, -21}) {
+        CHECK(!SubsetPrecomputer::compute_hessian_only(img, 64, 64, dim).valid);
+
+        SubsetData data;
+        SubsetPrecomputer::precompute_subset(data, img, 64, 64, dim);
+        CHECK(!data.is_initialized);
+
+        // Even with a valid pool entry, which belongs to another dim.
+        SubsetData fast;
+        SubsetPrecomputer::precompute_subset_fast(fast, img, 64, 64, dim, good);
+        CHECK(!fast.is_initialized);
+    }
+}
+
 // The cached-Hessian fast path must produce the same state as the full
 // precompute — it is used interchangeably by the JNI batch pipeline.
 TEST_CASE(SubsetPrecomputer, FastPathMatchesFullPrecompute) {
+    // precompute_subset is compute_hessian_only + precompute_subset_fast, so
+    // the two are the same bytes, not merely close (before v0.5.0 it was a
+    // separate implementation, equal to ~1e-3).
     Image img = test_image();
 
     SubsetData full;
@@ -138,23 +170,83 @@ TEST_CASE(SubsetPrecomputer, FastPathMatchesFullPrecompute) {
             SubsetPrecomputer::compute_hessian_only(img, 60, 70, DIM);
     REQUIRE(cached.valid);
 
-    CHECK_REL(cached.mean_intensity, full.mean_intensity, 1e-4);
-    CHECK_REL(cached.std_dev, full.std_dev, 1e-4);
-
     SubsetData fast;
     SubsetPrecomputer::precompute_subset_fast(fast, img, 60, 70, DIM, cached);
     REQUIRE(fast.is_initialized);
 
-    size_t n = (size_t) DIM * DIM;
-    for (size_t i = 0; i < n; i += 13) {
-        CHECK_NEAR(fast.norm_ref_intensities[i], full.norm_ref_intensities[i], 1e-3);
-        for (int k = 0; k < 6; ++k) {
-            CHECK_NEAR(fast.steepest_descent_images[i](k),
-                       full.steepest_descent_images[i](k), 1e-3);
-            CHECK_NEAR(fast.sdi_planes[k * n + i], full.sdi_planes[k * n + i], 1e-3);
-        }
-    }
+    const size_t n = (size_t) DIM * DIM;
+    auto same = [](const void *a, const void *b, size_t bytes) { return std::memcmp(a, b, bytes) == 0; };
+    CHECK(fast.mean_intensity == full.mean_intensity);
+    CHECK(fast.std_dev == full.std_dev);
+    CHECK(same(fast.norm_ref_intensities.data(), full.norm_ref_intensities.data(), n * sizeof(float)));
+    CHECK(same(fast.sdi_planes.data(), full.sdi_planes.data(), 6 * n * sizeof(float)));
+    CHECK(same(fast.H_inv.data(), full.H_inv.data(), sizeof(float) * 36));
+    CHECK(same(fast.H.data(), full.H.data(), sizeof(float) * 36));
+    for (size_t i = 0; i < n; ++i)
+        for (int k = 0; k < 6; ++k)
+            CHECK(fast.steepest_descent_images[i](k) == full.steepest_descent_images[i](k));
+
+    // An invalid pool entry is final for the fast path.
+    SubsetData none;
+    SubsetPrecomputer::precompute_subset_fast(none, img, 60, 70, DIM, CachedHessianData{});
+    CHECK(!none.is_initialized);
+}
+
+// The conditioning test used to be |det H| < 1e-6, and det H scales with the
+// subset: the four gradient rows and columns grow as (dim/2)^2. A singular
+// Hessian's rounding noise alone cleared the floor by twenty orders of
+// magnitude, and past ~170 px a healthy one overflowed float. It is now an
+// rcond estimate with those rows and columns divided by dim/2.
+TEST_CASE(SubsetPrecomputer, LargeSubset_HinvFinite) {
+    dictest::SpeckleField field(5, 320, 320);
+    const Image img = dictest::make_reference_image(field, 320, 320);
+    SubsetData data;
+    SubsetPrecomputer::precompute_subset(data, img, 160, 160, 301);
+    REQUIRE(data.is_initialized);
+    for (int r = 0; r < 6; ++r)
+        for (int c = 0; c < 6; ++c) CHECK(std::fabs(data.H_inv(r, c)) < 1e30f);
+    const Eigen::Matrix<float, 6, 6> prod = data.H * data.H_inv;
     for (int r = 0; r < 6; ++r)
         for (int c = 0; c < 6; ++c)
-            CHECK_REL(fast.H_inv(r, c), full.H_inv(r, c), 5e-3);
+            CHECK_NEAR(prod(r, c), (r == c) ? 1.0f : 0.0f, 5e-2);
+}
+
+TEST_CASE(SubsetPrecomputer, IllConditioned_Rejected) {
+    // Vertical stripes: no y gradient, so the v and every d/dy column of the
+    // steepest-descent images vanish. The 2x2 translation check catches it.
+    {
+        const int w = 96, h = 96;
+        std::vector<uint8_t> zero((size_t)w * h, 0);
+        Image img(w, h, zero.data());
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x)
+                img.intensities[(size_t)y * w + x] = 128.0f + 80.0f * std::sin(x * 0.7f);
+        img.prepare_data(false);
+        SubsetData data;
+        SubsetPrecomputer::precompute_subset(data, img, 48, 48, 21);
+        CHECK(!data.is_initialized);
+        CHECK(!SubsetPrecomputer::compute_hessian_only(img, 48, 48, 21).valid);
+    }
+    // A pattern symmetric about the subset centre cannot see a rotation about
+    // it: on x^2 + y^2 the 5-point gradients are exact, gx*y == gy*x at every
+    // pixel, and the d/dy-of-u and d/dx-of-v columns coincide. The translation
+    // block is perfectly conditioned, so only the full 6x6 test can catch it;
+    // det H came out at +1e9 (21 px) to +8e16 (201 px), or negative, and the
+    // subset was accepted with a meaningless inverse.
+    for (int dim : {21, 201}) {
+        const int w = dim + 40, h = dim + 40, c = w / 2;
+        const float k = 0.3f * (41.0f / dim) * (41.0f / dim);
+        std::vector<uint8_t> zero((size_t)w * h, 0);
+        Image img(w, h, zero.data());
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                const float dx = (float)(x - c), dy = (float)(y - c);
+                img.intensities[(size_t)y * w + x] = k * (dx * dx + dy * dy);
+            }
+        img.prepare_data(false);
+        SubsetData data;
+        SubsetPrecomputer::precompute_subset(data, img, c, c, dim);
+        CHECK(!data.is_initialized);
+        CHECK(!SubsetPrecomputer::compute_hessian_only(img, c, c, dim).valid);
+    }
 }

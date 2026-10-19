@@ -200,3 +200,24 @@ TEST_CASE(Strain, OutlierTestSkipsSparseAndInvalidPoints) {
     CHECK(StrainCalculator::reject_displacement_outliers(g) == 0);
     CHECK(count_invalid(g) == 1);
 }
+
+// ---------------------------------------------------------------------------
+// util::median_inplace — the one median, shared by the displacement outlier
+// test above and the anchor lattice's median test and global shift. The
+// anchor lattice had its own, which took the upper of the middle pair for an
+// even count: in an 8-neighbourhood the test then leaned towards the larger
+// displacements.
+// ---------------------------------------------------------------------------
+#include "util/median.hpp"
+
+TEST_CASE(Median, EvenCountAveragesMiddlePair) {
+    float even[] = {4.0f, 1.0f, 3.0f, 2.0f};
+    CHECK(Semper::util::median_inplace(even, 4) == 2.5f);
+    float eight[] = {0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+    CHECK(Semper::util::median_inplace(eight, 8) == 0.5f);   // the upper one was 1
+    float odd[] = {5.0f, -1.0f, 3.0f};
+    CHECK(Semper::util::median_inplace(odd, 3) == 3.0f);
+    float one[] = {7.0f};
+    CHECK(Semper::util::median_inplace(one, 1) == 7.0f);
+    CHECK(Semper::util::median_inplace(nullptr, 0) == 0.0f);
+}

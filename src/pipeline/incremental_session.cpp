@@ -99,6 +99,11 @@ struct IncrementalSession::Impl {
 
     // Move the reference to the frame just solved. U/V/valid are that frame's
     // totals on the frame-0 grid.
+    // One frame; both public overloads land here with the token to poll.
+    int process(const cv::Mat& def_gray, float* output, int output_capacity,
+                float* metrics, int metrics_len, CancelToken& cancel,
+                ProgressCallback on_progress, IncrementalFrameInfo* info);
+
     void move_reference(FieldCapture &cap, const std::vector<float> &U,
                         const std::vector<float> &V,
                         const std::vector<unsigned char> &valid, int new_ref_index) {
@@ -142,6 +147,15 @@ struct IncrementalSession::Impl {
         params_k.rect_y = grid_rect.y;
         params_k.rect_w = grid_rect.width;
         params_k.rect_h = grid_rect.height;
+        // The increment solve's own strain is never reported (frames are
+        // packed on the frame-0 grid, with the frame-0 window), but its
+        // window must still pass validate_params on this grid, which can be
+        // much smaller than frame 0's once the tracked material shrinks.
+        // A window past the bound would only have emptied that solve's
+        // packing anyway; capping it changes nothing the caller sees except
+        // that frame's metrics slots 1 and 20.
+        params_k.strain_window = (int)std::min<int64_t>(params_k.strain_window,
+                                                        max_strain_window(params_k));
         if (bb.area() == 0) std::fill(alive.begin(), alive.end(), 0);
         ref_index = new_ref_index;
         frames_since_update = 0;
@@ -174,14 +188,17 @@ int IncrementalSession::init(const cv::Mat& ref_gray, const cv::Mat& roi_mask,
     s.clear();
 
     if (ref_gray.empty() || ref_gray.type() != CV_8UC1) return -3;
+    if (!roi_mask.empty() && roi_mask.type() != CV_8UC1) return -3;
     if (params.update_interval < 0) return -3;
-    const FullFieldParams& f = params.field;
-    if (f.step <= 0 || f.subset_size <= 0) return -2;
+    // The same checks run_full_field makes, with the rect clipped to the
+    // image the same way, so the frame-0 grid is the grid every frame solves.
+    s.params = params;
+    const int param_rc = validate_params(s.params.field, ref_gray.cols, ref_gray.rows);
+    if (param_rc != 0) return param_rc;
+    const FullFieldParams& f = s.params.field;
     const int gridW = f.rect_w / f.step, gridH = f.rect_h / f.step;
-    if (gridW <= 0 || gridH <= 0) return -2;
     if (StrainCalculator::vsg_window_node_count(f.step, f.strain_window) < 3) return kBadStrainWindow;
 
-    s.params = params;
     s.width = ref_gray.cols;
     s.height = ref_gray.rows;
     s.grid0 = GridGeom{gridW, gridH, f.rect_x, f.rect_y, f.step};
@@ -221,16 +238,24 @@ int IncrementalSession::init(const cv::Mat& ref_gray, const cv::Mat& roi_mask,
 int IncrementalSession::process_frame(const cv::Mat& def_gray, float* output, int output_capacity,
                                       float* metrics, int metrics_len, CancelToken& cancel,
                                       ProgressCallback on_progress, IncrementalFrameInfo* info) {
-    detail::ScopedCancelToken bind(cancel);
-    return process_frame(def_gray, output, output_capacity, metrics, metrics_len,
-                         std::move(on_progress), info);
+    return impl_ ? impl_->process(def_gray, output, output_capacity, metrics, metrics_len,
+                                  cancel, std::move(on_progress), info)
+                 : -3;
 }
 
 int IncrementalSession::process_frame(const cv::Mat& def_gray, float* output, int output_capacity,
                                       float* metrics, int metrics_len,
                                       ProgressCallback on_progress, IncrementalFrameInfo* info) {
-    if (!impl_ || !impl_->initialized || output == nullptr) return -3;
-    Impl& s = *impl_;
+    return impl_ ? impl_->process(def_gray, output, output_capacity, metrics, metrics_len,
+                                  detail::global_cancel_token(), std::move(on_progress), info)
+                 : -3;
+}
+
+int IncrementalSession::Impl::process(const cv::Mat& def_gray, float* output, int output_capacity,
+                                      float* metrics, int metrics_len, CancelToken& cancel,
+                                      ProgressCallback on_progress, IncrementalFrameInfo* info) {
+    if (!initialized || output == nullptr) return -3;
+    Impl& s = *this;
     if (def_gray.empty() || def_gray.type() != CV_8UC1 ||
         def_gray.cols != s.width || def_gray.rows != s.height) {
         return -3;
@@ -296,7 +321,7 @@ int IncrementalSession::process_frame(const cv::Mat& def_gray, float* output, in
         // Same call as run_full_field, straight into the caller's buffer.
         const int rc = run_full_field_impl(s.cache, def_gray, s.user_mask0, s.params.field,
                                            output, output_capacity, metrics, metrics_len,
-                                           std::move(on_progress), &cap);
+                                           std::move(on_progress), &cap, cancel);
         if (rc < 0) return rc;
         written = rc;
         const NodeField nf = node_field_from_capture(cap);
@@ -318,7 +343,7 @@ int IncrementalSession::process_frame(const cv::Mat& def_gray, float* output, in
         s.scratch.resize((size_t)std::max(gw * gh, 1) * 8);
         const int rc = run_full_field_impl(s.cache, def_gray, s.mask_k, s.params_k,
                                            s.scratch.data(), (int)s.scratch.size(),
-                                           metrics, metrics_len, std::move(on_progress), &cap);
+                                           metrics, metrics_len, std::move(on_progress), &cap, cancel);
         if (rc < 0) return rc;
         const NodeField inc = node_field_from_capture(cap);
         const GapDistance gd = gap_distance(inc);

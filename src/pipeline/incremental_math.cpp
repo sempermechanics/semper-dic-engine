@@ -250,14 +250,15 @@ bool match_anchor(const CoastAnchor &a, const Image &def, int subset_size, bool 
     subset.cx = a.ax;
     subset.cy = a.ay;
 
-    OptimizationEngine engine;
-    engine.lm_enabled = true;
-    engine.lm_alpha = tuning::kLmAlpha;
-    engine.use_6x6_interpolator = use_6x6;
+    OptimizationEngine engine = make_engine(use_6x6);
     // Guess for the centre pixel: the node's guess less its offset from it.
     const AnalysisResult res = engine.calculate_deformation(
             subset, def, guess_x - a.dx - (float)a.ax, guess_y - a.dy - (float)a.ay,
             0.0f, 0.0f, 0.0f, 0.0f, INIT_NO_SEARCH);   // simplex rescue, as Path B
+    // Only a converged solve that clears the field's acceptance gate confirms
+    // the node. A hard reject (status 1, the 2.0 sentinel) stops where it
+    // started, which is always inside max_shift of the guess.
+    if (res.status != 0 || !(res.correlation_score <= tuning::kCorrAccept)) return false;
     // The node, (dx, dy) from the centre, through the matched affine map.
     const float nx = (float)a.ax + res.u + (1.0f + res.ux) * a.dx + res.uy * a.dy;
     const float ny = (float)a.ay + res.v + res.vx * a.dx + (1.0f + res.vy) * a.dy;

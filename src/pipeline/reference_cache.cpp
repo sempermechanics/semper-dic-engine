@@ -1,4 +1,5 @@
 #include <semper/pipeline.hpp>
+#include <semper/tuning.hpp>
 #include "full_field_internal.hpp"
 #include "util/log.hpp"
 #include <opencv2/imgproc.hpp>
@@ -8,9 +9,10 @@ namespace pipeline {
 
 namespace {
 
-// Ghost Wall: masked reference pixels carry -10, which every subset routine
-// skips (threshold -5). Applied after prepare_data, so gradients next to the
-// mask edge are still computed from the real intensities.
+// Ghost Wall: masked reference pixels carry tuning::kGhostWallValue, which
+// every subset routine skips (tuning::kGhostWallThreshold). Applied after
+// prepare_data, so gradients next to the mask edge are still computed from
+// the real intensities.
 void stamp_ghost_wall(Image& img, const cv::Mat& roi_mask) {
     int sterilized_count = 0;
     if (!roi_mask.empty()) {
@@ -21,7 +23,7 @@ void stamp_ghost_wall(Image& img, const cv::Mat& roi_mask) {
         for (int y = 0; y < img.height; ++y) {
             for (int x = 0; x < img.width; ++x) {
                 if (mask.at<uchar>(y, x) < 128) {
-                    img.intensities[y * img.width + x] = -10.0f;
+                    img.intensities[y * img.width + x] = tuning::kGhostWallValue;
                     sterilized_count++;
                 }
             }
@@ -45,7 +47,11 @@ void ReferenceCache::reset() {
 
 void ReferenceCache::set_from_gray(const cv::Mat& gray_in, const cv::Mat& roi_mask) {
     reset();
-    if (gray_in.empty()) return;
+    // Image and the Ghost Wall read pixels as bytes; anything but 8-bit gray
+    // (image or mask) leaves the cache empty, and the next solve returns -3.
+    // io::to_gray8 converts.
+    if (gray_in.empty() || gray_in.type() != CV_8UC1) return;
+    if (!roi_mask.empty() && roi_mask.type() != CV_8UC1) return;
     gray = gray_in.clone();
     width = gray.cols;
     height = gray.rows;

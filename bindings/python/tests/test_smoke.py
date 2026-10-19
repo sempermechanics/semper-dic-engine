@@ -41,7 +41,7 @@ def test_recovers_rigid_translation():
 
     assert res.count > 0
     assert res.points.shape[1] == 8
-    assert res.metrics.shape == (23,)
+    assert res.metrics.shape == (24,)
     # Column 2 is u (x-displacement). Recovered median should match the shift.
     u = res.points[:, 2]
     assert np.median(u) == pytest.approx(dx, abs=0.5)
@@ -77,7 +77,7 @@ def test_degenerate_roi_no_raise_returns_negative_result():
     # metrics is still the full (17,) array.
     assert res.count == semper.ERR_ROI
     assert res.points.shape == (0, 8)
-    assert res.metrics.shape == (23,)
+    assert res.metrics.shape == (24,)
 
 
 def test_set_reference_rejects_non_2d():
@@ -87,18 +87,27 @@ def test_set_reference_rejects_non_2d():
         eng.set_reference(rgb)
 
 
-def test_set_reference_float_array_is_cast_not_rejected():
-    # to_gray uses pybind11 forcecast, so a float64 array is silently narrowed to
-    # uint8 rather than rejected — the "must be uint8" message is NOT enforced.
-    # Pin this surprising-but-real behavior so a future change is a conscious one.
+def test_float_image_is_scaled_not_truncated():
+    # A float image in [0, 1] used to go through pybind11's forcecast, which
+    # truncated every pixel to 0 or 1: a black frame. Non-uint8 arrays are now
+    # mapped from their own range onto 0..255 (io::to_gray8), the same rule as
+    # a decoded 16-bit file, and ZNSSD does not see the affine map.
+    ref = _speckle()
+    dx = 3
+    eng_u8 = semper.Engine()
+    eng_u8.set_reference(ref)
+    want = eng_u8.run(np.roll(ref, dx, axis=1), rect=(40, 40, 176, 176), step=20,
+                      subset=31, strain_window=41)
+
     eng = semper.Engine()
-    ref_f64 = _speckle().astype(np.float64)
-    eng.set_reference(ref_f64)  # must NOT raise
-    res = eng.run(
-        ref_f64, rect=(0, 0, 128, 128), step=20, subset=31, strain_window=41,
-        raise_on_error=False,
-    )
-    assert res.metrics.shape == (23,)
+    eng.set_reference(ref.astype(np.float64) / 255.0)
+    got = eng.run(np.roll(ref, dx, axis=1).astype(np.float32) / 255.0,
+                  rect=(40, 40, 176, 176), step=20, subset=31, strain_window=41)
+    # Stretched to the full 0..255 range before quantizing, so not the same
+    # bytes as the uint8 frame, but the same field.
+    assert want.count > 0
+    assert got.count >= 0.8 * want.count
+    assert abs(float(np.median(got.points[:, 2])) - dx) < 0.05
 
 
 def test_strain_window_too_small_raises():
@@ -117,9 +126,38 @@ def test_error_codes_and_messages():
     assert semper.ERR_ROI == -2
     assert semper.ERR_INIT == -3
     assert semper.ERR_STRAIN_WINDOW == -4
+    assert semper.ERR_SEED == -5
+    assert "seed" in str(semper.DicError(semper.ERR_SEED))
     assert semper.ERR_CANCELLED == -99
     # DicError carries the code and maps to the documented human message.
     err = semper.DicError(semper.ERR_ROI)
     assert err.code == semper.ERR_ROI
     assert "ROI" in str(err)
     assert semper.DicError(semper.ERR_INIT).code == semper.ERR_INIT
+
+
+def test_even_subset_rejected_with_init_code():
+    # An even subset is off-centre by construction and used to write past the
+    # engine's subset buffers; it is an argument error now.
+    ref = _speckle()
+    eng = semper.Engine()
+    eng.set_reference(ref)
+    for subset in (30, 0):
+        with pytest.raises(semper.DicError) as excinfo:
+            eng.run(ref, rect=(40, 40, 176, 176), step=20, subset=subset, strain_window=41)
+        assert excinfo.value.code == semper.ERR_INIT
+
+
+def test_rect_larger_than_image_is_clipped():
+    # The rect is clipped to the image, so an oversized one solves the image
+    # instead of sizing buffers from the rect.
+    ref = _speckle()
+    eng = semper.Engine()
+    eng.set_reference(ref)
+    big = eng.run(ref, rect=(0, 0, 2**31 - 1, 2**31 - 1), step=20, subset=31, strain_window=41)
+    exact = eng.run(ref, rect=(0, 0, 256, 256), step=20, subset=31, strain_window=41)
+    assert big.count == exact.count
+    np.testing.assert_array_equal(big.points, exact.points)
+    with pytest.raises(semper.DicError) as excinfo:
+        eng.run(ref, rect=(300, 0, 64, 64), step=20, subset=31, strain_window=41)
+    assert excinfo.value.code == semper.ERR_ROI

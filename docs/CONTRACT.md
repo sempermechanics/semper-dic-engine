@@ -25,9 +25,9 @@ usual. Respect the surface described here, and declare your change's
 | Tier | What it covers | Rule for contributors |
 |---|---|---|
 | **Frozen** | Binary/data formats: output packing, metrics layout, error codes, and the *meaning* of existing `FullFieldParams` fields | Never change in place. A change here is a **major** version bump and requires a coordinated change in the downstream app. |
-| **Stable** | Public function **signatures** in `include/semper/{pipeline,incremental,io,cancel,version}.hpp` and `include/semper/semper_c.h` | May be **extended additively** (new overloads / new functions). Existing signatures, parameter order, defaults, and semantics must not change without a **major** bump. |
+| **Stable** | Public function **signatures** in `include/semper/{pipeline,incremental,io,cancel,metrics,version}.hpp` and `include/semper/semper_c.h` | May be **extended additively** (new overloads / new functions). Existing signatures, parameter order, defaults, and semantics must not change without a **major** bump. |
 | **Additive-only** | Deliberate growth points: trailing `FullFieldParams` fields, unused metrics slots | Append only, each with a default that reproduces prior behavior. Never reorder or repurpose an existing entry. |
-| **Internal** | Everything in `src/`, `tuning.hpp` constants, `types.hpp`, `seeding.hpp`, algorithm internals, private headers. Living under `include/semper/` does **not** make a header Stable — only the five named above and `semper_c.h` are. | Change freely. Behavior is guarded by the golden test, not by this contract. |
+| **Internal** | Everything in `src/`, `tuning.hpp` constants, `types.hpp`, `seeding.hpp`, algorithm internals, private headers. Living under `include/semper/` does **not** make a header Stable — only the six named above and `semper_c.h` are (`guarded_call.hpp`, added v0.5.0, is Internal). | Change freely. Behavior is guarded by the golden test, not by this contract. |
 
 **Semantic versioning** (`include/semper/version.hpp` / `SEMPER_VERSION`):
 
@@ -36,6 +36,18 @@ usual. Respect the surface described here, and declare your change's
 - **patch** — Internal-only improvement (accuracy, speed, robustness) with no surface change.
 
 Downstream apps pin an **exact** engine tag and only auto-adopt minor/patch bumps.
+
+> **v0.5.0 is a minor release.** Additive: `kSeedFailed` / `SEMPER_ERR_SEED`
+> (`-5`), metrics slot 23 and `kMetricsLen` / `SEMPER_METRICS_LEN` = 24,
+> `metrics.hpp` with `metrics_prefix_len`, `io::to_gray8`. Every Frozen value
+> and every existing signature is unchanged. What callers can observe besides:
+> inputs that used to be accepted and mis-solved are now refused (`-3` for an
+> even subset, a frame that does not match the reference, or a strain window
+> too large for the grid to ever fit, `-2` for a rect
+> with nothing on the image), exceptions no longer cross the C ABI or JNI, a
+> `CancelToken` solve no longer listens to `request_cancel()`, non-8-bit
+> images keep their contrast, and the solved field moves (IC-GN validity and
+> conditioning, MATHEMATICS §6.6; goldens re-captured).
 
 > **Build-plumbing carve-out.** Export/visibility machinery — the `SEMPER_C_API`
 > macro, `-fvisibility=hidden`, `dllexport`/`dllimport` selection — is treated as
@@ -69,18 +81,52 @@ int run_full_field(..., CancelToken& token, ProgressCallback on_progress = nullp
 ```
 
 - **Returns** *(Frozen)*: `>= 0` → number of valid output points. `-2` → invalid ROI.
-  `-3` → init/argument failure. `-99` (`kCancelled`) → cancelled mid-solve.
+  `-3` → init/argument failure. `-4` (`kBadStrainWindow`) → strain window too
+  small for the step. `-5` (`kSeedFailed`, v0.5.0) → nothing could seed the
+  solve. `-99` (`kCancelled`) → cancelled mid-solve.
   A non-positive `params.step` is treated as an invalid ROI (`-2`) — it would
   otherwise divide-by-zero when forming the grid. This is a clarification of the
   existing `-2` meaning, not a new code.
+- **Image types** *(v0.5.0)*: `def_gray` must be `CV_8UC1` and the size of
+  the cached reference, and a non-empty `roi_mask` `CV_8UC1` (any size; it is
+  resized), or the call returns `-3`. A frame of another size used to skip
+  phase correlation and then solve anyway, returning a plausible field of
+  nonsense. `set_from_gray` with a non-`CV_8UC1` image or mask leaves the
+  cache empty (so the next solve is `-3`), and `IncrementalSession::init`
+  returns `-3` for either.
+- **Parameter validation** *(v0.5.0)*: `subset_size` must be odd and at least
+  3, or the call returns `-3` (an even size overran the subset buffers). The
+  rect is clipped to the reference image before the grid is formed; the near
+  edge moves by whole steps, so every node keeps its position
+  `rect_x + i * step`. A rect with nothing on the image, or narrower than one
+  step once clipped, is `-2`. Until v0.5.0 an oversized rect sized the grid
+  from the rect and could throw `std::bad_alloc` out of the call.
+- **Strain window upper bound** *(v0.5.0)*: `strain_window` may be at most
+  `2 * (min(gridW, gridH) + 1) * step` px, with `gridW = rect_w / step` and
+  `gridH = rect_h / step` of the clipped rect; above that the call returns
+  `-3` (`IncrementalSession::init` likewise, on the frame-0 grid). Past that
+  size the VSG circle reaches more than a step beyond the grid's short side
+  from every node, so no node can meet the strain fit's 90% window-coverage
+  rule and the field would come back empty — the same outcome as before,
+  except that it used to take `(strain_window / step)^2` work per node first
+  (hours at `INT_MAX`). The lower bound is unchanged: too small for the step is
+  still `-4`. A rejection, not a clamp: a clamped window would solve a
+  different strain fit than the one asked for.
+- **Exceptions** never cross the C ABI or JNI: each entry point catches what
+  escapes and returns `-3` (`NULL` from the C constructors). The C++ functions
+  may still throw `std::bad_alloc` and OpenCV exceptions.
 - **Writes** *(Frozen)*: at most `output_capacity` floats, **8 per point** (see
   [A.4](#a4-frozen-data-formats)). Points beyond capacity are **dropped, never
   overflow**.
 - **Metrics** *(Frozen layout)*: when `metrics != nullptr && metrics_len >= 16`,
-  fill telemetry; 23 slots preferred. Slot indices are frozen.
+  fill the `metrics_prefix_len(metrics_len)` leading slots; `kMetricsLen` (24)
+  preferred (`include/semper/metrics.hpp`). Slot indices are frozen.
 - **Cancellation**: the legacy overload clears the process-global cancel flag on
-  entry and polls it inside point loops. The `CancelToken&` overload binds that
-  token for the duration of the solve.
+  entry and polls it inside point loops. The `CancelToken&` overload clears and
+  polls only that token, so solves with their own tokens can run concurrently
+  and cancel independently, and `request_cancel()` does not reach them. (Until
+  v0.5.0 the token was bound into one process-global pointer for the duration
+  of the solve, so two concurrent solves polled whichever was bound last.)
 - **You may** make it faster or more accurate (Internal). **You may not** change
   return-code meanings, 8-float packing, the capacity-drop rule, or metric slot
   indices without a major bump.
@@ -157,7 +203,8 @@ public:
   `run_full_field` against the first image. With any interval, the first frame
   is too.
 - **Returns** *(Frozen)*: `init` returns `0`, `-2`, `-3` (empty image, negative
-  interval) or `-4`. `process_frame` returns the same codes as `run_full_field`;
+  interval, a `subset_size` that is not odd and at least 3) or `-4`. The rect is
+  validated and clipped exactly as `run_full_field` does. `process_frame` returns the same codes as `run_full_field`;
   `-3` also covers "not initialized" and a frame whose size differs from the
   first image.
 - **Errors and cancellation** leave the session exactly as it was, so the same
@@ -195,7 +242,9 @@ bool cancel_requested();
 // Plus CancelToken for per-instance cancel (SDK / Python)
 ```
 
-The free functions stay — JNI `setCancelRequested` maps to them.
+The free functions stay — JNI `setCancelRequested` maps to them. They act on
+one process-wide token, the one every solve started without a token polls.
+`detail::ScopedCancelToken` (never documented here) was removed in v0.5.0.
 
 ### Image I/O — `include/semper/io.hpp` · *Stable*
 
@@ -203,9 +252,20 @@ The free functions stay — JNI `setCancelRequested` maps to them.
 cv::Mat decode_gray(const uint8_t* data, size_t len, int expected_w = 0, int expected_h = 0);
 cv::Mat decode_bgr (const uint8_t* data, size_t len);
 void    image_dimensions(const uint8_t* data, size_t len, int& out_w, int& out_h);
+cv::Mat to_gray8(const cv::Mat& img);                         // added v0.5.0
 ```
 
 Empty `cv::Mat` = failure; do not switch to throwing.
+
+- **Depth** *(v0.5.0)*: an encoded image of any depth other than 8-bit is
+  mapped linearly from its own min..max onto 0..255 (`to_gray8`); a flat one
+  becomes 128. Before, `convertTo(CV_8U)` saturated it — a 12-bit camera frame
+  came out nearly all white. ZNSSD is invariant to that affine map, so only
+  quantization changes for frames that already decoded correctly.
+- **Raw or encoded** *(v0.5.0)*: with `expected_w/h`, a buffer of exactly
+  `w*h*4` or `w*h` bytes is still decoded as an image when it starts with a
+  PNG, JPEG, TIFF, BMP, WebP or PNM signature and decodes as one; otherwise it
+  is raw, as before.
 
 ### C ABI — `include/semper/semper_c.h` · *Stable (ABI)*
 
@@ -290,14 +350,15 @@ index:  0   1   2   3     4     5     6      7
 field:  x   y   u   v    exx   eyy   exy   corr
 ```
 
-### Metrics buffer — **23 × `float32`**
+### Metrics buffer — **24 × `float32`**
 
 Slot indices are Frozen; new telemetry appends. `metrics_len == 16` is the
-minimum honored; **23 preferred**. The writer copies the largest prefix the
-caller's buffer can hold (16, 17, 19, 20, 21, 22 or 23 slots), so an existing
-caller that still passes 17 keeps working unchanged. The JNI adapter honours
-this from v0.4.1; before that it copied at most 19 slots, so slots 19–22 never
-reached Kotlin.
+minimum honored; **24 preferred** (`kMetricsLen`, `SEMPER_METRICS_LEN`). The
+writer copies the largest prefix the caller's buffer can hold (16, 17, 19, 20,
+21, 22, 23 or 24 slots; `metrics_prefix_len` is the one table, used by the
+solver and the JNI copy-back alike), so an existing caller that still passes
+17 or 23 keeps working unchanged. The JNI adapter honours this from v0.4.1;
+before that it copied at most 19 slots, so slots 19–22 never reached Kotlin.
 
 **Slot 10 semantic change (v0.2.2).** The index, type and layout are unchanged
 and remain Frozen. Its *meaning* changed from "AKAZE + RANSAC time (ms)" to
@@ -321,16 +382,21 @@ than repurpose either Frozen slot, v0.3.0 **appends** the missing terms:
 | 20 | Converged, then discarded by the VSG strain post-filter | v0.3.0 |
 | 21 | Phase-correlation lock: `1` = locked, `0` = no lock | v0.3.0 |
 | 22 | Mesh coverage: convex hull of the accepted anchors / ROI area, `0..1` | v0.3.0 |
+| 23 | Converged, then rejected by the displacement median test before packing | v0.5.0 |
 
-With slot 19 and slot 20 present the point accounting closes exactly, as
+With slots 19, 20 and 23 present the point accounting closes exactly, as
 long as the output buffer was large enough to hold the whole field:
 
 ```
-metrics[3] + metrics[4] + metrics[19] == metrics[1] + metrics[20]
+metrics[3] + metrics[4] + metrics[19] == metrics[1] + metrics[20] + metrics[23]
 ```
 
-That is, every point some path solved is either in the output buffer or was
-dropped by the strain post-filter. Slot 20 was previously invisible: a caller
+That is, every point some path solved is either in the output buffer, was
+rejected as a displacement outlier, or was dropped by the strain
+post-filter. Until v0.5.0 the identity had no slot 23 and failed whenever the
+median test rejected anything (`FullField.MetricsIdentityHoldsWithOutliers`);
+a caller reading a 23-slot buffer can still recover slot 23 as the
+difference. Slot 20 was previously invisible: a caller
 seeing slot 1 fall short of slots 3 + 4 had no way to distinguish a point that
 never converged from one that converged and was then discarded because its
 strain fit was rank-deficient.
@@ -393,6 +459,7 @@ and smoke test in this repo was on the wrong side of it before v0.3.0.
 | `-2` | invalid ROI |
 | `-3` | init / argument failure |
 | `-4` | `strain_window` too small for `step` (**added v0.3.0**) |
+| `-5` | no seed: no anchor converged, phase correlation did not lock, and the fallback search failed (**added v0.5.0**; this case returned an undocumented `-1` before) |
 | `-99` (`kCancelled`) | cancelled mid-solve |
 
 ---

@@ -104,27 +104,29 @@ int run_path_c(
     int flat_idx = path_c_seed_y * gridW + path_c_seed_x;
 
     Semper::SubsetData seed_subset;
-    SubsetPrecomputer::precompute_subset_fast(seed_subset, *ctx.cache.ref_img, realX, realY, params.subset_size, ctx.hessian_pool[flat_idx]);
+    // The same engine configuration as every other solve (it used to leave
+    // LM damping off). Seed the search from the phase-correlation shift when
+    // there is one: INIT_AUTO_SEARCH honours a non-zero guess and otherwise
+    // falls back to its own +/-15 px scan, so passing the global shift both
+    // starts Path C closer and extends its reach past that scan window.
+    // globalU/globalV are overwritten below only on success, so a failure
+    // leaves the phase-correlation values intact for Path B.
+    OptimizationEngine seed_engine = make_engine(params.use_6x6_interpolator);
+    const float guess[6] = {globalU, globalV, 0.0f, 0.0f, 0.0f, 0.0f};
+    const NodeSolve node = solve_node(seed_engine, seed_subset, *ctx.cache.ref_img, ctx.def_img,
+                                      realX, realY, params.subset_size,
+                                      ctx.hessian_pool[flat_idx], guess, INIT_AUTO_SEARCH);
 
-    if (seed_subset.is_initialized) {
-        OptimizationEngine seed_engine;
-        seed_engine.use_6x6_interpolator = params.use_6x6_interpolator;
-        // Seed the search from the phase-correlation shift when there is one.
-        // INIT_AUTO_SEARCH honours a non-zero guess and otherwise falls back to
-        // its own +/-15 px scan, so passing the global shift both starts Path C
-        // closer and extends its reach past that scan window. globalU/globalV
-        // are overwritten below only on success, so a failure leaves the
-        // phase-correlation values intact for Path B.
-        auto res = seed_engine.calculate_deformation(seed_subset, ctx.def_img, globalU, globalV, 0.0f, 0.0f, 0.0f, 0.0f, INIT_AUTO_SEARCH);
-
+    if (node.initialized) {
+        const AnalysisResult& res = node.res;
         if (res.status == 0 && res.correlation_score <= tuning::kCorrAccept) {
             globalU = res.u; globalV = res.v;
             LOGD("PATH C SUCCESS: Seed locked at u=%.2f, v=%.2f", globalU, globalV);
         } else {
             LOGE("PATH C FAILED: Central anchor search diverged.");
-            return -1;
+            return kSeedFailed;
         }
-    } else { return -1; }
+    } else { return kSeedFailed; }
 
     return 0;
 }

@@ -1,6 +1,7 @@
 // Incremental DIC building blocks on exact fields: increment sampling, the
 // node field built from a solve capture, and the material-mask warp.
 #include "framework/test_framework.h"
+#include <semper/tuning.hpp>
 
 #if defined(DIC_HAVE_OPENCV)
 
@@ -207,6 +208,30 @@ TEST_CASE(IncrementalMath, Anchor_MatchesTheNodeWhereItMoved) {
     // A patch that would leave the image is not cut.
     CoastAnchor edge;
     CHECK(!make_anchor(ref, 12.0f, 100.0f, 21, edge));
+}
+
+// match_anchor confirms a coasted node only on a converged, accepted solve.
+// It used to look at nothing but where the solve stopped: an IC-GN that hit a
+// hard reject at its starting guess (status 1, the 2.0 sentinel score) stopped
+// right there, inside max_shift, and "confirmed" the node with corr 2.0 -- a
+// point that then went into the total-displacement base for good.
+TEST_CASE(IncrementalMath, MatchAnchor_RejectsUnconvergedSolve) {
+    const cv::Mat ref = texture(200, 200, 7);
+    Semper::Image img(ref.cols, ref.rows, ref.data);
+    img.prepare_data(false);
+    CoastAnchor a;
+    REQUIRE(make_anchor(ref, 100.0f, 100.0f, 21, a));
+
+    // Guessed with most of the subset off the left edge: every IC-GN start
+    // fails the 90% valid-pixel guard where it stands.
+    float x = -1, y = -1, corr = -1;
+    CHECK(!match_anchor(a, img, 21, false, 3.0f, 100.0f, 50.0f, x, y, corr));
+    CHECK(x == -1.0f);
+    CHECK(corr == -1.0f);
+
+    // The same anchor where it is: still confirmed.
+    CHECK(match_anchor(a, img, 21, false, 100.5f, 100.0f, 2.0f, x, y, corr));
+    CHECK(corr <= Semper::tuning::kCorrAccept);
 }
 
 TEST_CASE(IncrementalMath, NodeField_DropsUnsolvedAndOutliers) {

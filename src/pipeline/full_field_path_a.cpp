@@ -1,6 +1,5 @@
-// Path A — mesh-guided OpenMP solve.
-// Extract-only split from full_field_path_a.cpp; algorithms unchanged.
-// schedule(dynamic, 32), thread count, and arithmetic are unchanged.
+// Path A — mesh-guided OpenMP solve of every grid node the Delaunay guess
+// field (full_field_mesh.cpp) covers, schedule(dynamic, 32).
 
 #include "full_field_internal.hpp"
 
@@ -37,72 +36,70 @@ void run_path_a(
     const int gridH = ctx.gridH;
     const int safe_cores = ctx.safe_cores;
 
-    std::atomic<bool> omp_region_threw(false);
+    RegionErrors errors;
 #pragma omp parallel num_threads(safe_cores)
     {
         int tid = omp_get_thread_num();
-        OptimizationEngine local_engine; Semper::SubsetData local_subset;
-        // 🚀 ENABLE LEVENBERG-MARQUARDT (TIKHONOV REGULARIZATION) - PATH A
-        local_engine.lm_enabled = true;
-        local_engine.lm_alpha = tuning::kLmAlpha; // <--- TUNE THIS VALUE
-        local_engine.use_6x6_interpolator = params.use_6x6_interpolator;
+        OptimizationEngine local_engine = make_engine(params.use_6x6_interpolator);
+        Semper::SubsetData local_subset;
         double local_hessian = 0.0, local_wait = 0.0; int local_pts = 0;
         EngineStatFlusher flusher(local_engine, stats_pathA[tid], local_pts, local_hessian, local_wait);
 
 #pragma omp for schedule(dynamic, 32)
         for (int idx = 0; idx < gridW * gridH; ++idx) {
-            if (omp_region_threw.load(std::memory_order_relaxed)) continue;
-            if (cancel_requested()) continue;
-            if (!guess.in_mesh[idx]) continue;
-            int x = idx % gridW, y = idx / gridW;
-            if (resultGrid[y][x].solved) continue;
+            if (errors.failed()) continue;
+            if (ctx.cancel.requested()) continue;
+            try {
+                if (!guess.in_mesh[idx]) continue;
+                int x = idx % gridW, y = idx / gridW;
+                if (resultGrid[y][x].solved) continue;
 
-            int realX = params.rect_x + x * params.step, realY = params.rect_y + y * params.step;
-            auto th1 = std::chrono::high_resolution_clock::now();
-            SubsetPrecomputer::precompute_subset_fast(local_subset, *ctx.cache.ref_img, realX, realY, params.subset_size, ctx.hessian_pool[idx]);
-            local_hessian += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - th1).count();
+                int realX = params.rect_x + x * params.step, realY = params.rect_y + y * params.step;
+                const float g[6] = {guess.u[idx], guess.v[idx], guess.ux[idx],
+                                    guess.uy[idx], guess.vx[idx], guess.vy[idx]};
+                const NodeSolve node = solve_node(local_engine, local_subset, *ctx.cache.ref_img,
+                                                  ctx.def_img, realX, realY, params.subset_size,
+                                                  ctx.hessian_pool[idx], g, INIT_NO_SEARCH);
+                local_hessian += node.hessian_ms;
 
-            if (local_subset.is_initialized) {
-                // Save the exact guess before we run
-                resultGrid[y][x].guess_u = guess.u[idx];
-                resultGrid[y][x].guess_v = guess.v[idx];
-                resultGrid[y][x].guess_ux = guess.ux[idx];
-                resultGrid[y][x].guess_uy = guess.uy[idx];
-                resultGrid[y][x].guess_vx = guess.vx[idx];
-                resultGrid[y][x].guess_vy = guess.vy[idx];
+                if (node.initialized) {
+                    // Save the exact guess before we run
+                    resultGrid[y][x].guess_u = g[0];
+                    resultGrid[y][x].guess_v = g[1];
+                    resultGrid[y][x].guess_ux = g[2];
+                    resultGrid[y][x].guess_uy = g[3];
+                    resultGrid[y][x].guess_vx = g[4];
+                    resultGrid[y][x].guess_vy = g[5];
 
-                int simplex_count_before = local_engine.count_simplex;
+                    const Semper::AnalysisResult& res = node.res;
+                    const bool needed_rescue = node.needed_rescue;
+                    stats_pathA[tid].icgn_iters += res.iters;
 
-                auto search_flag = ALLOW_SIMPLEX_RESCUE ? INIT_NO_SEARCH : INIT_NO_SIMPLEX;
-                Semper::AnalysisResult res = local_engine.calculate_deformation(
-                        local_subset, ctx.def_img, guess.u[idx], guess.v[idx], guess.ux[idx], guess.uy[idx], guess.vx[idx], guess.vy[idx], search_flag);
-                reject_if_ghosted(res, params.subset_size);
-                stats_pathA[tid].icgn_iters += res.iters;
-                bool needed_rescue = (local_engine.count_simplex > simplex_count_before);
+                    if (needed_rescue) {
+                        record_simplex_outcome(stats_pathA[tid], res);
+                    }
 
-                if (!ALLOW_SIMPLEX_RESCUE && res.status != 0) { res.correlation_score = 1.0f; }
-
-                if (needed_rescue) {
-                    record_simplex_outcome(stats_pathA[tid], res);
+                    if (res.status == 0 && res.correlation_score <= tuning::kCorrAccept) {
+                        int order = ctx.compute_order_counter.fetch_add(1, std::memory_order_relaxed);
+                        // 🚀 FIX: Passed res.iters at the end instead of icgn_iters_used
+                        resultGrid[y][x] = {(float)realX, (float)realY, res.u, res.v, res.ux, res.uy, res.vx, res.vy,
+                                            res.correlation_score, true, tid, order, resultGrid[y][x].mesh_assignment_type,
+                                            needed_rescue, res.iters};
+                        ctx.global_points_solved.fetch_add(1, std::memory_order_relaxed); local_pts++;
+                    } else {
+                        resultGrid[y][x].solved = false;
+                        resultGrid[y][x].corr = CORR_INVALID;
+                        resultGrid[y][x].used_simplex = needed_rescue;
+                        // 🚀 FIX: Assign the real iterations on failure
+                        resultGrid[y][x].icgn_iters = res.iters;
+                    }
                 }
-
-                if (res.status == 0 && res.correlation_score <= tuning::kCorrAccept) {
-                    int order = ctx.compute_order_counter.fetch_add(1, std::memory_order_relaxed);
-                    // 🚀 FIX: Passed res.iters at the end instead of icgn_iters_used
-                    resultGrid[y][x] = {(float)realX, (float)realY, res.u, res.v, res.ux, res.uy, res.vx, res.vy,
-                                        res.correlation_score, true, tid, order, resultGrid[y][x].mesh_assignment_type,
-                                        needed_rescue, res.iters};
-                    ctx.global_points_solved.fetch_add(1, std::memory_order_relaxed); local_pts++;
-                } else {
-                    resultGrid[y][x].solved = false;
-                    resultGrid[y][x].corr = CORR_INVALID;
-                    resultGrid[y][x].used_simplex = needed_rescue;
-                    // 🚀 FIX: Assign the real iterations on failure
-                    resultGrid[y][x].icgn_iters = res.iters;
-                }
+            } catch (...) {
+                errors.capture();
             }
         }
     }
+    errors.rethrow_if_any();
 }
 
 } // namespace internal

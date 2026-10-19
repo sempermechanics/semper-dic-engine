@@ -31,6 +31,7 @@
 #include <semper/subset.hpp>
 #include <semper/tuning.hpp>
 #include "util/log.hpp"
+#include "util/median.hpp"
 
 #include <omp.h>
 #include <opencv2/imgproc.hpp>
@@ -50,17 +51,6 @@ namespace pipeline {
 namespace internal {
 
 namespace {
-
-float median_of(float* v, int n) {
-    if (n <= 0) return 0.0f;
-    const int mid = n / 2;
-    std::nth_element(v, v + mid, v + n);
-    return v[mid];
-}
-
-float median_of(std::vector<float> v) {
-    return median_of(v.data(), (int)v.size());
-}
 
 // How many lattice indices an axis of n grid nodes carries at this stride,
 // including the last index, which is always appended. Mirrors the loop that
@@ -134,7 +124,8 @@ MeshSeedResult solve_anchor_seeds(
         const HessianPool& hessian_pool,
         const ResultGrid& resultGrid,
         std::vector<ThreadStats>& stats,
-        PhaseTimings& timings) {
+        PhaseTimings& timings,
+        const CancelToken& cancel) {
 
     MeshSeedResult out;
     if (cache.ref_img == nullptr || gridW <= 0 || gridH <= 0) return out;
@@ -225,15 +216,13 @@ MeshSeedResult solve_anchor_seeds(
         const auto init_mode = r.phase_locked ? INIT_NO_SIMPLEX : INIT_AUTO_SEARCH;
 
         std::atomic<int> attempted(0);
+        RegionErrors errors;
 
 #pragma omp parallel num_threads(safe_cores)
         {
             const int tid = omp_get_thread_num();
-            OptimizationEngine engine;
+            OptimizationEngine engine = make_engine(params.use_6x6_interpolator);
             Semper::SubsetData subset;
-            engine.lm_enabled = true;
-            engine.lm_alpha = tuning::kLmAlpha;
-            engine.use_6x6_interpolator = params.use_6x6_interpolator;
             double local_hessian = 0.0, local_wait = 0.0;
             // Stays 0: the anchor phase no longer publishes, so points_solved is
             // credited in publish_anchor_results once the median test has spoken.
@@ -247,68 +236,65 @@ MeshSeedResult solve_anchor_seeds(
             // does not move when the chunk does. docs/SEEDING_BENCHMARK.md 5.1.
 #pragma omp for schedule(dynamic, 4)
             for (int idx = 0; idx < n_anchor; ++idx) {
-                if (cancel_requested()) continue;
+                if (cancel.requested() || errors.failed()) continue;
+                try {
+                    const int gx = lat_x[(size_t)(idx % LW)];
+                    const int gy = lat_y[(size_t)(idx / LW)];
+                    // No ROI mask check here: run_full_field's strict per-pixel scan
+                    // already pre-set `solved` on every node the mask or the boundary
+                    // reserve rejects, and the Hessian pool is only built for the rest.
+                    if (resultGrid[gy][gx].solved) continue;
 
-                const int gx = lat_x[(size_t)(idx % LW)];
-                const int gy = lat_y[(size_t)(idx / LW)];
-                // No ROI mask check here: run_full_field's strict per-pixel scan
-                // already pre-set `solved` on every node the mask or the boundary
-                // reserve rejects, and the Hessian pool is only built for the rest.
-                if (resultGrid[gy][gx].solved) continue;
+                    const int pool_idx = gy * gridW + gx;
+                    const int realX = params.rect_x + gx * params.step;
+                    const int realY = params.rect_y + gy * params.step;
+                    attempted.fetch_add(1, std::memory_order_relaxed);
 
-                const int pool_idx = gy * gridW + gx;
-                const int realX = params.rect_x + gx * params.step;
-                const int realY = params.rect_y + gy * params.step;
-                attempted.fetch_add(1, std::memory_order_relaxed);
+                    // Under the similarity each anchor starts where the rotation puts
+                    // it, with the rotation's gradients: the one global shift is off
+                    // by 2 r sin(theta/2) at radius r.
+                    const float guess_sim[6] = {model_u((float)realX, (float)realY),
+                                                model_v((float)realX, (float)realY),
+                                                gux, guy, gvx, gvy};
+                    const float guess_shift[6] = {r.globalU, r.globalV, 0.0f, 0.0f, 0.0f, 0.0f};
+                    const NodeSolve node = solve_node(engine, subset, *cache.ref_img, def_img,
+                                                      realX, realY, params.subset_size,
+                                                      hessian_pool[(size_t)pool_idx],
+                                                      sim ? guess_sim : guess_shift, init_mode);
+                    local_hessian += node.hessian_ms;
+                    if (!node.initialized) continue;
 
-                auto th1 = std::chrono::high_resolution_clock::now();
-                SubsetPrecomputer::precompute_subset_fast(subset, *cache.ref_img, realX, realY,
-                                                          params.subset_size,
-                                                          hessian_pool[(size_t)pool_idx]);
-                local_hessian += std::chrono::duration<double, std::milli>(
-                        std::chrono::high_resolution_clock::now() - th1).count();
-                if (!subset.is_initialized) continue;
+                    const AnalysisResult& res = node.res;
+                    const bool needed_rescue = node.needed_rescue;
+                    stats[tid].icgn_iters += res.iters;
+                    if (needed_rescue) record_simplex_outcome(stats[tid], res);
 
-                const int simplex_before = engine.count_simplex;
-                // Under the similarity each anchor starts where the rotation puts
-                // it, with the rotation's gradients: the one global shift is off
-                // by 2 r sin(theta/2) at radius r.
-                AnalysisResult res = sim
-                        ? engine.calculate_deformation(
-                                subset, def_img,
-                                model_u((float)realX, (float)realY),
-                                model_v((float)realX, (float)realY),
-                                gux, guy, gvx, gvy, init_mode)
-                        : engine.calculate_deformation(
-                                subset, def_img, r.globalU, r.globalV,
-                                0.0f, 0.0f, 0.0f, 0.0f, init_mode);
-                reject_if_ghosted(res, params.subset_size);
-                stats[tid].icgn_iters += res.iters;
-                const bool needed_rescue = (engine.count_simplex > simplex_before);
-                if (needed_rescue) record_simplex_outcome(stats[tid], res);
+                    if (res.status != 0) continue;
 
-                if (res.status != 0) continue;
+                    // Record, do not publish: the median test has not run yet, so it
+                    // is not yet known whether this node is a measurement or a blunder.
+                    AnchorResult& a = anchors[(size_t)idx];
+                    a.rx = (float)realX; a.ry = (float)realY;
+                    a.u = res.u; a.v = res.v;
+                    a.ux = res.ux; a.uy = res.uy; a.vx = res.vx; a.vy = res.vy;
+                    a.corr = res.correlation_score;
+                    a.gx = gx; a.gy = gy;
+                    a.thread_id = tid;
+                    a.icgn_iters = res.iters;
+                    a.used_simplex = needed_rescue;
 
-                // Record, do not publish: the median test has not run yet, so it
-                // is not yet known whether this node is a measurement or a blunder.
-                AnchorResult& a = anchors[(size_t)idx];
-                a.rx = (float)realX; a.ry = (float)realY;
-                a.u = res.u; a.v = res.v;
-                a.ux = res.ux; a.uy = res.uy; a.vx = res.vx; a.vy = res.vy;
-                a.corr = res.correlation_score;
-                a.gx = gx; a.gy = gy;
-                a.thread_id = tid;
-                a.icgn_iters = res.iters;
-                a.used_simplex = needed_rescue;
-
-                // Two gates. A mesh vertex only has to be approximately right, and
-                // the median test below rejects blunders; an output point has to
-                // clear the same bar Path A applies. kCorrAccept is the tighter of
-                // the two, so output implies vertex.
-                a.vertex = res.correlation_score <= tuning::kAnchorAcceptScore;
-                a.output = res.correlation_score <= tuning::kCorrAccept;
+                    // Two gates. A mesh vertex only has to be approximately right, and
+                    // the median test below rejects blunders; an output point has to
+                    // clear the same bar Path A applies. kCorrAccept is the tighter of
+                    // the two, so output implies vertex.
+                    a.vertex = res.correlation_score <= tuning::kAnchorAcceptScore;
+                    a.output = res.correlation_score <= tuning::kCorrAccept;
+                } catch (...) {
+                    errors.capture();
+                }
             }
         }
+        errors.rethrow_if_any();
 
         r.attempted = attempted.load(std::memory_order_relaxed);
 
@@ -359,7 +345,8 @@ MeshSeedResult solve_anchor_seeds(
                     }
                 }
                 if (nn >= 3) {
-                    const float mu = median_of(nu.data(), nn), mv = median_of(nv.data(), nn);
+                    const float mu = util::median_inplace(nu.data(), (size_t)nn);
+                    const float mv = util::median_inplace(nv.data(), (size_t)nn);
                     if (std::abs(res_u[idx] - mu) > tuning::kAnchorMedianTol ||
                         std::abs(res_v[idx] - mv) > tuning::kAnchorMedianTol) {
                         // Withhold `kept` only. `vertex` stays set, so a rejected
@@ -380,8 +367,8 @@ MeshSeedResult solve_anchor_seeds(
         r.accepted = (int)r.ref_pts.size();
 
         if (r.accepted >= 3) {
-            r.globalU = median_of(us);
-            r.globalV = median_of(vs);
+            r.globalU = util::median_inplace(us.data(), us.size());
+            r.globalV = util::median_inplace(vs.data(), vs.size());
             std::vector<cv::Point2f> hull;
             cv::convexHull(r.ref_pts, hull);
             const float roi_area = (float)(params.rect_w * params.rect_h);

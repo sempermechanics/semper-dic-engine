@@ -22,6 +22,15 @@ constexpr int kCancelled = -99;
 constexpr int kBadStrainWindow = -4;
 
 /**
+ * Returned by run_full_field when nothing could seed the solve: the anchor
+ * lattice solved no node, phase correlation did not lock, and the
+ * central-tendency fallback (Path C) did not converge either -- typically a
+ * deformed frame unrelated to the reference, or motion beyond every search.
+ * Added in 0.5.0; this case used to return an undocumented -1.
+ */
+constexpr int kSeedFailed = -5;
+
+/**
  * A cancellation flag scoped to one solve — thread-safe, so a caller on any
  * thread can stop an in-flight run while the solver's workers poll it.
  *
@@ -50,17 +59,20 @@ private:
 /**
  * Cooperative cancellation for an in-flight solve — process-global convenience API.
  *
- * These delegate to the currently *active* token: the one bound by the
- * [CancelToken]-taking overload of run_full_field for the duration of that solve,
- * or a process-wide default token when none is bound. Only one solve runs at a
- * time (the JNI layer holds the reference-cache mutex for the duration of one),
- * so a single active target is sufficient and keeps the polling call sites inside
- * the solver unchanged.
+ * These act on one process-wide token, the one every solve started *without*
+ * a [CancelToken] polls (the run_full_field and IncrementalSession overloads
+ * that take none). The JNI adapter is that caller: it holds one lock around
+ * one solve at a time. A solve started with its own token polls only that
+ * token, so these functions never reach it, and its token never reaches
+ * anything else (until 0.5.0 the token was bound into a process-global
+ * pointer for the duration of the solve, so two concurrent solves polled one
+ * token between them).
  *
  * The solver polls the flag inside its point loops, so a cancel takes effect
  * within a point or two instead of at the end of the frame. run_full_field clears
- * the active flag on entry, so a stale cancel from a previous solve never aborts
- * the next one. [clear_cancel] remains public for callers that reset explicitly.
+ * the token it polls on entry, so a stale cancel from a previous solve never
+ * aborts the next one. [clear_cancel] remains public for callers that reset
+ * explicitly.
  *
  * Deliberately kept in a header of its own, with no OpenCV in it, so the flag can
  * be linked and tested without the rest of the pipeline.
@@ -71,22 +83,9 @@ bool cancel_requested();
 
 namespace detail {
 
-/**
- * Binds `token` as the active cancel target for the enclosing solve and restores
- * the previous target on scope exit. Used by the [CancelToken]-taking overload of
- * run_full_field so the solver's existing `cancel_requested()` polls route to the
- * per-solve token. Single-solve-at-a-time (see the note above).
- */
-class ScopedCancelToken {
-public:
-    explicit ScopedCancelToken(CancelToken& token);
-    ~ScopedCancelToken();
-    ScopedCancelToken(const ScopedCancelToken&) = delete;
-    ScopedCancelToken& operator=(const ScopedCancelToken&) = delete;
-
-private:
-    CancelToken* prev_;
-};
+/** The process-wide token behind the free functions above. Internal: what the
+ *  token-less overloads pass down to the solver. */
+CancelToken& global_cancel_token() noexcept;
 
 } // namespace detail
 

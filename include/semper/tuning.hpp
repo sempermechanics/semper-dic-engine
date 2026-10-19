@@ -88,6 +88,22 @@ inline constexpr float kSimilarityMinCornerPx = 4.0f;
  *  the similarity fits keep ~100%. */
 inline constexpr float kSimilarityKeepFraction = 0.90f;
 
+/** Ghost Wall: value stamped into reference pixels outside the ROI mask
+ *  (reference_cache.cpp), and the threshold every subset routine tests
+ *  against. Real intensities are >= 0 and a cubic undershoot stays well above
+ *  the threshold, so `< kGhostWallThreshold` means masked and nothing else. */
+inline constexpr float kGhostWallValue = -10.0f;
+inline constexpr float kGhostWallThreshold = -5.0f;
+
+/** Smallest reciprocal condition number (1-norm, from the explicit inverse)
+ *  accepted for a 6x6 subset Hessian before it is inverted. Judged with the
+ *  four gradient rows and columns divided by the subset half-width, which is
+ *  what makes it independent of subset size; the determinant test it replaces
+ *  overflowed float on large subsets and let singular ones through on their
+ *  rounding noise. 1e-6 is a float inverse with about one significant digit
+ *  left. */
+inline constexpr float kHessianMinRcond = 1e-6f;
+
 /** Packed-field sentinel for "no valid correlation at this grid point". */
 inline constexpr float kCorrInvalid = -1.0f;
 

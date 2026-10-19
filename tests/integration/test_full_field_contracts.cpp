@@ -5,16 +5,28 @@
 
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <string>
 #include "framework/synthetic.h"
 #include "framework/synthetic_cv.h"
 
 #include <semper/cancel.hpp>
 #include <semper/strain.hpp>
 #include <semper/pipeline.hpp>
+#include <semper/solver.hpp>
+#include <semper/subset.hpp>
+#include <semper/tuning.hpp>
+#include "pipeline/full_field_internal.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <limits>
+#include <memory>
 #include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
+#include <thread>
 #include <vector>
 
 using Semper::pipeline::FullFieldParams;
@@ -116,6 +128,59 @@ TEST_CASE(FullField, StrainWindowTooSmallForStep_IsRejected) {
                          metrics, 23, nullptr) > 0);
 }
 
+// A strain window far larger than the grid used to be accepted and sized
+// the VSG loops: vsg_window_node_count walks (window / step)^2 offsets, so
+// strain_window = INT_MAX spun for hours inside the -4 check, and a window
+// merely much larger than the grid cost window^2 per node in the strain fit,
+// only to reject every node (once the radius passes the grid's short side by
+// a step, no node can have the 90% of its window on the grid the fit needs).
+// Beyond 2 * (min(gridW, gridH) + 1) * step it is an argument error now.
+TEST_CASE(FullField, HugeStrainWindow_ReturnsInitErrorPromptly) {
+    cv::Mat ref_gray, def_gray;
+    make_pair(ref_gray, def_gray);
+    const FullFieldParams base = params_for(W, H);
+    const int grid_min = std::min(base.rect_w / base.step, base.rect_h / base.step);
+    const int max_window = 2 * (grid_min + 1) * base.step;
+
+    // Run on a worker so a regression fails the test instead of hanging it.
+    auto solve_within = [&](int strain_window, int seconds, int &rc) {
+        auto done = std::make_shared<std::atomic<bool>>(false);
+        auto result = std::make_shared<std::atomic<int>>(0);
+        std::thread([=]() {
+            ReferenceCache cache;
+            cache.set_from_gray(ref_gray, cv::Mat());
+            FullFieldParams p = base;
+            p.strain_window = strain_window;
+            const int cap = 8 * ((W / STEP) * (H / STEP) + 8);
+            std::vector<float> out((size_t)cap, 0.0f);
+            result->store(run_full_field(cache, def_gray, cv::Mat(), p, out.data(), cap,
+                                         nullptr, 0, nullptr));
+            done->store(true);
+        }).detach();
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+        while (!done->load() && std::chrono::steady_clock::now() < until)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        rc = result->load();
+        return done->load();
+    };
+
+    int rc = 0;
+    for (int window : {std::numeric_limits<int>::max(), 1 << 20, max_window + 1}) {
+        const bool returned = solve_within(window, 20, rc);
+        if (!returned) {
+            std::printf("    strain_window=%d still running after 20 s\n", window);
+            std::fflush(stdout);
+            // The worker cannot be stopped or joined; end the run here.
+            std::_Exit(1);
+        }
+        CHECK(rc == -3);
+    }
+    // The largest accepted window still solves (and, at that size, the strain
+    // fit legitimately keeps few or no points).
+    REQUIRE(solve_within(max_window, 60, rc));
+    CHECK(rc >= 0);
+}
+
 TEST_CASE(FullField, DegenerateStep_ReturnsRoiError) {
     cv::Mat ref_gray, def_gray;
     make_pair(ref_gray, def_gray);
@@ -128,6 +193,124 @@ TEST_CASE(FullField, DegenerateStep_ReturnsRoiError) {
     p.step = 0;
     const int code = call_solver(cache, def_gray, p, 8 * 4);
     CHECK(code == -2);
+}
+
+TEST_CASE(FullField, EvenOrZeroSubsetSize_ReturnsInitError) {
+    // The subset is built symmetrically around its centre pixel, so it holds
+    // (2 * (dim / 2) + 1)^2 pixels. For an even dim that is (dim + 1)^2, and
+    // the precompute wrote 441 values into the 400-float buffers of a subset
+    // of 20 (a heap overflow under ASan, silent corruption without it); for 0
+    // it wrote into empty vectors. Nothing below the C ABI checked it.
+    cv::Mat ref_gray, def_gray;
+    make_pair(ref_gray, def_gray);
+    ReferenceCache cache;
+    cache.set_from_gray(ref_gray, cv::Mat());
+    const int cap = 8 * ((W / STEP) * (H / STEP) + 8);
+    for (int subset : {20, 0, -21, 1, 2}) {
+        FullFieldParams p = params_for(W, H);
+        p.subset_size = subset;
+        CHECK(call_solver(cache, def_gray, p, cap) == -3);
+    }
+    // The smallest subset that is accepted.
+    FullFieldParams p = params_for(W, H);
+    p.subset_size = 3;
+    CHECK(call_solver(cache, def_gray, p, cap) >= 0);
+}
+
+TEST_CASE(FullField, HugeRect_ClippedToImage) {
+    // The rect was never intersected with the image: rect_w = INT_MAX made a
+    // grid of INT_MAX / step columns, and the ResultGrid allocation threw
+    // std::bad_alloc straight through the C and JNI entry points. The rect is
+    // now clipped to the image without moving the grid lattice, so any rect
+    // that covers the image solves exactly the image-sized rect.
+    cv::Mat ref_gray, def_gray;
+    make_pair(ref_gray, def_gray);
+    const int cap = 8 * ((W / STEP) * (H / STEP) + 8);
+    auto solve = [&](const FullFieldParams &p, std::vector<float> &out) {
+        ReferenceCache cache;
+        cache.set_from_gray(ref_gray, cv::Mat());
+        out.assign((size_t)cap, 0.0f);
+        float metrics[23] = {};
+        return run_full_field(cache, def_gray, cv::Mat(), p, out.data(), cap,
+                              metrics, 23, nullptr);
+    };
+    std::vector<float> want, got;
+    const int n_want = solve(params_for(W, H), want);
+    REQUIRE(n_want > 0);
+
+    FullFieldParams huge = params_for(W, H);
+    huge.rect_w = std::numeric_limits<int>::max();
+    huge.rect_h = std::numeric_limits<int>::max();
+    CHECK(solve(huge, got) == n_want);
+    CHECK(std::memcmp(want.data(), got.data(), (size_t)n_want * 8 * sizeof(float)) == 0);
+
+    // Hanging off the top-left by whole steps: same lattice, same field.
+    FullFieldParams shifted = params_for(W + 3 * STEP, H + 2 * STEP);
+    shifted.rect_x = -3 * STEP;
+    shifted.rect_y = -2 * STEP;
+    CHECK(solve(shifted, got) == n_want);
+    CHECK(std::memcmp(want.data(), got.data(), (size_t)n_want * 8 * sizeof(float)) == 0);
+}
+
+TEST_CASE(FullField, RectOffImage_ReturnsRoiError) {
+    cv::Mat ref_gray, def_gray;
+    make_pair(ref_gray, def_gray);
+    ReferenceCache cache;
+    cache.set_from_gray(ref_gray, cv::Mat());
+    const int cap = 8 * 64;
+
+    FullFieldParams right = params_for(W, H);
+    right.rect_x = W + 10;
+    CHECK(call_solver(cache, def_gray, right, cap) == -2);
+
+    FullFieldParams above = params_for(W, H);
+    above.rect_y = -2 * H;
+    CHECK(call_solver(cache, def_gray, above, cap) == -2);
+
+    // rect_x + rect_w overflows int.
+    FullFieldParams overflow = params_for(std::numeric_limits<int>::max(), H);
+    overflow.rect_x = std::numeric_limits<int>::max() - 5;
+    CHECK(call_solver(cache, def_gray, overflow, cap) == -2);
+
+    // On the image, but narrower than one step once clipped.
+    FullFieldParams sliver = params_for(W, H);
+    sliver.rect_x = W - STEP / 2;
+    CHECK(call_solver(cache, def_gray, sliver, cap) == -2);
+}
+
+// The deformed image was never checked against the reference: a frame of
+// another size skipped phase correlation (it checks) and was then correlated
+// pixel by pixel anyway, returning a plausible field of nonsense; a frame of
+// another type was read as bytes. Both are argument errors now.
+TEST_CASE(FullField, DeformedSizeMismatch_ReturnsInitError) {
+    cv::Mat ref_gray, def_gray;
+    make_pair(ref_gray, def_gray);
+    ReferenceCache cache;
+    cache.set_from_gray(ref_gray, cv::Mat());
+    const int cap = 8 * ((W / STEP) * (H / STEP) + 8);
+    CHECK(call_solver(cache, def_gray(cv::Rect(0, 0, W - 16, H)).clone(), params_for(W, H), cap) == -3);
+    cv::Mat bigger;
+    cv::copyMakeBorder(def_gray, bigger, 0, 20, 0, 20, cv::BORDER_REFLECT);
+    CHECK(call_solver(cache, bigger, params_for(W, H), cap) == -3);
+    CHECK(call_solver(cache, def_gray, params_for(W, H), cap) > 0);
+}
+
+TEST_CASE(FullField, DeformedWrongType_ReturnsInitError) {
+    cv::Mat ref_gray, def_gray;
+    make_pair(ref_gray, def_gray);
+    ReferenceCache cache;
+    cache.set_from_gray(ref_gray, cv::Mat());
+    const int cap = 8 * ((W / STEP) * (H / STEP) + 8);
+    cv::Mat f32, bgr;
+    def_gray.convertTo(f32, CV_32F);
+    cv::cvtColor(def_gray, bgr, cv::COLOR_GRAY2BGR);
+    CHECK(call_solver(cache, f32, params_for(W, H), cap) == -3);
+    CHECK(call_solver(cache, bgr, params_for(W, H), cap) == -3);
+    // The ROI mask is read as bytes too.
+    std::vector<float> out((size_t)cap, 0.0f);
+    cv::Mat mask_f(H, W, CV_32FC1, cv::Scalar(255.0f));
+    CHECK(run_full_field(cache, def_gray, mask_f, params_for(W, H), out.data(), cap,
+                         nullptr, 0, nullptr) == -3);
 }
 
 TEST_CASE(FullField, EmptyDeformed_ReturnsInitError) {
@@ -370,6 +553,104 @@ TEST_CASE(FullField, MetricsPointCountsAccountForEverySolvedPoint) {
     CHECK(metrics[18] > 0.0f);
 }
 
+// The median test rejects converged-but-wrong points before packing. Those
+// were counted by their solving path (slots 3/4/19) and then appeared in
+// neither slot 1 nor slot 20, so the documented identity failed whenever it
+// fired. Slot 23 (v0.5.0) counts them. Here a 44 px block of the deformed
+// image moves 4 px further than the rest: its inner nodes converge cleanly to
+// the block's motion and the median test peels them off as a cluster.
+TEST_CASE(FullField, MetricsIdentityHoldsWithOutliers) {
+    cv::Mat ref_gray, def_gray;
+    make_pair(ref_gray, def_gray);
+    cv::Mat block = def_gray(cv::Rect(100, 100, 44, 44)).clone();
+    block.copyTo(def_gray(cv::Rect(104, 100, 44, 44)));
+
+    FullFieldParams params = params_for(W, H);
+    params.step = 5;
+    params.strain_window = 31;
+    const int cap = (W / 5) * (H / 5) * 8;
+    ReferenceCache cache;
+    cache.set_from_gray(ref_gray, cv::Mat());
+    std::vector<float> out((size_t)cap, 0.0f);
+    float metrics[Semper::pipeline::kMetricsLen];
+    for (float &m : metrics) m = -1.0f;
+    const int n = run_full_field(cache, def_gray, cv::Mat(), params, out.data(), cap,
+                                 metrics, Semper::pipeline::kMetricsLen, nullptr);
+    REQUIRE(n > 0);
+    std::printf("    3:%g + 4:%g + 19:%g  vs  1:%g + 20:%g + 23:%g\n", metrics[3], metrics[4],
+                metrics[19], metrics[1], metrics[20], metrics[23]);
+    CHECK(metrics[23] > 0.0f);
+    CHECK(metrics[3] + metrics[4] + metrics[19] == metrics[1] + metrics[20] + metrics[23]);
+}
+
+// Path C is the last resort when the anchor lattice found nothing and phase
+// correlation did not lock. Its failure returned -1, a code no header,
+// binding or document defined. It is kSeedFailed (-5) now.
+TEST_CASE(FullField, UnseedableField_ReturnsDocumentedCode) {
+    // A blank frame (lens cap, dropped frame): nothing to correlate with.
+    // (An unrelated speckle frame is not enough -- the unlocked lattice's
+    // own search finds a few spurious matches on it and seeds from those.)
+    cv::Mat ref_gray, def_gray;
+    make_pair(ref_gray, def_gray);
+    const cv::Mat unrelated(H, W, CV_8UC1, cv::Scalar(128));
+    ReferenceCache cache;
+    cache.set_from_gray(ref_gray, cv::Mat());
+    const int cap = 8 * ((W / STEP) * (H / STEP) + 8);
+    std::vector<float> out((size_t)cap, 0.0f);
+    float metrics[Semper::pipeline::kMetricsLen] = {};
+    const int rc = run_full_field(cache, unrelated, cv::Mat(), params_for(W, H), out.data(), cap,
+                                  metrics, Semper::pipeline::kMetricsLen, nullptr);
+    std::printf("    rc = %d\n", rc);
+    CHECK(rc == Semper::pipeline::kSeedFailed);
+    CHECK(Semper::pipeline::kSeedFailed == -5);
+}
+
+// The rescue telemetry (metrics 5-7 and the profile's crash/timeout split)
+// classified a Simplex rescue by the iterations of the IC-GN run *after* the
+// rescue, which usually converges quickly, so a rescued timeout was counted
+// as a crash. It is classified by the run that triggered it now. Here the
+// first run is made to time out by scaling the SoA steepest-descent planes
+// (the full-subset gradient) to 1/20: every step is 1/20 of the way.
+TEST_CASE(Telemetry, RescueClassifiedByTriggeringRun) {
+    using namespace Semper;
+    dictest::SpeckleField field(/*seed=*/31, 160, 160);
+    dictest::AffineDeformation truth;
+    truth.u = 1.0f; truth.v = -0.5f; truth.cx = 80.0f; truth.cy = 80.0f;
+    const Image ref = dictest::make_reference_image(field, 160, 160);
+    const Image def = dictest::make_deformed_image(field, 160, 160, truth);
+    SubsetData subset;
+    SubsetPrecomputer::precompute_subset(subset, ref, 80, 80, 31);
+    REQUIRE(subset.is_initialized);
+    for (float &v : subset.sdi_planes) v *= 0.05f;
+
+    OptimizationEngine engine;
+    const AnalysisResult res = engine.calculate_deformation(subset, def, 0.0f, 0.0f, 0.0f, 0.0f,
+                                                           0.0f, 0.0f, INIT_NO_SEARCH);
+    std::printf("    simplex runs %d, final iters %d, status %d\n", engine.count_simplex, res.iters,
+                res.status);
+    REQUIRE(engine.count_simplex == 1);
+    REQUIRE(res.iters < tuning::kIcgnMaxIter);   // the run after the rescue was short
+
+    Semper::pipeline::internal::ThreadStats bucket;
+    Semper::pipeline::internal::record_simplex_outcome(bucket, res);
+    CHECK(bucket.simplex_calls == 1);
+    CHECK(bucket.simplex_from_timeout == 1);
+    CHECK(bucket.simplex_from_crash == 0);
+}
+
+// Every solve in the pipeline -- anchors, Paths A, B and C, re-anchoring --
+// builds its engine through make_engine. Path C used to set up its own and
+// left LM damping off, so the one seed that has to work without any other
+// help was solved by a differently configured engine.
+TEST_CASE(PathC, UsesSameEngineConfig) {
+    for (bool use6x6 : {false, true}) {
+        const Semper::OptimizationEngine e = Semper::pipeline::internal::make_engine(use6x6);
+        CHECK(e.lm_enabled);
+        CHECK(e.lm_alpha == Semper::tuning::kLmAlpha);
+        CHECK(e.use_6x6_interpolator == use6x6);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reference precompute cache. A batch against one reference reuses the grid
 // scan, the Hessian pool and the reference side of the phase correlation.
@@ -519,6 +800,112 @@ TEST_CASE(FullField, RefCache_CancelledSolveDoesNotPoisonCache) {
     CHECK(rc == kCancelled || rc > 0);
     CHECK(bit_equal(solve_on(shared, frames[0], cv::Mat(), p),
                     solve_fresh(ref_gray, frames[0], cv::Mat(), p)));
+}
+
+// The debug export reads the ROI mask at every grid node. With a rect past
+// the image those reads were out of bounds (roiMask.at<> is unchecked in
+// Release). validate_params now clips the rect first, and the export's own
+// lookup is bounds-checked too; under ASan this is the test for both.
+TEST_CASE(DebugExport, RectBeyondImage_NoOOB) {
+    cv::Mat ref_gray, def_gray;
+    make_pair(ref_gray, def_gray);
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() /
+                         ("semper_debug_" + std::to_string((long long)std::chrono::steady_clock::now()
+                                                                  .time_since_epoch().count()));
+    REQUIRE(fs::create_directories(dir));
+
+    cv::Mat mask(H, W, CV_8UC1, cv::Scalar(255));
+    cv::circle(mask, cv::Point(W / 2, H / 2), 30, cv::Scalar(0), -1);
+    FullFieldParams p = params_for(W + 4 * STEP, H + 4 * STEP);
+    p.rect_x = -2 * STEP;
+    p.rect_y = -2 * STEP;
+
+    ReferenceCache cache;
+    cache.set_from_gray(ref_gray, mask);
+    cache.debug_dir = dir.string();
+    const int cap = 8 * ((p.rect_w / STEP) * (p.rect_h / STEP) + 8);
+    std::vector<float> out((size_t)cap, 0.0f);
+    CHECK(run_full_field(cache, def_gray, mask, p, out.data(), cap, nullptr, 0, nullptr) > 0);
+    // The export ran: its CSV is there.
+    CHECK(fs::exists(dir / "debug_grid_data.csv"));
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+// ---------------------------------------------------------------------------
+// Two engines, two tokens, one process. Until 0.5.0 the token overload bound
+// its token into one process-global "active" pointer for the duration of the
+// solve, so with two solves in flight both polled whichever was bound last:
+// cancelling one stopped the other, or nothing, and a solve that outlived its
+// token left the global pointing at a dead object. Tokens now travel with the
+// solve. Run under TSan this is also the test that sees two solves at once.
+// ---------------------------------------------------------------------------
+TEST_CASE(CancelToken, ConcurrentEnginesCancelIndependently) {
+    cv::Mat ref_gray, def_gray;
+    make_pair(ref_gray, def_gray);
+    FullFieldParams p = params_for(W, H);
+    p.step = 5;
+    p.strain_window = 31;
+    const int cap = (W / 5) * (H / 5) * 8;
+
+    // The uncontested result B has to reproduce.
+    std::vector<float> want((size_t)cap, 0.0f);
+    int n_want = 0;
+    {
+        ReferenceCache cache;
+        cache.set_from_gray(ref_gray, cv::Mat());
+        float metrics[23] = {};
+        n_want = run_full_field(cache, def_gray, cv::Mat(), p, want.data(), cap, metrics, 23, nullptr);
+    }
+    REQUIRE(n_want > 0);
+
+    using Clock = std::chrono::steady_clock;
+    auto wait_for = [](const std::atomic<bool> &flag) {
+        const auto until = Clock::now() + std::chrono::seconds(20);
+        while (!flag.load() && Clock::now() < until)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    };
+
+    Semper::pipeline::CancelToken token_a, token_b;
+    std::atomic<bool> b_running(false), a_done(false);
+    int rc_a = 0, rc_b = 0;
+    std::vector<float> out_b((size_t)cap, 0.0f);
+
+    // B starts first and, from its progress thread, holds its solve open
+    // (the solve joins that thread before returning) until A has finished,
+    // so the two overlap for all of A.
+    std::thread tb([&] {
+        ReferenceCache cache;
+        cache.set_from_gray(ref_gray, cv::Mat());
+        float metrics[23] = {};
+        bool first = true;
+        rc_b = run_full_field(cache, def_gray, cv::Mat(), p, out_b.data(), cap, metrics, 23,
+                              token_b, [&](int) {
+                                  if (!first) return;
+                                  first = false;
+                                  b_running = true;
+                                  wait_for(a_done);
+                              });
+    });
+    wait_for(b_running);
+    std::thread ta([&] {
+        ReferenceCache cache;
+        cache.set_from_gray(ref_gray, cv::Mat());
+        std::vector<float> out((size_t)cap, 0.0f);
+        float metrics[23] = {};
+        rc_a = run_full_field(cache, def_gray, cv::Mat(), p, out.data(), cap, metrics, 23,
+                              token_a, [&](int) { token_a.request(); });
+        a_done = true;
+    });
+    ta.join();
+    tb.join();
+
+    CHECK(rc_a == kCancelled);
+    CHECK(rc_b == n_want);
+    CHECK(!token_b.requested());
+    if (rc_b == n_want)
+        CHECK(std::memcmp(want.data(), out_b.data(), (size_t)n_want * 8 * sizeof(float)) == 0);
 }
 
 #else

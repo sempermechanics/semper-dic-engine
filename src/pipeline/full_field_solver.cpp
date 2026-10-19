@@ -24,6 +24,8 @@
 #include <thread>
 #include <vector>
 #include <algorithm>
+#include <cstdint>
+#include <limits>
 
 #undef LOG_TAG
 #define LOG_TAG "SemperPipeline"
@@ -31,15 +33,14 @@
 namespace Semper {
 namespace pipeline {
 
-// Cooperative cancel (the flag itself lives in cancel.cpp). Polled in the hot
-// point loops: the cost is one relaxed atomic load per point against a full ICGN
-// solve, and a late poll only means one more point, never a wrong result.
+// Cooperative cancel. The token is passed down to every phase (SolveContext)
+// and polled in the hot point loops: the cost is one relaxed atomic load per
+// point against a full ICGN solve, and a late poll only means one more point,
+// never a wrong result.
 
 using namespace Semper::pipeline::internal;
 
-// Re-entrant overload: bind the caller-owned token as the active cancel target for
-// the duration of the solve, then run the shared implementation below unchanged —
-// its clear_cancel()/cancel_requested() calls route to `cancel` while bound.
+// Re-entrant overload: the solve polls the caller-owned token and nothing else.
 int run_full_field(
     ReferenceCache& cache,
     const cv::Mat& def_gray,
@@ -51,9 +52,9 @@ int run_full_field(
     int metrics_len,
     CancelToken& cancel,
     ProgressCallback on_progress) {
-    detail::ScopedCancelToken bind(cancel);
-    return run_full_field(cache, def_gray, roi_mask, params, output_ptr,
-                          output_capacity, metrics, metrics_len, on_progress);
+    return run_full_field_impl(cache, def_gray, roi_mask, params, output_ptr,
+                               output_capacity, metrics, metrics_len,
+                               std::move(on_progress), nullptr, cancel);
 }
 
 int run_full_field(
@@ -68,22 +69,85 @@ int run_full_field(
     ProgressCallback on_progress) {
     return run_full_field_impl(cache, def_gray, roi_mask, params, output_ptr,
                                output_capacity, metrics, metrics_len,
-                               std::move(on_progress), nullptr);
+                               std::move(on_progress), nullptr,
+                               detail::global_cancel_token());
 }
 
 namespace internal {
+
+namespace {
+
+// Clips [lo, lo + len) to [0, extent) on one axis, moving `lo` forward by
+// whole steps so the lattice lo + i * step is kept. 64-bit throughout: a
+// caller's lo + len can overflow int. False if nothing is left.
+bool clip_axis(int &lo, int &len, int step, int extent) {
+    int64_t a = lo;
+    const int64_t b = std::min<int64_t>((int64_t)lo + (int64_t)len, extent);
+    if (a < 0) a += ((-a + step - 1) / step) * (int64_t)step;
+    if (b <= a) return false;
+    lo = (int)a;
+    len = (int)(b - a);
+    return true;
+}
+
+} // namespace
+
+int validate_params(FullFieldParams &p, int width, int height) {
+    if (width <= 0 || height <= 0) return -3;
+    // Every pixel index in the engine is an int.
+    if ((int64_t)width * (int64_t)height > (int64_t)std::numeric_limits<int>::max()) return -3;
+    // step <= 0 would divide by zero forming the grid; it has always been
+    // reported as an invalid ROI.
+    if (p.step <= 0) return -2;
+    if (p.subset_size < 3 || p.subset_size % 2 == 0) return -3;
+    if (p.rect_w <= 0 || p.rect_h <= 0) return -2;
+    if (!clip_axis(p.rect_x, p.rect_w, p.step, width)) return -2;
+    if (!clip_axis(p.rect_y, p.rect_h, p.step, height)) return -2;
+    if (p.rect_w / p.step <= 0 || p.rect_h / p.step <= 0) return -2;
+    if ((int64_t)p.strain_window > max_strain_window(p)) return -3;
+    return 0;
+}
+
+int64_t max_strain_window(const FullFieldParams &p) {
+    if (p.step <= 0) return 0;
+    const int64_t grid_min = std::min(p.rect_w / p.step, p.rect_h / p.step);
+    return 2 * (grid_min + 1) * (int64_t)p.step;
+}
+
+NodeSolve solve_node(OptimizationEngine &engine, SubsetData &subset, const Image &ref_img,
+                     const Image &def_img, int realX, int realY, int subset_size,
+                     const CachedHessianData &cached, const float guess[6],
+                     InitializationMode mode) {
+    NodeSolve out;
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    SubsetPrecomputer::precompute_subset_fast(subset, ref_img, realX, realY, subset_size, cached);
+    out.hessian_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - t0).count();
+    out.initialized = subset.is_initialized;
+    if (!out.initialized) return out;
+
+    const int simplex_before = engine.count_simplex;
+    out.res = engine.calculate_deformation(subset, def_img, guess[0], guess[1], guess[2],
+                                           guess[3], guess[4], guess[5], mode);
+    // VSG protector: a subset that reaches into the Ghost Wall must not pass,
+    // least of all on Path B, where an accepted cell seeds its neighbours.
+    reject_if_ghosted(out.res, subset_size);
+    out.needed_rescue = engine.count_simplex > simplex_before;
+    return out;
+}
 
 int run_full_field_impl(
     ReferenceCache& cache,
     const cv::Mat& def_gray,
     const cv::Mat& roi_mask,
-    const FullFieldParams& params,
+    const FullFieldParams& params_in,
     float* output_ptr,
     int output_capacity,
     float* metrics,
     int metrics_len,
     ProgressCallback on_progress,
-    FieldCapture* capture) {
+    FieldCapture* capture,
+    CancelToken& cancel) {
 
         std::string local_debug_dir = cache.debug_dir;
         cache.debug_dir.clear();
@@ -93,24 +157,30 @@ int run_full_field_impl(
 
         // 🚀 PRIORITY 3: Return -3 for memory/init errors
         if (output_ptr == nullptr || cache.ref_img == nullptr || def_gray.empty()) return -3;
-        // step <= 0 would divide-by-zero at `rect_w / step` below (a SIGFPE in
-        // release builds, where the assert is compiled out). Guard it with the
-        // same -2 ROI code the degenerate-grid check already returns.
-        if (params.step <= 0) return -2;
-        SEMPER_ASSERT(params.subset_size > 0);
-        SEMPER_ASSERT(params.step > 0);
+        // The deformed frame is correlated pixel for pixel against the cached
+        // reference, as 8-bit gray: another size used to skip phase
+        // correlation and then solve anyway, another type was read as bytes.
+        if (def_gray.type() != CV_8UC1 || def_gray.cols != cache.width ||
+            def_gray.rows != cache.height) {
+            return -3;
+        }
+        // The mask is read as bytes too (it may be any size; it is resized).
+        if (!roi_mask.empty() && roi_mask.type() != CV_8UC1) return -3;
+        FullFieldParams params = params_in;
+        const int param_rc = validate_params(params, cache.width, cache.height);
+        if (param_rc != 0) return param_rc;
         SEMPER_ASSERT(output_capacity >= 0);
         // Clear any leftover cancel from a previous solve so this run starts fresh.
-        // The flag is process-global; without this, a caller that cancelled and
-        // then started a new solve without resetting would get an instant -99.
-        clear_cancel();
-        if (cancel_requested()) return kCancelled;
+        // Without this, a caller that cancelled and then started a new solve
+        // without resetting would get an instant -99.
+        cancel.clear();
 
-        static int s_frame_count = 0; s_frame_count++;
-        LOGD("=== FRAME %d computeFullFieldDirect (HYBRID CORE) START ===", s_frame_count);
+        LOGD("=== computeFullFieldDirect (HYBRID CORE) START ===");
 
         auto t_prep_start = std::chrono::high_resolution_clock::now();
-        cv::Mat defMat = def_gray;
+        // Image reads rows * cols contiguous bytes; a view into a larger Mat
+        // is not.
+        cv::Mat defMat = def_gray.isContinuous() ? def_gray : def_gray.clone();
         cv::Mat roiMask;
         if (!roi_mask.empty()) {
             roiMask = roi_mask;
@@ -128,9 +198,10 @@ int run_full_field_impl(
 
         int safe_cores = std::max(1, (int)std::thread::hardware_concurrency());
 
-        int gridW = params.rect_w / params.step;
-        int gridH = params.rect_h / params.step;
-        if (gridW <= 0 || gridH <= 0) return -2; // 🚀 PRIORITY 3: Return -2 for ROI Errors
+        // validate_params clipped the rect to the image, so the grid holds at
+        // most one node per pixel and every count below fits an int.
+        const int gridW = params.rect_w / params.step;
+        const int gridH = params.rect_h / params.step;
 
         // The VSG strain fit needs 3 grid nodes inside the strain window to
         // solve for a plane. That count is fixed by (step, strain_window)
@@ -160,7 +231,7 @@ int run_full_field_impl(
         int path_c_seed_x = gridW / 2;
         int path_c_seed_y = gridH / 2;
 
-        ResultGrid resultGrid(gridH, std::vector<GridPoint>(gridW));
+        ResultGrid resultGrid((size_t)gridH, std::vector<GridPoint>((size_t)gridW));
         int total_valid_points = 0;
 
         // The scan below and the Hessian pre-pass depend only on the reference,
@@ -280,7 +351,7 @@ int run_full_field_impl(
         struct ThreadJoinGuard {
             std::thread &t; std::atomic<bool> &stop_flag; std::condition_variable &cv;
             std::mutex &cv_mutex; bool &detached_flag;
-            ~ThreadJoinGuard() {
+            void stop() {
                 stop_flag.store(true, std::memory_order_release);
                 {
                     std::unique_lock<std::mutex> lk(cv_mutex);
@@ -288,6 +359,7 @@ int run_full_field_impl(
                 }
                 if (t.joinable()) t.join();
             }
+            ~ThreadJoinGuard() { stop(); }
         };
         ThreadJoinGuard progressGuard{progress_thread, progress_thread_should_stop, progress_cv, progress_cv_mutex, progress_thread_detached};
 
@@ -300,24 +372,30 @@ int run_full_field_impl(
         if (!grid_cached) {
         pre.hessian_pool.assign((size_t)gridW * gridH, CachedHessianData());
         HessianPool& hessian_pool = pre.hessian_pool;
+        RegionErrors prepass_errors;
 
     #pragma omp parallel for schedule(static) num_threads(safe_cores)
         for (int pool_idx = 0; pool_idx < gridW * gridH; ++pool_idx) {
-            // OpenMP forbids breaking out of a parallel for, so a cancel skips
-            // the remaining iterations instead — the same shape the existing
-            // exception guard in Path A uses.
-            if (cancel_requested()) continue;
-            int gx = pool_idx % gridW, gy = pool_idx / gridW;
-            if (!resultGrid[gy][gx].solved) {
-                int realX = params.rect_x + gx * params.step, realY = params.rect_y + gy * params.step;
-                hessian_pool[pool_idx] = SubsetPrecomputer::compute_hessian_only(*cache.ref_img, realX, realY, params.subset_size);
+            // OpenMP forbids breaking out of a parallel for, so a cancel (or
+            // an exception, see RegionErrors) skips the remaining iterations.
+            if (cancel.requested() || prepass_errors.failed()) continue;
+            try {
+                int gx = pool_idx % gridW, gy = pool_idx / gridW;
+                if (!resultGrid[gy][gx].solved) {
+                    int realX = params.rect_x + gx * params.step, realY = params.rect_y + gy * params.step;
+                    hessian_pool[pool_idx] = SubsetPrecomputer::compute_hessian_only(*cache.ref_img, realX, realY, params.subset_size);
+                }
+            } catch (...) {
+                prepass_errors.capture();
             }
         }
+        // The pool is left marked stale (grid_valid is false until below).
+        prepass_errors.rethrow_if_any();
 
         // The cancel flag only ever goes up during a solve, so if it is still
         // clear here every iteration above ran: the pool is complete and safe
         // to reuse. Otherwise it stays marked stale for the next solve.
-        if (!cancel_requested()) {
+        if (!cancel.requested()) {
             pre.rect_x = params.rect_x; pre.rect_y = params.rect_y;
             pre.rect_w = params.rect_w; pre.rect_h = params.rect_h;
             pre.step = params.step; pre.subset_size = params.subset_size;
@@ -341,7 +419,7 @@ int run_full_field_impl(
         std::vector<ThreadStats> stats_anchors(safe_cores);
         MeshSeedResult seeds = solve_anchor_seeds(
                 cache, defMat, defImg, params, gridW, gridH, safe_cores,
-                hessian_pool, resultGrid, stats_anchors, timings);
+                hessian_pool, resultGrid, stats_anchors, timings, cancel);
 
         // Now apply them. Nodes that clear the result gate *and* survive the
         // median test are marked solved, so Path A skips them and Path B takes
@@ -372,7 +450,7 @@ int run_full_field_impl(
         const bool have_seed = seeds.solved > 0 || seeds.accepted >= 3;
         bool execute_path_c = (mesh_quality == MeshQuality::NONE) && !have_seed;
 
-        if (cancel_requested()) return kCancelled;
+        if (cancel.requested()) return kCancelled;
 
         std::vector<AffineTriangle> affTriangles;
         MeshGuessField guess = build_mesh_guess_field(
@@ -381,7 +459,8 @@ int run_full_field_impl(
                 resultGrid, affTriangles, timings);
 
         const SolveContext ctx{cache, params, defImg, gridW, gridH, safe_cores,
-                               hessian_pool, global_points_solved, compute_order_counter};
+                               hessian_pool, global_points_solved, compute_order_counter,
+                               cancel};
 
         if (execute_path_c) {
             // Path C now runs in cases a bare phase lock used to suppress (see
@@ -405,7 +484,7 @@ int run_full_field_impl(
 
         // Path A is done or abandoned; a cancelled field is incomplete, so stop
         // before spending anything on strain and packing.
-        if (cancel_requested()) return kCancelled;
+        if (cancel.requested()) return kCancelled;
 
         {
             ScopedTimer pathB_timer(timings.pathB);
@@ -415,7 +494,7 @@ int run_full_field_impl(
 
         // Path B's workers have been joined by their guard. A cancelled field is
         // partial, so there is nothing worth deriving strain from.
-        if (cancel_requested()) return kCancelled;
+        if (cancel.requested()) return kCancelled;
 
         if (capture) {
             capture->gridW = gridW;
@@ -441,6 +520,9 @@ int run_full_field_impl(
             LOGE("Output buffer full at %d points (capacity %d floats); remaining points dropped.", valid_count, output_capacity);
         }
 
+        // The ticker is joined first, so the callback is never entered from
+        // two threads at once (the final 100 used to race the last tick).
+        progressGuard.stop();
         if (on_progress) {
             try { on_progress(100); } catch (...) {
                 LOGE("on_progress(100) callback threw; ignoring");
@@ -469,7 +551,8 @@ int run_full_field_impl(
         // ==========================================
         fill_engine_metrics(metrics, metrics_len, timings, summary,
                             total_valid_points, valid_count,
-                            packed.dropped_by_post_filter, seeds, mesh_quality);
+                            packed.dropped_by_post_filter, packed.dropped_as_outlier,
+                            seeds, mesh_quality);
 
         if (capture && capture->keep_deformed) {
             capture->deformed = std::move(defImgOwner);

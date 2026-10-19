@@ -140,7 +140,7 @@ Configure with `-DSEMPER_ANDROID=ON`. The shared library `OUTPUT_NAME` is
 | [docs/INCREMENTAL_BENCHMARK.md](docs/INCREMENTAL_BENCHMARK.md) | Fixed vs incremental reference: accuracy, precision, cost |
 | [docs/PERF_BASELINE_bd44af0.md](docs/PERF_BASELINE_bd44af0.md) | Non-regression speed/quality floor |
 
-Output packing (**8 floats/point**), metrics layout (**23 floats**), and return
+Output packing (**8 floats/point**), metrics layout (**24 floats**, slot indices Frozen, new slots append), and return
 codes are **Frozen**. Touching `include/semper/*` requires stating the semver
 tier in the PR.
 

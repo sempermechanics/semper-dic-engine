@@ -22,7 +22,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <exception>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -43,9 +46,9 @@ struct ThreadStats {
     int simplex_saved = 0;
     int simplex_dead = 0;
 
-    // Track WHY it went to Simplex
-    int simplex_from_crash = 0;   // Failed in < 20 iters (Bad guess / out of bounds)
-    int simplex_from_timeout = 0; // Failed at exactly 20 iters (Non-convergence)
+    // Track WHY it went to Simplex, from the IC-GN run that triggered it
+    int simplex_from_crash = 0;   // stopped before kIcgnMaxIter: a hard reject or a bad score
+    int simplex_from_timeout = 0; // ran out of kIcgnMaxIter iterations
 };
 
 struct EngineStatFlusher {
@@ -79,15 +82,35 @@ struct ScopedTimer {
     }
 };
 
+// An exception must not leave an OpenMP region: the runtime terminates the
+// process. Each region body catches into one of these; the remaining
+// iterations see failed() and skip, and once the region has joined the solve
+// rethrows the first exception, which the C / JNI entry points turn into -3
+// (guarded_call). Path B's std::thread workers have their own handler.
+class RegionErrors {
+public:
+    bool failed() const { return failed_.load(std::memory_order_relaxed); }
+    // Call from a catch (...) block inside the region.
+    void capture() noexcept {
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (!first_) first_ = std::current_exception();
+        failed_.store(true, std::memory_order_relaxed);
+    }
+    void rethrow_if_any() {
+        if (first_) std::rethrow_exception(first_);
+    }
+
+private:
+    std::atomic<bool> failed_{false};
+    std::mutex mutex_;
+    std::exception_ptr first_;
+};
+
 // Sentinel for "no valid correlation here" (skipped or failed point).
 // ZNSSD is >= 0 for every real solve, so a negative value can never be
 // confused with a genuinely perfect match (ZNSSD == 0.0), which the old
 // corr==0 convention silently discarded.
 inline constexpr float CORR_INVALID = tuning::kCorrInvalid;
-
-// Toggle Simplex ON or OFF. constexpr so the dead branches fold away exactly
-// as they did when this was a function-local `bool ... = true`.
-inline constexpr bool ALLOW_SIMPLEX_RESCUE = true;
 
 // Default-initialized so a new field can never leave a call site
 // reading indeterminate memory. The aggregate-init sites below fill the
@@ -173,8 +196,37 @@ struct FieldCapture {
     cv::Mat deformed_gray;
 };
 
+// The one place solve parameters are checked, for run_full_field and
+// IncrementalSession::init alike, against a width x height reference.
+// Returns 0 with `p` normalised, or the code to return:
+//   -3  subset_size not odd and >= 3 (the subset is built symmetrically
+//       around its centre pixel, so an even size overruns its buffers), or
+//       an image too large to index with int;
+//   -2  step <= 0, or nothing of the rect left once it is clipped to the
+//       image, or a grid of no nodes;
+//   -3  also strain_window > max_strain_window(p) (after clipping).
+// A strain_window too small for the step is not checked here; that is
+// kBadStrainWindow (-4), tested by the callers.
+// The rect is clipped to the image without moving the grid lattice: the
+// near edge advances by whole steps, so every node keeps the position
+// rect_x + i * step it had. Nodes off the image were never solvable; what
+// clipping changes is that the anchor lattice and the seeding health slots
+// are planned over the part of the grid that exists.
+int validate_params(FullFieldParams &p, int width, int height);
+
+// The largest strain_window worth fitting on p's grid: 2 * (min(gridW, gridH)
+// + 1) * step px. Past it the VSG circle reaches more than a step beyond the
+// grid's short side from every node, so no node can have the 90% of its
+// window on the grid that compute_vsg_strain requires (at most ~60%, checked
+// exhaustively for steps 1-12 and short sides of 1-60 nodes) and the field
+// would be empty -- after the window loops had cost (window / step)^2 per
+// node, and vsg_window_node_count alone ~1e18 iterations at INT_MAX. 64-bit:
+// the product can exceed int for a huge grid.
+int64_t max_strain_window(const FullFieldParams &p);
+
 // run_full_field with an optional capture. capture == nullptr is exactly
-// run_full_field.
+// run_full_field. `cancel` is the one token this solve clears on entry and
+// polls; it is passed down explicitly so concurrent solves never share one.
 int run_full_field_impl(
         ReferenceCache &cache,
         const cv::Mat &def_gray,
@@ -185,7 +237,8 @@ int run_full_field_impl(
         float *metrics,
         int metrics_len,
         ProgressCallback on_progress,
-        FieldCapture *capture);
+        FieldCapture *capture,
+        CancelToken &cancel);
 
 // Everything the three solve paths read out of run_full_field's frame. Passed
 // by const reference so the extracted phases keep the same view of the solve
@@ -200,6 +253,7 @@ struct SolveContext {
     const HessianPool &hessian_pool;
     std::atomic<int> &global_points_solved;
     std::atomic<int> &compute_order_counter;
+    const CancelToken &cancel;   // this solve's, polled by every phase
 };
 
 // Per-phase wall clock, aggregated for the profiling log and the metrics array.
@@ -225,18 +279,47 @@ inline void reject_if_ghosted(AnalysisResult &res, int subset_size) {
     }
 }
 
-// Classify a Simplex rescue on the REAL iteration count against kIcgnMaxIter,
-// then record whether it saved the point or died.
+// The one engine configuration every solve in the pipeline uses -- anchor
+// lattice, Paths A, B and C, incremental re-anchoring: DICe-style LM damping
+// of the translation DOFs (tuning::kLmAlpha) and the caller's interpolator.
+// Path C used to set up its own engine and left LM off.
+inline OptimizationEngine make_engine(bool use_6x6_interpolator) {
+    OptimizationEngine engine;
+    engine.lm_enabled = true;
+    engine.lm_alpha = tuning::kLmAlpha;
+    engine.use_6x6_interpolator = use_6x6_interpolator;
+    return engine;
+}
+
+// One grid node's solve, shared by the anchor lattice and Paths A, B and C:
+// the subset from its pool entry, the IC-GN (with the Simplex rescue the mode
+// allows), and the Ghost Wall rejection.
+struct NodeSolve {
+    bool initialized = false;   // the subset fit the image and its pool entry was valid
+    bool needed_rescue = false; // a Simplex ran
+    double hessian_ms = 0.0;    // time spent preparing the subset
+    AnalysisResult res;
+};
+
+NodeSolve solve_node(OptimizationEngine &engine, SubsetData &subset, const Image &ref_img,
+                     const Image &def_img, int realX, int realY, int subset_size,
+                     const CachedHessianData &cached, const float guess[6],
+                     InitializationMode mode);
+
+// Classify a Simplex rescue by the IC-GN run that triggered it (crash: it
+// stopped early; timeout: it used the whole budget), then record whether the
+// rescue saved the point or died. It used to read `iters`, which is the run
+// after the rescue, so a rescued timeout was usually counted as a crash.
 inline void record_simplex_outcome(ThreadStats &bucket, const AnalysisResult &res) {
     bucket.simplex_calls++;
 
-    if (res.iters >= tuning::kIcgnMaxIter) {
+    if (res.trigger_iters >= tuning::kIcgnMaxIter) {
         bucket.simplex_from_timeout++;
     } else {
         bucket.simplex_from_crash++;
     }
 
-    if (res.status == 0 && res.correlation_score <= tuning::kCorrAccept && ALLOW_SIMPLEX_RESCUE) {
+    if (res.status == 0 && res.correlation_score <= tuning::kCorrAccept) {
         bucket.simplex_saved++;
     } else {
         bucket.simplex_dead++;
@@ -333,7 +416,8 @@ MeshSeedResult solve_anchor_seeds(
         const HessianPool &hessian_pool,
         const ResultGrid &resultGrid,
         std::vector<ThreadStats> &stats,
-        PhaseTimings &timings);
+        PhaseTimings &timings,
+        const CancelToken &cancel);
 
 // Applies the anchors that cleared the strict gate AND survived the median
 // test. Returns how many were published. Serial by design — compute_order
@@ -393,7 +477,8 @@ void run_path_b(
 // ---------------------------------------------------------------------------
 
 // Returns 0 on success (globalU/globalV and the seed indices are updated), or
-// the negative error code run_full_field should return to its caller.
+// the negative error code run_full_field should return to its caller: -2 when
+// no node is left to seed from, kSeedFailed when the seed search fails.
 int run_path_c(
         const SolveContext &ctx,
         const std::vector<cv::Point2f> &seed_ref_pts,
@@ -463,6 +548,7 @@ void fill_engine_metrics(
         int total_valid_points,
         int valid_count,
         int dropped_by_post_filter,
+        int dropped_as_outlier,
         const MeshSeedResult &seeds,
         MeshQuality mesh_quality);
 

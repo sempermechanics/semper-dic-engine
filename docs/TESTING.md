@@ -286,6 +286,9 @@ end-to-end (ICGN, Simplex, auto-search, guards).
 | `LmDampingPreservesWellPosedSolution` | LM damping (α=1e-3) doesn't shift a good solution | LM applied to wrong DOFs or damping leaking into the answer |
 | `RepeatSolve_BitIdentical` | The same solve twice is bit-identical | Threading race, uninitialized buffer, or run-to-run nondeterminism |
 | `SuccessfulSolve_CorrelationNonNegative` | Successful solves report ZNSSD ≥ 0 | Sentinel contract broken — the JNI layer marks failed/skipped points with `CORR_INVALID = -1`, so a real score must never be negative |
+| `SaturatedBlackSpeckle_Converges` | A subset with > 10% pixels saturated to exactly 0 converges with both interpolators (0.05 px: the clip is a kink no cubic reproduces) | Validity is read off the sample value again: before v0.5.0 every sample not > 0 was dropped as if off the image, the 4×4 path failed the 90% guard and the 6×6 one solved on the masked path |
+| `MaskedThenFullIteration_MatchesFullOnlyPath` | After iterations that lost pixels, a full iteration steps with the reference Hessian again (made visible by scaling the AoS images only the masked branch reads) | The masked inverse is reused for the rest of the call |
+| `DegenerateMaskedHessian_FailsCleanly` | A masked Hessian singular in its strain block (translation block fine) ends in status 1 with finite values near the start | Its inverse is taken anyway and Inf/NaN reaches the warp, the `(int)` pixel guard and the result |
 
 ## Suite: `DiceTranslationSynthetic` — `dice/test_translation_synthetic.cpp`
 
@@ -345,7 +348,7 @@ Interpolation ladder + gradients + blur, validated via mathematical identities
 | `InterpolatorsExactOnLinearRamp` | Catmull-Rom & Keys reproduce degree-1 polynomials exactly at any sub-pixel position |
 | `GradientOfLinearRampIsExactSlope` | 5-point central difference is exact for degree ≤ 4 |
 | `BlurPreservesConstantImage` | Normalized kernel ⇒ constant in = constant out |
-| `BilinearOutOfBoundsReturnsZero` | The `0.0f` dead-pixel sentinel contract that ICGN's `val > 0` guard relies on |
+| `BilinearOutOfBoundsReturnsZero` | Bilinear returns `0.0f` outside its support (IC-GN's 4 px guard keeps it from ever being sampled there; validity is not read from values) |
 | `BoundaryDemotionLadderIsContinuousInRange` | 6×6→bilinear and 4×4→bilinear demotion never extrapolates outside [0,255] |
 
 ## Suite: `SubsetPrecomputer` — `unit/test_subset_precomputer.cpp`
@@ -357,7 +360,10 @@ Interpolation ladder + gradients + blur, validated via mathematical identities
 | `SteepestDescentImagesFollowDefinition` | `sd = [gx, gy, gx·x, gx·y, gy·x, gy·y]/σ` at spot-checked pixels |
 | `HessianIsSymmetricAndInverseIsValid` | `H = Hᵀ` and `H·H⁻¹ ≈ I` |
 | `RejectsSubsetOffImageBoundary` | Boundary subsets → `is_initialized == false` (never solved) |
-| `FastPathMatchesFullPrecompute` | `compute_hessian_only` + `precompute_subset_fast` ≡ full `precompute_subset` — the batch pipeline treats them as interchangeable |
+| `FastPathMatchesFullPrecompute` | `compute_hessian_only` + `precompute_subset_fast` ≡ full `precompute_subset`, byte for byte (v0.5.0: the full path is built from the other two); an invalid pool entry gives an uninitialized subset |
+| `LargeSubset_HinvFinite` | A 301 px subset is accepted and `H·H⁻¹ ≈ I` with a finite inverse | The conditioning test overflows with subset size again (the old `\|det H\|` did past ~170 px) |
+| `IllConditioned_Rejected` | Vertical stripes (2×2 check) and a pattern symmetric about the subset centre, which cannot see rotation, are rejected at 21 and 201 px. The second had `det H` of +1e9 to +8e16 and was accepted with a meaningless inverse before v0.5.0 | The 6×6 Hessian is no longer checked as a whole (`hessian::well_conditioned`, `tuning::kHessianMinRcond`) |
+| `EvenDimRejected` | An even, zero, one or negative `dim` gives an uninitialized subset from all three functions, even with a valid pool entry. Before v0.5.0 an even `dim` wrote `(dim+1)²` values into `dim²` buffers (heap overflow under ASan) |
 
 ## Suite: `Strain` — `unit/test_strain_calculator.cpp`
 
@@ -375,6 +381,7 @@ precision, not "close enough".
 | `OutlierTestRejectsASingleSpike` | One point 3 px off is the only one rejected |
 | `OutlierTestRejectsAWholeCluster` | A 4x4 block 20 px off is rejected whole (its inner points only on a later pass), and strain beside it is the field's again |
 | `OutlierTestKeepsAStraightJump` | A 5 px step along a column (a crack) is not an outlier on either side |
+| `Median.EvenCountAveragesMiddlePair` | `util::median_inplace` averages the middle pair for an even count (the anchor lattice's own median took the upper one) | The two medians diverge again |
 | `OutlierTestSkipsSparseAndInvalidPoints` | Under 3 neighbours, no test; an already invalid point is neither counted nor used |
 
 ## Suite: `CancelToken` — `unit/test_cancel_token.cpp`
@@ -388,6 +395,9 @@ pinned here is the contract those polls rest on.
 | `StartsClear` / `RequestIsObserved` | The flag reads back what was set |
 | `StaysSetUntilCleared` | Sticky across a thousand polls — the caller must clear it before a run, which is why both run paths assign `false` on entry |
 | `CrossesThreads` | A worker spinning on the flag sees a request made from another thread — the flag is set on the UI thread, read by solver workers |
+| `FreeFunctionsActOnTheGlobalTokenOnly` | `request_cancel` / `clear_cancel` set and clear the process-wide token and never touch a caller-owned one |
+| `ConcurrentEnginesCancelIndependently` (in `test_full_field_contracts.cpp`) | Two solves in flight on two threads: cancelling A returns `-99` from A, and B finishes with the uncontested field byte for byte. Failed before v0.5.0, when the token was bound into one global pointer and B was cancelled by A's request | A token leaked between concurrent engines again (the SDK / Python case) |
+| `Metrics.PrefixLenTable` | `metrics_prefix_len`: nothing below 16, 18 → 17, 19..24 as given, 24 above | The one prefix table drifts from CONTRACT §A.4 |
 | `CancelledCodeIsDistinctFromEngineErrors` | `kCancelled` is −99, matching `AnalysisRunCodes.ERROR_CANCELLED`, and is neither the −2 ROI nor the −3 init failure |
 
 `cancel.cpp` is deliberately its own translation unit with no OpenCV in it, so
@@ -408,6 +418,9 @@ so a pixel-corrupting decode bug was invisible to the whole pipeline. OpenCV-gat
 | `EncodedPng_RoundTripsExactly` | Encoded PNG decodes losslessly to the original | Encoded-image decode regressed |
 | `EncodedColor_ConvertsToGray` | Encoded 3-channel image collapses to one channel | Colour images enter the solver as multi-channel garbage |
 | `EncodedNon8U_ConvertsTo8U` | 16-bit PNG is converted to `CV_8U` | Non-8U depth reaches the solver, which assumes 8-bit |
+| `Encoded16Bit_PreservesContrast` | A 12-bit ramp in a 16-bit PNG decodes to 0..255, strictly increasing | The depth conversion saturates again (before v0.5.0 the ramp came out nearly all 255) |
+| `FloatAndSigned_ScaledToGray8` | `to_gray8`: a [0, 1] float image spans 0..255, a flat one is 128, 8-bit gray passes through, colour collapses, empty stays empty | The one conversion every non-8-bit input goes through (decode, Python arrays) changed |
+| `EncodedWithRawLength_StillDecoded` | A PNG whose byte length equals `w*h` for the expected size is decoded as a PNG; a raw buffer that merely starts like a JPEG is still raw | Raw-vs-encoded is decided by length alone again |
 | `MismatchedLength_FallsThroughToEncoded` | `expected_w/h` set but `len` matching neither raw size → encoded path | A wrong-length raw buffer is misread as raw instead of decoded |
 | `NullAndEmpty_ReturnEmpty` | `nullptr` / `len == 0` → empty `cv::Mat`, no crash | Null-deref on a bad caller argument |
 | `GarbageBytes_ReturnEmptyNoCrash` | Undecodable bytes → empty, no crash | Decoder trusts attacker-controlled bytes |
@@ -439,13 +452,19 @@ Compile-time `static_assert`s pin `ReferenceCache` as non-copyable/non-movable
 ## Suite: `FullField` — `integration/test_full_field_contracts.cpp`
 
 Host characterization of `run_full_field` — the Frozen return codes, the
-capacity-drop rule, and the 23-float metrics layout — without depending on solve
+capacity-drop rule, and the metrics layout — without depending on solve
 quality. OpenCV-gated.
 
 | Test | Proves | Failure would mean |
 |---|---|---|
 | `DegenerateRoi_ReturnsRoiError` | `rect_w < step` → `-2` | ROI validation regressed |
 | `EmptyDeformed_ReturnsInitError` | Empty deformed image → `-3` | Init-guard regressed |
+| `DeformedSizeMismatch_ReturnsInitError` / `DeformedWrongType_ReturnsInitError` | A deformed frame of another size than the reference, or not `CV_8UC1` (float, BGR), and a non-`CV_8UC1` mask → `-3` | Before v0.5.0 a smaller frame solved into a plausible field of nonsense and a float frame was read as bytes |
+| `DebugExport.RectBeyondImage_NoOOB` | The debug export (maps + CSV) runs on a rect hanging off the image with a mask; clean under ASan | The export's mask lookup reads outside the mask again |
+| `EvenOrZeroSubsetSize_ReturnsInitError` | `subset_size` 20, 0, −21, 1, 2 → `-3`; 3 solves | `validate_params` stopped guarding the subset buffers (crashes under ASan without it) |
+| `HugeRect_ClippedToImage` | A rect of `INT_MAX` sides, and one hanging off the top-left by whole steps, give the image-sized rect's field byte for byte | The rect sizes the grid again (`std::bad_alloc` through the C/JNI boundary), or clipping moved the lattice |
+| `HugeStrainWindow_ReturnsInitErrorPromptly` | `strain_window` of `INT_MAX`, 2²⁰ and one past `2·(min(gridW,gridH)+1)·step` → `-3` within 20 s (on a worker thread, so a regression fails instead of hanging), and the largest accepted window still solves | The window bound is gone: `INT_MAX` spun in `vsg_window_node_count` for hours before v0.5.0 |
+| `RectOffImage_ReturnsRoiError` | Rect wholly off the image, `rect_x + rect_w` overflowing `int`, or a clipped rect narrower than a step → `-2` | Clipping overflowed or let an empty grid through |
 | `StrainWindowTooSmallForStep_IsRejected` | A `strain_window` spanning fewer than 3 grid nodes → `-4`, with the corrective value logged | The VSG plane fit is rank-deficient at every point, the strain post-filter discards the whole field, and the caller gets zero points and a success code — the silent-empty-field defect |
 | `StaleCancelDoesNotAbortNextSolve` | A leftover cancel is cleared on entry | A prior cancel poisons the next solve |
 | `UndersizedBuffer_TruncatesWithoutOverflow` | Small `out_capacity` drops points, never overflows, returns `≤ capacity/8` | Buffer overflow on a caller-sized buffer |
@@ -455,14 +474,20 @@ quality. OpenCV-gated.
 | `RefCache_SequenceOnOneCache_BitIdenticalToFresh` | Five frames solved against one cache give the same bytes as five fresh caches, on a DFT-optimal ROI with the 6×6 interpolator | The per-reference cache (grid scan, Hessian pool, phase-correlation reference) changed a result. This test caught `cv::phaseCorrelate` windowing a cached input in place |
 | `RefCache_InvalidatesOnParamsOrMask` | Changing `step`, `subset_size`, `rect` or the mask between solves gives the same result as a fresh cache | A stale grid scan or Hessian pool reused for a different grid |
 | `RefCache_CancelledSolveDoesNotPoisonCache` | A solve cancelled during the pre-pass, then repeated, matches a fresh solve | A partly filled Hessian pool cached as complete |
+| `MetricsIdentityHoldsWithOutliers` | A 44 px block moved 4 px further than the rest: the median test rejects its inner nodes and `3 + 4 + 19 == 1 + 20 + 23` still holds, with slot 23 > 0 | Points the median test drops fall out of the accounting again (before v0.5.0 there was no slot 23 and the identity failed whenever the test fired) |
+| `UnseedableField_ReturnsDocumentedCode` | A blank deformed frame → `kSeedFailed` (`-5`) | Path C's failure leaks an undocumented code again (it was `-1`), or a blank crop "locks" phase correlation again (it did, at zero shift, and the solve returned 0 points with success) |
+| `PathC.UsesSameEngineConfig` | `make_engine` sets LM damping (`kLmAlpha`) and the interpolator; every pipeline solve builds its engine through it (Path C used to leave LM off) | The engine configurations drift apart again |
+| `Telemetry.RescueClassifiedByTriggeringRun` | A Simplex rescue after an IC-GN run that used its whole budget is counted as a timeout, even when the IC-GN after the rescue is short | The crash/timeout split reads the post-rescue run again (it did until v0.5.0) |
 | `MetricsPointCountsAccountForEverySolvedPoint` | `metrics[3] + metrics[4] + metrics[19] == metrics[1] + metrics[20]`, anchors > 0, mean ICGN iters ≥ 1, slot 18 > 0 | A solving path or a post-filter drop stops being counted — the failure mode that hid the anchor lattice from slots 3/4 and the strain post-filter from everything |
 
 ## Suite: `GoldenCorpus` — `integration/test_golden_corpus.cpp`
 
 Relative equivalence for the **subset** solver: an 18×18 grid over two
 scenarios (pure translation and affine) is solved with `INIT_NO_SIMPLEX` from a
-zero guess, once per interpolator. 578 of the 648 nodes survive
-`precompute_subset` and are recorded; they are compared against
+zero guess, once per interpolator. 554 of the 648 nodes survive
+`precompute_subset` and are recorded (578 before v0.5.0: the 6×6 conditioning
+test now rejects 12 per scenario, every one of which was a status-1 record
+with diverged values); they are compared against
 `tests/fixtures/golden_corpus.bin.bicubic` and `.keys6x6`.
 
 | Test | Proves | Failure would mean |
@@ -470,7 +495,8 @@ zero guess, once per interpolator. 578 of the 648 nodes survive
 | `CaptureOrCompare_4x4Bicubic` | Every point's convergence status and converged u/v/strains match the capture | The bicubic path moved |
 | `CaptureOrCompare_6x6Keys` | The same for the Keys 4th-order path | The 6×6 path moved |
 
-**The fixtures are captured on Ubuntu GCC Release** (`244231e`), and host tests
+**The fixtures are captured on Ubuntu GCC Release** (re-captured for v0.5.0 on
+Ubuntu 24.04, GCC 13.3; first captured at `244231e`), and host tests
 build with `-ffast-math`, so bit-exact reproduction is not on offer even for an
 identical binary rerun. Values get tolerances (`1e-2` px, `1e-3` strain). Status
 gets one specific, bounded excuse:
@@ -529,10 +555,11 @@ against a committed binary baseline, `tests/fixtures/full_field_golden.bin`.
 | `CaptureOrCompare` | Two synthetic scenarios (translate, affine) reproduce the recorded point count, the recorded counting metrics exactly, and every point value within a portable tolerance | Any stage of the pipeline changed its output — intended or not |
 | `RepeatSolve_IsDeterministic` | Five solves of the same field agree bit-for-bit | A data race or an order-dependent reduction entered the parallel region |
 
-Fourteen metrics slots are recorded alongside the field: `0..8`, `16`, and this
-branch's `19..22` (anchor points, post-filter drops, phase lock, mesh coverage).
+Fifteen metrics slots are recorded alongside the field: `0..8`, `16`, and this
+branch's `19..23` (anchor points, post-filter drops, phase lock, mesh coverage,
+and from v0.5.0 median-test drops).
 The timing slots (`9..14`, `17`, `18`) are excluded — they differ every run by
-construction. Twelve of the fourteen are integer counts or a 0/1 flag and are
+construction. Thirteen of the fifteen are integer counts or a 0/1 flag and are
 compared **exactly**; that exactness is what makes this suite a gate. The two
 exceptions are averages: slot 8 (mean IC-GN iterations) gets `0.1` and slot 22
 (mesh coverage, a convex-hull area ratio) gets `1e-4`.
@@ -571,7 +598,13 @@ deliberate act**: the diff to the `.bin` belongs in a commit whose message says
 why the field moved. The file originated on the GPU branch; the two branches'
 fixtures are not interchangeable, because their seeding front-ends differ.
 
-## Suite: `SeedBench` — `integration/test_seeding_bench.cpp`
+## Suite: `SeedBench` — `integration/test_seeding_bench.cpp` + `integration/test_seeding_contracts.cpp`
+
+Split in v0.5.0 (the one file had passed 1200 lines): the sweeps are in
+`test_seeding_bench.cpp`, the always-on cases below in
+`test_seeding_contracts.cpp`, and the harness both use (ground-truth fields,
+scenarios, per-row measurement, table/CSV writers) in
+`framework/seed_bench.h`. The suite name is unchanged.
 
 Mostly a **measurement harness**, not a gate: `CandidateSweep`,
 `RealSpeckleSweep`, `Challenge5`, `Challenge14Sinusoid` and `LargeMotionSweep`
@@ -633,7 +666,7 @@ error, an error map and a bias fit. OpenCV-gated.
 | `StationaryBand_NodesCoastAcrossAndComeBack` | 320×480, 36 frames moving 108 px down under a stationary 9 px band that shows fresh speckle every frame (glare, a background edge under translucent film). N = 1. ≥ 98% of the nodes tracked after frame 1 still tracked. Nodes whose path stayed clear of the band: ≥ 90% reported, worst error ≤ 0.6 px. Nodes that crossed it: ≥ 45% reported again by the last frame, median error ≤ 0.08 px, worst ≤ 0.4 px. Measured: 806 tracked (frame 1: 816; frame 1 cannot measure the nodes in the band, and they are not followed); clear 168/180, worst 0.46 px; crossed 146/285, median 0.029 px, worst 0.20 px (the rest still wait for a clean subset) | Coasting stops carrying nodes across a gap (before it, every node that reached the band was lost), or re-anchoring stops removing the coast's drift (without it, crossed nodes came back up to 2.3 px off) |
 | `EarlyUpdate_WhenReportedPointsDrop` | The band sequence with N = 100: the reference moves early, and only on frames reporting < 95% of the first frame on the current reference; N = 0 never moves | The early update fires on noise, or not at all |
 | `RepeatRun_BitIdentical` | The same sequence twice gives the same bytes | Run-to-run nondeterminism in composition or the mask warp |
-| `Contracts_ErrorCodes` | `-3` before `init`, for a wrong-size frame and for a null buffer; `-2` / `-4` / `-3` from `init` | The documented codes drifted |
+| `Contracts_ErrorCodes` | `-3` before `init`, for a wrong-size frame and for a null buffer; `-2` / `-4` / `-3` from `init`, including an even subset (`-3`), a strain window far beyond the grid (`-3`) and a rect off the image (`-2`) | The documented codes drifted |
 | `Cancel_LeavesSessionUnchanged` | A frame cancelled mid-solve, then resubmitted, gives the same bytes as an uncancelled run | A cancelled frame half-updates the session |
 | `LongHorizon_160Frames` | 256², 160 frames of 0.1% stretch (16% total), noise σ = 1, N = 1 and N = 5: ≥ 95% of nodes tracked, rms U ≤ 0.45 / 0.35 px, rms strain ≤ 3.5e-2, RSS growth < 16 MB. Measured: rms 0.40 (N = 1), 0.19 (N = 5), fixed 0.05 | Error growth over a long horizon got worse, or memory leaks per reference update |
 
@@ -679,6 +712,7 @@ times the fixed-reference cache (first frame vs the rest) against any
 | `Fit_CorrIsWorstUsed` | The fit's ZNSSD is the worst of the nodes inside the radius, not of the field |
 | `AnchorNeed_DropRefreshKeep` | Far from any gap: drop the anchor; clean with a gap or the grid edge within reach: cut a new one; a hole inside its own subset: keep the old one |
 | `Anchor_MatchesTheNodeWhereItMoved` | An anchor cut at a sub-pixel node position and matched 1 px off from where it moved lands within 0.05 px; a match further from the guess than allowed, or on another texture, fails; a patch leaving the image is not cut |
+| `MatchAnchor_RejectsUnconvergedSolve` | A match whose IC-GN hard-rejects at its starting guess (status 1, score 2.0) does not confirm the node, however close to the guess it stopped; a real match still does. Before v0.5.0 it confirmed with corr 2.0 |
 | `MaskWarp_ZeroDisplacement_IsIdentity` / `_Translation_ShiftsMask` / `_Stretch_ScalesArea` | The forward mask warp is exact for identity and translation, and the area of a stretched mask is within 1% |
 | `MaskWarp_LargeRotation_IsTheRotatedMask` | An 84° turn, with the material reaching 16 px past the outer nodes: area within 2%, no pixel set more than 1 px outside the analytically rotated square, none missing more than 1 px inside it |
 | `MaskWarp_NoValidNode_IsEmpty` | No tracked node, no material |
@@ -707,12 +741,14 @@ Where `c/smoke.c` proves the happy path runs, `c/contract.c` pins the **Frozen
 ABI surface** the private downstream app and any external C/C#/Rust caller depend
 on. It runs in the `c-sdk-smoke` CI job and returns non-zero on any breach:
 
-- Compile-time `_Static_assert` on every Frozen constant (`SEMPER_ERR_*`,
+- Compile-time `_Static_assert` on every Frozen constant (`SEMPER_ERR_*` incl. `SEMPER_ERR_SEED`,
   `SEMPER_FLOATS_PER_POINT`, `SEMPER_METRICS_LEN`) and on `sizeof`/`offsetof` of
   all eight `semper_params` fields — a reordered field is a build failure, not a
   silent parameter mis-read.
 - Runtime: null-argument guards → `INIT`, run-before-`set_reference` → `INIT`,
-  degenerate ROI → `ROI`, the capacity-drop rule, the `metrics_len` rule,
+  degenerate ROI → `ROI`, even/zero subset → `INIT`, an `INT_MAX` strain
+  window → `INIT` (the largest accepted one still solves), and an `INT_MAX` rect
+  clipped to the image rather than aborting the process (v0.5.0), the capacity-drop rule, the `metrics_len` rule,
   per-engine cancel independence, and the `MAJOR.MINOR.PATCH` version format.
 - Incremental session (v0.4.0): `sizeof`/`offsetof` of the six
   `semper_incremental_info` fields, null guards, process-before-init → `INIT`.
@@ -762,9 +798,9 @@ tests/
   integration/            the assembled engine end-to-end + robustness
                             test_optimization_engine, test_robustness,
                             test_full_field_contracts,
-                            test_full_field_golden, test_seeding_bench,
-                            test_full_field_determinism, test_reference_cache
-                            (the last five OpenCV-gated)
+                            test_full_field_golden, test_seeding_contracts,
+                            test_seeding_bench, test_full_field_determinism,
+                            test_reference_cache (the last six OpenCV-gated)
   dice/                   DICe golden comparisons
   perf/                   throughput gates
 ```
@@ -772,7 +808,7 @@ tests/
 `tests/CMakeLists.txt` lists sources under `DIC_UNIT_TESTS` /
 `DIC_INTEGRATION_TESTS` / `DIC_DICE_TESTS` / `DIC_PERF_TESTS`, plus
 `DIC_PIPELINE_TESTS` for the OpenCV-gated suites (`test_full_field_contracts`,
-`test_full_field_golden`, `test_seeding_bench`, `test_full_field_determinism`,
+`test_full_field_golden`, `test_seeding_contracts`, `test_seeding_bench`, `test_full_field_determinism`,
 `test_image_codec`, `test_reference_cache`) — attached only when OpenCV is present.
 
 ## Adding a new test

@@ -1,7 +1,8 @@
 // Path B — reliability-guided flood fill (RGDIC), deterministic in parallel.
 //
 // The flood fill grows the solved region outwards from Path A's boundary (or
-// from AKAZE / Path C seeds when Path A solved nothing). Each unsolved cell is
+// from the anchor-lattice vertices or the Path C seed when Path A solved
+// nothing). Each unsolved cell is
 // solved once, from the first solved neighbour that reaches it: the
 // neighbour's displacement, projected by its gradients, is the cell's initial
 // guess. Which neighbour that is decides the answer — a different guess
@@ -78,7 +79,7 @@ using ReliabilityQueue = std::priority_queue<SeedNode, std::vector<SeedNode>, Re
 struct CellTask {
     int x = 0, y = 0;
     float gu = 0, gv = 0, gux = 0, guy = 0, gvx = 0, gvy = 0;
-    bool counts_as_path_b = true; // AKAZE / Path C seeds are not counted
+    bool counts_as_path_b = true; // seeds (lattice vertices, Path C) are not counted
 
     bool initialized = false;     // subset fit inside the image
     bool needed_rescue = false;   // Simplex ran
@@ -101,21 +102,14 @@ void solve_cell(const SolveContext& ctx, OptimizationEngine& engine, SubsetData&
     const FullFieldParams& params = ctx.params;
     const int flat = t.y * ctx.gridW + t.x;
     const int realX = params.rect_x + t.x * params.step, realY = params.rect_y + t.y * params.step;
-
-    auto th1 = std::chrono::high_resolution_clock::now();
-    SubsetPrecomputer::precompute_subset_fast(subset, *ctx.cache.ref_img, realX, realY, params.subset_size, ctx.hessian_pool[flat]);
-    t.hessian_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - th1).count();
-    t.initialized = subset.is_initialized;
-    if (!t.initialized) return;
-
-    const int simplex_count_before = engine.count_simplex;
-    auto search_flag = ALLOW_SIMPLEX_RESCUE ? INIT_NO_SEARCH : INIT_NO_SIMPLEX;
-    t.res = engine.calculate_deformation(subset, ctx.def_img, t.gu, t.gv, t.gux, t.guy, t.gvx, t.gvy, search_flag);
-    // Matters more here than on Path A: an accepted cell seeds every point
-    // that floods out from it, so a subset sitting in the mask must not pass.
-    reject_if_ghosted(t.res, params.subset_size);
-    t.needed_rescue = (engine.count_simplex > simplex_count_before);
-    if (!ALLOW_SIMPLEX_RESCUE && t.res.status != 0) { t.res.correlation_score = 1.0f; }
+    const float guess[6] = {t.gu, t.gv, t.gux, t.guy, t.gvx, t.gvy};
+    const NodeSolve node = solve_node(engine, subset, *ctx.cache.ref_img, ctx.def_img, realX, realY,
+                                      params.subset_size, ctx.hessian_pool[flat], guess,
+                                      INIT_NO_SEARCH);
+    t.hessian_ms = node.hessian_ms;
+    t.initialized = node.initialized;
+    t.needed_rescue = node.needed_rescue;
+    if (t.initialized) t.res = node.res;
 }
 
 // Serial: record one solved cell in the grid, the stats and the queue.
@@ -237,14 +231,9 @@ void run_path_b(
     // solves. calculate_deformation and precompute_subset_fast overwrite all
     // they read, so which worker solves a cell cannot change its result (Path
     // A relies on the same property under schedule(dynamic)).
-    std::vector<OptimizationEngine> engines(safe_cores);
+    std::vector<OptimizationEngine> engines((size_t)safe_cores,
+                                           make_engine(params.use_6x6_interpolator));
     SubsetPool subsets(safe_cores);
-    for (auto& e : engines) {
-        // 🚀 ENABLE LEVENBERG-MARQUARDT - PATH B
-        e.lm_enabled = true;
-        e.lm_alpha = tuning::kLmAlpha; // <--- TUNE THIS VALUE
-        e.use_6x6_interpolator = params.use_6x6_interpolator;
-    }
     struct StatsFlush {
         std::vector<OptimizationEngine>& engines; std::vector<ThreadStats>& stats;
         ~StatsFlush() {
@@ -259,7 +248,7 @@ void run_path_b(
     // sorted order, before the flood starts — all of them, as the threaded
     // version did on any device with at least as many cores as seeds.
     for (const auto& seed : global_seeds) {
-        if (cancel_requested()) return;
+        if (ctx.cancel.requested()) return;
         const int flat = seed.y_idx * gridW + seed.x_idx;
         if (claimed[flat]) continue;
         claimed[flat] = 1;
@@ -351,8 +340,8 @@ void run_path_b(
                         return false;
                     };
                     cv.wait_for(lk, std::chrono::milliseconds(tuning::kCancelPollMs),
-                                [&] { return done || cancel_requested() || has_work(); });
-                    if (done || cancel_requested()) return;
+                                [&] { return done || ctx.cancel.requested() || has_work(); });
+                    if (done || ctx.cancel.requested()) return;
                     if (round == nullptr) continue;
 
                     // Oldest round first: that is the one blocking the next commit.

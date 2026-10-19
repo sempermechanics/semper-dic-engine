@@ -184,6 +184,7 @@ void fill_engine_metrics(
         int total_valid_points,
         int valid_count,
         int dropped_by_post_filter,
+        int dropped_as_outlier,
         const MeshSeedResult& seeds,
         MeshQuality mesh_quality) {
     float avg_iters = 0.0f;
@@ -191,12 +192,13 @@ void fill_engine_metrics(
         avg_iters = (float)s.total_icgn_iters / (float)valid_count;
     }
 
-    if (metrics != nullptr && metrics_len >= 16) {
+    const int ncopy = metrics_prefix_len(metrics_len);
+    if (metrics != nullptr && ncopy > 0) {
         const int tot_simp_calls = s.a_simp_calls + s.b_simp_calls + s.n_simp_calls;
         const int tot_simp_saved = s.a_simp_saved + s.b_simp_saved + s.n_simp_saved;
         const int tot_simp_dead = s.a_simp_dead + s.b_simp_dead + s.n_simp_dead;
 
-        float metrics_data[23];
+        float metrics_data[kMetricsLen];
 
             // 0-4: Point Counts
             metrics_data[0] = (float)total_valid_points;      // Total Attempted
@@ -262,9 +264,13 @@ void fill_engine_metrics(
             metrics_data[21] = seeds.phase_locked ? 1.0f : 0.0f;  // Phase-correlation lock
             metrics_data[22] = seeds.coverage;                    // Mesh hull / ROI area, 0..1
 
-            int ncopy = (metrics_len >= 23) ? 23 : (metrics_len >= 22) ? 22
-                      : (metrics_len >= 21) ? 21 : (metrics_len >= 20) ? 20
-                      : (metrics_len >= 19) ? 19 : (metrics_len >= 17) ? 17 : 16;
+            // 23: points that converged and were then rejected by the
+            // displacement median test before packing (v0.5.0). They were
+            // counted by their solving path and reached neither slot 1 nor
+            // slot 20, so the identity below failed whenever the test fired:
+            //   slot 3 + slot 4 + slot 19 == slot 1 + slot 20 + slot 23
+            metrics_data[23] = (float)dropped_as_outlier;         // Dropped by the median test
+
         for (int mi = 0; mi < ncopy; ++mi) metrics[mi] = metrics_data[mi];
     }
 }

@@ -76,9 +76,14 @@ The engine's answer for one subset.
 Everything precomputed about one reference subset. Invariants:
 
 - `x_offsets/y_offsets` (and `_f` float mirrors): relative coords in `[-dim/2, +dim/2]`, row-major, length `n = dim²`.
-  **`dim` must be odd** — the offsets are built symmetrically around the center
-  pixel, so an even `dim` yields an off-center subset. The UI enforces this
-  (see [Parameters from the app](#parameters-from-the-app)); direct callers must.
+  **`dim` must be odd and at least 3** — the offsets are built symmetrically
+  around the center pixel, so the subset holds `(2·(dim/2)+1)²` pixels, and for
+  an even `dim` that is more than the `dim²` its buffers hold. The engine
+  enforces this rather than trusting the caller: `run_full_field` and
+  `IncrementalSession::init` return `-3` for any other `subset_size`
+  (`validate_params`, which also clips the rect to the image), and the three
+  `SubsetPrecomputer` functions return an uninitialized subset for one. The app
+  also only offers odd sizes (see [Parameters from the app](#parameters-from-the-app)).
 - `norm_ref_intensities[i] = (ref_intensities[i] − mean_intensity) / std_dev`.
 - `H` = Σ sd·sdᵀ (6×6 Gauss-Newton Hessian), `H_inv` = its inverse.
 - `steepest_descent_images[i]` = `[gx, gy, gx·x, gx·y, gy·x, gy·y] / std_dev` (Eigen 6×1, AoS).
@@ -113,19 +118,25 @@ valid in the interior `[2, dim−3]`; the border ring is zero.
 
 All three are *interpolating* kernels: they reproduce pixel values exactly at
 integer coordinates and reproduce linear ramps exactly at sub-pixel positions.
-The engine treats intensity `< 0` as "dead pixel" — hence bilinear's `0.0f`
-return is a sentinel further filtered by callers (`val > 0` checks).
+IC-GN and the Simplex never call them where bilinear demotion could happen:
+their 4 px guard (`sample_warped_subset`) is stricter than every demotion
+boundary, and a sample's validity is decided by that guard and the reference
+mask, never by its value. A deformed intensity of `0` is black, not missing.
+(Until v0.5.0 IC-GN dropped every sample not `> 0`, so saturated black speckle
+and cubic undershoot next to it were treated as off-image.)
 
 ---
 
 ## Module: `include/semper/subset.hpp`
 
-Static factory for `SubsetData`. Three entry points with one contract:
-**all paths must produce interchangeable state** (guarded by
-`FastPathMatchesFullPrecompute`).
+Static factory for `SubsetData`. Three entry points, one implementation:
+`precompute_subset` is `compute_hessian_only` followed by
+`precompute_subset_fast`, so the two routes give the same bytes (guarded,
+bit for bit, by `FastPathMatchesFullPrecompute`; v0.5.0 — it was a third copy
+of the arithmetic before).
 
 ```cpp
-// Full precompute: stats + gradients + SDI + Hessian + inverse.
+// Full precompute: compute_hessian_only, then precompute_subset_fast from it.
 static void precompute_subset(SubsetData&, const Image& ref, int cx, int cy, int dim);
 
 // Stats + Hessian only — for the batch pipeline's Hessian pool.
@@ -138,8 +149,15 @@ static void precompute_subset_fast(SubsetData&, const Image& ref,
 ```
 
 Failure modes (→ `is_initialized = false` / `cached.valid = false`):
-subset crosses the image boundary; > 50% masked pixels; singular or
-ill-conditioned Hessian (`cond(H₂ₓ₂) > 1e12`).
+`dim` not odd and ≥ 3; subset crosses the image boundary; > 50% masked pixels;
+ill-conditioned Hessian (`cond(H₂ₓ₂) > 1e12`, or the 6×6 rcond test
+`hessian::well_conditioned`). `precompute_subset_fast` with an invalid pool
+entry gives an uninitialized subset (no recomputation: it would fail again).
+
+Every solve in the pipeline goes through `solve_node` (pool entry → subset →
+`calculate_deformation` → Ghost-Wall rejection) on an engine from
+`make_engine` (LM damping `tuning::kLmAlpha`, the caller's interpolator):
+anchor lattice, Paths A, B and C, and incremental re-anchoring.
 
 ---
 
@@ -184,9 +202,19 @@ Synthetic test data must be generated with this exact convention
   normalizes (ZNSSD → invariant to affine intensity changes `a·I + b`),
   accumulates the gradient via `simd::znssd_error_and_gradient`, then updates
   `W ← W · ΔW⁻¹`. Converges when `‖Δp‖ < 0.001`, max 50 iterations.
-- **Guards:** ≥ 90% of warped pixels must land inside the image; post-convergence
+- **Sampling:** `sample_warped_subset` is the one place the deformed image is
+  read through a warp, for IC-GN and the Simplex alike; it fills values and a
+  per-pixel validity mask (inside the 4 px guard and not in the Ghost Wall).
+- **Guards:** ≥ 90% of warped pixels must be valid; post-convergence
   texture check (sum of squared gradients of surviving pixels) rejects
-  texture-less matches.
+  texture-less matches. An iteration that loses pixels steps with its own
+  masked Hessian, and only if that Hessian passes the same 6×6 conditioning
+  test as the reference one (`hessian::well_conditioned`: 1-norm rcond with the
+  gradient rows scaled by the half-width, `tuning::kHessianMinRcond`); the
+  next full iteration is back on the reference Hessian. A step with a
+  non-invertible `ΔW`, or one that would make `W` non-finite (checked on the
+  bits, since `-ffast-math` folds `isfinite`), ends the solve as a failure on
+  the last good warp.
 - **Levenberg-Marquardt option** (`lm_enabled`, `lm_alpha`): adds `α` to
   `H(0,0)`/`H(1,1)` only (translation DOFs), DICe-compatible. Off by default.
 - **Simplex** (Nelder-Mead on ZNSSD): derivative-free rescue for bad seeds;
@@ -330,16 +358,19 @@ thread**; `SubsetData` buffers are reused across grid points via the
 
 ### Cancellation — `include/semper/cancel.hpp`
 
-A process-wide flag (`request_cancel` / `clear_cancel` / `cancel_requested`),
-polled by `run_full_field` inside its point loops, so a cancel lands within a
-point or two instead of at the end of the frame. One relaxed atomic load per
-point is nothing against an ICGN solve.
+A `CancelToken` per solve, passed down to every phase (`SolveContext::cancel`,
+and to `solve_anchor_seeds`) and polled inside the point loops, so a cancel
+lands within a point or two instead of at the end of the frame. One relaxed
+atomic load per point is nothing against an ICGN solve. The process-wide
+functions (`request_cancel` / `clear_cancel` / `cancel_requested`) act on the
+token that the overloads without one pass down; nothing is shared between
+solves that bring their own.
 
 Where it is polled, and why there:
 
 | Site | Shape |
 |---|---|
-| Hessian pre-pass, Path A mesh execution | `if (cancel_requested()) continue;` — OpenMP forbids breaking out of a parallel `for`, so a cancel skips the remaining iterations |
+| Hessian pre-pass, anchor lattice, Path A mesh execution | `if (cancel.requested()) continue;` — OpenMP forbids breaking out of a parallel `for`, so a cancel skips the remaining iterations |
 | Path B workers | the flag in the condition-variable predicate, then `return` |
 | Path B's CV wait | bounded (`wait_for`, 20 ms) — a worker waiting for the next round has no one to notify it of a cancel, so it re-checks on a timer |
 | After Path A, after Path B | `return kCancelled` — a cancelled field is partial, so strain and packing are never run on it |

@@ -1,5 +1,5 @@
 // pybind11 bindings for the Semper DIC engine — wraps the C++ core directly.
-// NumPy in, (N, 8) points + (23,) metrics out. Behavior is identical to the
+// NumPy in, (N, 8) points + (24,) metrics out. Behavior is identical to the
 // Android/JNI path; see docs/CONTRACT.md for the frozen formats.
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -30,21 +31,36 @@ namespace {
 
 ProgressCallback to_callback(const py::object& progress);
 
-// Accepts a 2-D uint8 ndarray (H, W) — wrapped as grayscale, copied so it owns
-// its pixels across the solve — or encoded bytes (PNG/JPEG) decoded via io.
+// Accepts a 2-D ndarray (H, W) — copied so it owns its pixels across the
+// solve — or encoded bytes (PNG/JPEG) decoded via io. A uint8 array is taken
+// as is; any other dtype (uint16, float in [0, 1], ...) is mapped from its own
+// range onto 0..255 by io::to_gray8, as a decoded 16-bit file is. (Until
+// 0.5.0 pybind11's forcecast truncated it to uint8: a [0, 1] float image
+// became black.)
 cv::Mat to_gray(const py::object& img, int expected_w, int expected_h) {
     if (py::isinstance<py::bytes>(img) || py::isinstance<py::bytearray>(img)) {
         std::string s = py::cast<std::string>(img);
         return Semper::io::decode_gray(reinterpret_cast<const uint8_t*>(s.data()),
                                        s.size(), expected_w, expected_h);
     }
-    auto arr = py::array_t<uint8_t, py::array::c_style | py::array::forcecast>::ensure(img);
-    if (!arr) throw std::invalid_argument("image must be a uint8 ndarray or encoded bytes");
-    if (arr.ndim() != 2) throw std::invalid_argument("grayscale image must be 2-D (H, W)");
-    const int h = static_cast<int>(arr.shape(0));
-    const int w = static_cast<int>(arr.shape(1));
-    cv::Mat wrapped(h, w, CV_8UC1, const_cast<uint8_t*>(arr.data()));
-    return wrapped.clone();
+    auto check_2d = [](const py::array& a) {
+        if (a.ndim() != 2) throw std::invalid_argument("grayscale image must be 2-D (H, W)");
+        if (a.shape(0) > INT32_MAX || a.shape(1) > INT32_MAX)
+            throw std::invalid_argument("image too large");
+    };
+    if (py::isinstance<py::array_t<uint8_t>>(img)) {
+        auto arr = py::array_t<uint8_t, py::array::c_style | py::array::forcecast>::ensure(img);
+        check_2d(arr);
+        cv::Mat wrapped(static_cast<int>(arr.shape(0)), static_cast<int>(arr.shape(1)), CV_8UC1,
+                        const_cast<uint8_t*>(arr.data()));
+        return wrapped.clone();
+    }
+    auto arr = py::array_t<double, py::array::c_style | py::array::forcecast>::ensure(img);
+    if (!arr) throw std::invalid_argument("image must be a numeric ndarray or encoded bytes");
+    check_2d(arr);
+    cv::Mat wrapped(static_cast<int>(arr.shape(0)), static_cast<int>(arr.shape(1)), CV_64FC1,
+                    const_cast<double*>(arr.data()));
+    return Semper::io::to_gray8(wrapped);
 }
 
 class Engine {
@@ -61,7 +77,7 @@ public:
     }
 
     // Returns (code, points|None, metrics). code >= 0 is the point count; negative
-    // is a SEMPER error (-2 ROI, -3 init, -99 cancelled). points is (code, 8) f32.
+    // is a SEMPER error (-2 ROI, -3 init, -4 strain window, -5 seed, -99 cancelled). points is (code, 8) f32.
     py::tuple run(const py::object& deformed, const py::object& mask,
                   std::array<int, 4> rect, int step, int subset, int strain_window,
                   bool use_6x6, const py::object& progress) {
@@ -82,11 +98,15 @@ public:
 
         // One point per grid node is the upper bound; 8 floats each. Over-allocate
         // so the solver never has to drop points (see the capacity contract).
-        const int cols = step > 0 ? (p.rect_w / step + 1) : 0;
-        const int rows = step > 0 ? (p.rect_h / step + 1) : 0;
-        const size_t max_pts = static_cast<size_t>(std::max(0, cols) * std::max(0, rows));
+        // The engine clips the rect to the image, so the image bounds the grid
+        // too: an oversized rect must not size this buffer.
+        const int span_w = std::min(p.rect_w, cache_.width);
+        const int span_h = std::min(p.rect_h, cache_.height);
+        const size_t cols = step > 0 ? static_cast<size_t>(std::max(0, span_w / step + 1)) : 0;
+        const size_t rows = step > 0 ? static_cast<size_t>(std::max(0, span_h / step + 1)) : 0;
+        const size_t max_pts = cols * rows;
         std::vector<float> out(max_pts * 8, 0.0f);
-        float metrics[23] = {0};
+        float metrics[Semper::pipeline::kMetricsLen] = {0};
 
         ProgressCallback cb = to_callback(progress);
 
@@ -94,10 +114,10 @@ public:
         {
             py::gil_scoped_release rel;  // long solve must not hold the GIL
             n = run_full_field(cache_, def, roi, p, out.data(),
-                               static_cast<int>(out.size()), metrics, 23, cancel_, cb);
+                               static_cast<int>(out.size()), metrics, Semper::pipeline::kMetricsLen, cancel_, cb);
         }
 
-        py::array_t<float> met(23);
+        py::array_t<float> met(Semper::pipeline::kMetricsLen);
         std::memcpy(met.mutable_data(), metrics, sizeof(metrics));
         if (n < 0) {
             return py::make_tuple(n, py::none(), met);
@@ -162,7 +182,7 @@ public:
         cv::Mat def = to_gray(deformed, width_, height_);
         if (def.empty()) throw std::runtime_error("failed to decode deformed image");
         std::vector<float> out(static_cast<size_t>(std::max(session_.max_points(), 1)) * 8, 0.0f);
-        float metrics[23] = {0};
+        float metrics[Semper::pipeline::kMetricsLen] = {0};
         Semper::pipeline::IncrementalFrameInfo fi;
         ProgressCallback cb = to_callback(progress);
 
@@ -170,10 +190,10 @@ public:
         {
             py::gil_scoped_release rel;  // long solve must not hold the GIL
             n = session_.process_frame(def, out.data(), static_cast<int>(out.size()),
-                                       metrics, 23, cancel_, cb, &fi);
+                                       metrics, Semper::pipeline::kMetricsLen, cancel_, cb, &fi);
         }
 
-        py::array_t<float> met(23);
+        py::array_t<float> met(Semper::pipeline::kMetricsLen);
         std::memcpy(met.mutable_data(), metrics, sizeof(metrics));
         py::dict info;
         info["reference_frame"] = fi.reference_frame;
