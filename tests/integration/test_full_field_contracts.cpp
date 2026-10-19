@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 #include <thread>
@@ -125,6 +126,59 @@ TEST_CASE(FullField, StrainWindowTooSmallForStep_IsRejected) {
                                                             params.strain_window) >= 3);
     CHECK(run_full_field(cache, def_gray, cv::Mat(), params, out.data(), cap,
                          metrics, 23, nullptr) > 0);
+}
+
+// A strain window far larger than the grid used to be accepted and sized
+// the VSG loops: vsg_window_node_count walks (window / step)^2 offsets, so
+// strain_window = INT_MAX spun for hours inside the -4 check, and a window
+// merely much larger than the grid cost window^2 per node in the strain fit,
+// only to reject every node (once the radius passes the grid's short side by
+// a step, no node can have the 90% of its window on the grid the fit needs).
+// Beyond 2 * (min(gridW, gridH) + 1) * step it is an argument error now.
+TEST_CASE(FullField, HugeStrainWindow_ReturnsInitErrorPromptly) {
+    cv::Mat ref_gray, def_gray;
+    make_pair(ref_gray, def_gray);
+    const FullFieldParams base = params_for(W, H);
+    const int grid_min = std::min(base.rect_w / base.step, base.rect_h / base.step);
+    const int max_window = 2 * (grid_min + 1) * base.step;
+
+    // Run on a worker so a regression fails the test instead of hanging it.
+    auto solve_within = [&](int strain_window, int seconds, int &rc) {
+        auto done = std::make_shared<std::atomic<bool>>(false);
+        auto result = std::make_shared<std::atomic<int>>(0);
+        std::thread([=]() {
+            ReferenceCache cache;
+            cache.set_from_gray(ref_gray, cv::Mat());
+            FullFieldParams p = base;
+            p.strain_window = strain_window;
+            const int cap = 8 * ((W / STEP) * (H / STEP) + 8);
+            std::vector<float> out((size_t)cap, 0.0f);
+            result->store(run_full_field(cache, def_gray, cv::Mat(), p, out.data(), cap,
+                                         nullptr, 0, nullptr));
+            done->store(true);
+        }).detach();
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+        while (!done->load() && std::chrono::steady_clock::now() < until)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        rc = result->load();
+        return done->load();
+    };
+
+    int rc = 0;
+    for (int window : {std::numeric_limits<int>::max(), 1 << 20, max_window + 1}) {
+        const bool returned = solve_within(window, 20, rc);
+        if (!returned) {
+            std::printf("    strain_window=%d still running after 20 s\n", window);
+            std::fflush(stdout);
+            // The worker cannot be stopped or joined; end the run here.
+            std::_Exit(1);
+        }
+        CHECK(rc == -3);
+    }
+    // The largest accepted window still solves (and, at that size, the strain
+    // fit legitimately keeps few or no points).
+    REQUIRE(solve_within(max_window, 60, rc));
+    CHECK(rc >= 0);
 }
 
 TEST_CASE(FullField, DegenerateStep_ReturnsRoiError) {

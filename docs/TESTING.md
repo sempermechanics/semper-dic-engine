@@ -463,6 +463,7 @@ quality. OpenCV-gated.
 | `DebugExport.RectBeyondImage_NoOOB` | The debug export (maps + CSV) runs on a rect hanging off the image with a mask; clean under ASan | The export's mask lookup reads outside the mask again |
 | `EvenOrZeroSubsetSize_ReturnsInitError` | `subset_size` 20, 0, −21, 1, 2 → `-3`; 3 solves | `validate_params` stopped guarding the subset buffers (crashes under ASan without it) |
 | `HugeRect_ClippedToImage` | A rect of `INT_MAX` sides, and one hanging off the top-left by whole steps, give the image-sized rect's field byte for byte | The rect sizes the grid again (`std::bad_alloc` through the C/JNI boundary), or clipping moved the lattice |
+| `HugeStrainWindow_ReturnsInitErrorPromptly` | `strain_window` of `INT_MAX`, 2²⁰ and one past `2·(min(gridW,gridH)+1)·step` → `-3` within 20 s (on a worker thread, so a regression fails instead of hanging), and the largest accepted window still solves | The window bound is gone: `INT_MAX` spun in `vsg_window_node_count` for hours before v0.5.0 |
 | `RectOffImage_ReturnsRoiError` | Rect wholly off the image, `rect_x + rect_w` overflowing `int`, or a clipped rect narrower than a step → `-2` | Clipping overflowed or let an empty grid through |
 | `StrainWindowTooSmallForStep_IsRejected` | A `strain_window` spanning fewer than 3 grid nodes → `-4`, with the corrective value logged | The VSG plane fit is rank-deficient at every point, the strain post-filter discards the whole field, and the caller gets zero points and a success code — the silent-empty-field defect |
 | `StaleCancelDoesNotAbortNextSolve` | A leftover cancel is cleared on entry | A prior cancel poisons the next solve |
@@ -665,7 +666,7 @@ error, an error map and a bias fit. OpenCV-gated.
 | `StationaryBand_NodesCoastAcrossAndComeBack` | 320×480, 36 frames moving 108 px down under a stationary 9 px band that shows fresh speckle every frame (glare, a background edge under translucent film). N = 1. ≥ 98% of the nodes tracked after frame 1 still tracked. Nodes whose path stayed clear of the band: ≥ 90% reported, worst error ≤ 0.6 px. Nodes that crossed it: ≥ 45% reported again by the last frame, median error ≤ 0.08 px, worst ≤ 0.4 px. Measured: 806 tracked (frame 1: 816; frame 1 cannot measure the nodes in the band, and they are not followed); clear 168/180, worst 0.46 px; crossed 146/285, median 0.029 px, worst 0.20 px (the rest still wait for a clean subset) | Coasting stops carrying nodes across a gap (before it, every node that reached the band was lost), or re-anchoring stops removing the coast's drift (without it, crossed nodes came back up to 2.3 px off) |
 | `EarlyUpdate_WhenReportedPointsDrop` | The band sequence with N = 100: the reference moves early, and only on frames reporting < 95% of the first frame on the current reference; N = 0 never moves | The early update fires on noise, or not at all |
 | `RepeatRun_BitIdentical` | The same sequence twice gives the same bytes | Run-to-run nondeterminism in composition or the mask warp |
-| `Contracts_ErrorCodes` | `-3` before `init`, for a wrong-size frame and for a null buffer; `-2` / `-4` / `-3` from `init`, including an even subset (`-3`) and a rect off the image (`-2`) | The documented codes drifted |
+| `Contracts_ErrorCodes` | `-3` before `init`, for a wrong-size frame and for a null buffer; `-2` / `-4` / `-3` from `init`, including an even subset (`-3`), a strain window far beyond the grid (`-3`) and a rect off the image (`-2`) | The documented codes drifted |
 | `Cancel_LeavesSessionUnchanged` | A frame cancelled mid-solve, then resubmitted, gives the same bytes as an uncancelled run | A cancelled frame half-updates the session |
 | `LongHorizon_160Frames` | 256², 160 frames of 0.1% stretch (16% total), noise σ = 1, N = 1 and N = 5: ≥ 95% of nodes tracked, rms U ≤ 0.45 / 0.35 px, rms strain ≤ 3.5e-2, RSS growth < 16 MB. Measured: rms 0.40 (N = 1), 0.19 (N = 5), fixed 0.05 | Error growth over a long horizon got worse, or memory leaks per reference update |
 
@@ -745,7 +746,8 @@ on. It runs in the `c-sdk-smoke` CI job and returns non-zero on any breach:
   all eight `semper_params` fields — a reordered field is a build failure, not a
   silent parameter mis-read.
 - Runtime: null-argument guards → `INIT`, run-before-`set_reference` → `INIT`,
-  degenerate ROI → `ROI`, even/zero subset → `INIT` and an `INT_MAX` rect
+  degenerate ROI → `ROI`, even/zero subset → `INIT`, an `INT_MAX` strain
+  window → `INIT` (the largest accepted one still solves), and an `INT_MAX` rect
   clipped to the image rather than aborting the process (v0.5.0), the capacity-drop rule, the `metrics_len` rule,
   per-engine cancel independence, and the `MAJOR.MINOR.PATCH` version format.
 - Incremental session (v0.4.0): `sizeof`/`offsetof` of the six

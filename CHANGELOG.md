@@ -22,6 +22,9 @@ Minor: additive surface, Frozen values unchanged, numerics move.
   `run_full_field` and `IncrementalSession::init` return `-3` for it.
 - The rect is clipped to the image (lattice kept); an oversized one no longer
   throws `std::bad_alloc` through the C ABI / JNI. Nothing on the image: `-2`.
+- `strain_window` above `2 * (min(gridW, gridH) + 1) * step` is `-3`: such a
+  window can never meet the strain fit's 90% coverage rule (the field was
+  empty anyway), and at `INT_MAX` the window count looped for hours.
 - No exception crosses the C ABI or JNI (`guarded_call`, `-3`); exceptions in
   the OpenMP regions are caught and rethrown after the region instead of
   terminating the process.

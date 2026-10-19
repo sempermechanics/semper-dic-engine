@@ -22,6 +22,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -202,13 +203,26 @@ struct FieldCapture {
 //       around its centre pixel, so an even size overruns its buffers), or
 //       an image too large to index with int;
 //   -2  step <= 0, or nothing of the rect left once it is clipped to the
-//       image, or a grid of no nodes.
+//       image, or a grid of no nodes;
+//   -3  also strain_window > max_strain_window(p) (after clipping).
+// A strain_window too small for the step is not checked here; that is
+// kBadStrainWindow (-4), tested by the callers.
 // The rect is clipped to the image without moving the grid lattice: the
 // near edge advances by whole steps, so every node keeps the position
 // rect_x + i * step it had. Nodes off the image were never solvable; what
 // clipping changes is that the anchor lattice and the seeding health slots
 // are planned over the part of the grid that exists.
 int validate_params(FullFieldParams &p, int width, int height);
+
+// The largest strain_window worth fitting on p's grid: 2 * (min(gridW, gridH)
+// + 1) * step px. Past it the VSG circle reaches more than a step beyond the
+// grid's short side from every node, so no node can have the 90% of its
+// window on the grid that compute_vsg_strain requires (at most ~60%, checked
+// exhaustively for steps 1-12 and short sides of 1-60 nodes) and the field
+// would be empty -- after the window loops had cost (window / step)^2 per
+// node, and vsg_window_node_count alone ~1e18 iterations at INT_MAX. 64-bit:
+// the product can exceed int for a huge grid.
+int64_t max_strain_window(const FullFieldParams &p);
 
 // run_full_field with an optional capture. capture == nullptr is exactly
 // run_full_field. `cancel` is the one token this solve clears on entry and

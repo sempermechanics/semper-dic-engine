@@ -157,6 +157,17 @@ static void test_param_validation(uint8_t* ref, uint8_t* def) {
     CHECK(semper_run(eng, def, (size_t)W * H, NULL, 0, &huge, out, 8 * 64,
                      metrics, SEMPER_METRICS_LEN, NULL, NULL) >= 0);
 
+    /* A strain window far beyond the grid used to spin in the VSG window
+       count for hours (INT_MAX: ~4e18 iterations). It is an argument error
+       past 2 * (min(gridW, gridH) + 1) * step (v0.5.0). */
+    semper_params wide = valid_params();
+    wide.strain_window = 0x7fffffff;
+    CHECK(semper_run(eng, def, (size_t)W * H, NULL, 0, &wide, out, 8 * 64,
+                     metrics, SEMPER_METRICS_LEN, NULL, NULL) == SEMPER_ERR_INIT);
+    wide.strain_window = 2 * (valid_params().rect_w / valid_params().step + 1) * valid_params().step;
+    CHECK(semper_run(eng, def, (size_t)W * H, NULL, 0, &wide, out, 8 * 64,
+                     metrics, SEMPER_METRICS_LEN, NULL, NULL) >= 0);
+
     /* Nothing of the rect on the image: invalid ROI. */
     semper_params off = valid_params();
     off.rect_x = W + 1;

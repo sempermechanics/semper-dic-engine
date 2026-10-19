@@ -104,7 +104,14 @@ int validate_params(FullFieldParams &p, int width, int height) {
     if (!clip_axis(p.rect_x, p.rect_w, p.step, width)) return -2;
     if (!clip_axis(p.rect_y, p.rect_h, p.step, height)) return -2;
     if (p.rect_w / p.step <= 0 || p.rect_h / p.step <= 0) return -2;
+    if ((int64_t)p.strain_window > max_strain_window(p)) return -3;
     return 0;
+}
+
+int64_t max_strain_window(const FullFieldParams &p) {
+    if (p.step <= 0) return 0;
+    const int64_t grid_min = std::min(p.rect_w / p.step, p.rect_h / p.step);
+    return 2 * (grid_min + 1) * (int64_t)p.step;
 }
 
 NodeSolve solve_node(OptimizationEngine &engine, SubsetData &subset, const Image &ref_img,

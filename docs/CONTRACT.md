@@ -42,7 +42,8 @@ Downstream apps pin an **exact** engine tag and only auto-adopt minor/patch bump
 > `metrics.hpp` with `metrics_prefix_len`, `io::to_gray8`. Every Frozen value
 > and every existing signature is unchanged. What callers can observe besides:
 > inputs that used to be accepted and mis-solved are now refused (`-3` for an
-> even subset or a frame that does not match the reference, `-2` for a rect
+> even subset, a frame that does not match the reference, or a strain window
+> too large for the grid to ever fit, `-2` for a rect
 > with nothing on the image), exceptions no longer cross the C ABI or JNI, a
 > `CancelToken` solve no longer listens to `request_cancel()`, non-8-bit
 > images keep their contrast, and the solved field moves (IC-GN validity and
@@ -100,6 +101,17 @@ int run_full_field(..., CancelToken& token, ProgressCallback on_progress = nullp
   `rect_x + i * step`. A rect with nothing on the image, or narrower than one
   step once clipped, is `-2`. Until v0.5.0 an oversized rect sized the grid
   from the rect and could throw `std::bad_alloc` out of the call.
+- **Strain window upper bound** *(v0.5.0)*: `strain_window` may be at most
+  `2 * (min(gridW, gridH) + 1) * step` px, with `gridW = rect_w / step` and
+  `gridH = rect_h / step` of the clipped rect; above that the call returns
+  `-3` (`IncrementalSession::init` likewise, on the frame-0 grid). Past that
+  size the VSG circle reaches more than a step beyond the grid's short side
+  from every node, so no node can meet the strain fit's 90% window-coverage
+  rule and the field would come back empty — the same outcome as before,
+  except that it used to take `(strain_window / step)^2` work per node first
+  (hours at `INT_MAX`). The lower bound is unchanged: too small for the step is
+  still `-4`. A rejection, not a clamp: a clamped window would solve a
+  different strain fit than the one asked for.
 - **Exceptions** never cross the C ABI or JNI: each entry point catches what
   escapes and returns `-3` (`NULL` from the C constructors). The C++ functions
   may still throw `std::bad_alloc` and OpenCV exceptions.

@@ -147,6 +147,15 @@ struct IncrementalSession::Impl {
         params_k.rect_y = grid_rect.y;
         params_k.rect_w = grid_rect.width;
         params_k.rect_h = grid_rect.height;
+        // The increment solve's own strain is never reported (frames are
+        // packed on the frame-0 grid, with the frame-0 window), but its
+        // window must still pass validate_params on this grid, which can be
+        // much smaller than frame 0's once the tracked material shrinks.
+        // A window past the bound would only have emptied that solve's
+        // packing anyway; capping it changes nothing the caller sees except
+        // that frame's metrics slots 1 and 20.
+        params_k.strain_window = (int)std::min<int64_t>(params_k.strain_window,
+                                                        max_strain_window(params_k));
         if (bb.area() == 0) std::fill(alive.begin(), alive.end(), 0);
         ref_index = new_ref_index;
         frames_since_update = 0;
