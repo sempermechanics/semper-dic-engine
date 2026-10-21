@@ -23,7 +23,7 @@ constexpr int kBadStrainWindow = -4;
 
 /**
  * Returned by run_full_field when nothing could seed the solve: the anchor
- * lattice solved no node, phase correlation did not lock, and the
+ * lattice solved no node, the global motion model (AKAZE) did not lock, and the
  * central-tendency fallback (Path C) did not converge either -- typically a
  * deformed frame unrelated to the reference, or motion beyond every search.
  * Added in 0.5.0; this case used to return an undocumented -1.

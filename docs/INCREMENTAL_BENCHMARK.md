@@ -39,7 +39,7 @@ Both builds ran on the same host, interleaved scenario by scenario: `045a500` (t
   - **With noise, the fixed reference changes only near 90°.** On the 110 px ROI at σ = 2 the log-polar estimate locks in only a few solves between ~5° and ~85°, so these frames use the translation lattice exactly as before. See S4.
 - **Every other scenario is unchanged** to the printed digit, except S6 N = 10: 0.069 → 0.065 px (σ = 0) and 0.337 → 0.336 px (σ = 2).
   - S2, S5, S8 and S9 are where the similarity misfired before the ≥ 90%-kept rule existed. Under anisotropic stretch the log-polar estimate reports a rotation and scale, and the similarity lattice can settle on a self-consistent wrong cluster. S5 at 60% then read 0.215 px at frame 150 instead of 0.014 px.
-  - In this run the fallback (the second, translation-only lattice solve) fired in at most 15 of the 1000 solves of any variant (S8, T = 200). `SeedBench.SimilarityFallsBackUnderStretch` guards the case.
+  - In this run the fallback (the second, translation-only lattice solve) fired in at most 15 of the 1000 solves of any variant (S8, T = 200). `SeedBench.SimilarityFallsBackUnderStretch` guarded the case (`StretchSeedsWithoutBlunders` since v0.6.0, which replaced the similarity with an AKAZE homography; see SEEDING_BENCHMARK.md §11).
 - **Cost:** see §3.
 
 The tables below are the new build's. Tables other than S4 also differ in places from this report's first edition, because `045a500` landed in between. It added coasting across gaps, re-anchoring before reporting, and an early reference update when a frame reports 5% fewer points. Those numbers are identical in both builds of this run.

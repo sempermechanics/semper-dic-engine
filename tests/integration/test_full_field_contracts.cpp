@@ -376,7 +376,7 @@ TEST_CASE(FullField, MetricsLayout_Contract) {
     CHECK(metrics[15] <= 100.f);
     // Seed-quality flag is one of the three documented values.
     CHECK((metrics[16] == 0.f || metrics[16] == 1.f || metrics[16] == 2.f));
-    // Seeding health (slots 21/22): the phase lock is a flag, coverage is a
+    // Seeding health (slots 21/22): the global lock is a flag, coverage is a
     // fraction of the ROI. On this synthetic pure-translation pair both should
     // be healthy -- if the lock ever fails here, the seeder broke.
     CHECK((metrics[21] == 0.f || metrics[21] == 1.f));
@@ -653,7 +653,7 @@ TEST_CASE(PathC, UsesSameEngineConfig) {
 
 // ---------------------------------------------------------------------------
 // Reference precompute cache. A batch against one reference reuses the grid
-// scan, the Hessian pool and the reference side of the phase correlation.
+// scan, the Hessian pool and the reference AKAZE keypoints.
 // Reuse must never change a result: every solve below is compared bit for bit
 // against a solve on a fresh cache, which recomputes everything.
 // ---------------------------------------------------------------------------

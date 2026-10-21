@@ -473,6 +473,10 @@ guess of the deformation gradient.
 
 ### 8.1 Global Rigid Shift by Phase Correlation
 
+*§8.1 and §8.1.1 describe the global model from v0.2.2 to v0.5.0. Since v0.6.0
+the solve uses the AKAZE homography of §8.1.2 instead; the functions remain as
+Internal API and the reasoning below is what §8.1.2 had to improve on.*
+
 Let $f$ and $g$ be the reference and deformed intensity fields over the ROI,
 windowed by a Hann taper to suppress edge discontinuity. Their cross-power
 spectrum is normalised to unit magnitude:
@@ -583,8 +587,8 @@ stretch, so condition 2 lets it through. Anchors seeded from that wrong model
 can converge, as a cluster, onto the wrong speckle. Such a cluster agrees with
 itself, so neither the ZNSSD gate nor a median test of residuals from that same
 model rejects it. Nor can counting kept anchors choose between the two
-lattices: in the case pinned by `SeedBench.SimilarityFallsBackUnderStretch` the
-wrong lattice keeps 123 anchors and the translation-only one 86. A lattice that
+lattices: in the case `SeedBench.StretchSeedsWithoutBlunders` now pins (v0.5.0
+measurements) the wrong lattice keeps 123 anchors and the translation-only one 86. A lattice that
 keeps almost every anchor is the evidence that the model fits; a rotation it
 fits keeps ~100%.
 
@@ -600,14 +604,89 @@ ROI at the same noise it is within 0.05° at every angle tested. Below that size
 noisy frames therefore stay translation-only: never worse than before, and not
 helped either.
 
+#### 8.1.2 Global Homography from AKAZE Matches (v0.6.0)
+
+The §8.1.1 model has two blind spots that follow from its construction: the
+point-symmetric spectrum confines $\theta$ to $(-90°, 90°)$, so a half turn reads
+as no turn, and a similarity cannot describe stretch, so it misreads strong
+stretch as rotation and scale. The model is now a planar homography fitted to
+feature matches:
+
+$$ \bm{q} = \pi\!\left(H \begin{pmatrix}\bm{p}\\1\end{pmatrix}\right), \qquad \pi(x, y, w) = (x/w,\ y/w) $$
+
+which contains translation, rotation at any angle, scale, anisotropic stretch
+and shear, and has no angle ambiguity because it is fitted to correspondences,
+not to a spectrum.
+
+**Matches.** AKAZE keypoints and binary (MLDB) descriptors are detected in the
+ROI padded by $k_{\text{AkazePadPx}} = 40$ px of the working scale, in both
+frames, on an area-downsampled copy at scale $\sigma \in \{0.25, 0.5, 1\}$.
+Descriptors are matched by Hamming distance with Lowe's ratio test
+($d_1 < 0.75\,d_2$), matches whose reference keypoint falls outside the ROI
+mask are dropped, and $H$ is fitted by RANSAC with a 3 px threshold at the
+working scale. Fitted at scale $\sigma$ on crop-local coordinates
+$\bm{p}' = \sigma(\bm{p} - \bm{o})$, the image-space model is
+
+$$ H = T^{-1} H' T, \qquad T = \begin{pmatrix}\sigma & 0 & -\sigma o_x\\ 0 & \sigma & -\sigma o_y\\ 0 & 0 & 1\end{pmatrix} $$
+
+**Scale.** The coarsest scale with at least $k_{\text{AkazeGoodInliers}} = 25$
+inliers is used, else the scale with the most inliers if it has
+$k_{\text{AkazeMinInliers}} = 10$, else there is no model. The coarse scales
+are cheap and see the large speckle of a big ROI; a small ROI has too few
+pixels at $0.25\times$ and settles at $0.5\times$ or $1\times$. The scale a
+solve settles on is the first one tried on the next solve, and coarser ones
+only if nothing from there up fits.
+
+**Seed.** At each anchor $\bm{p}$, with $(X, Y, w)^\top = H(\bm{p}, 1)^\top$,
+
+$$ \bm{u}_0(\bm{p}) = \pi\big(H(\bm{p}, 1)^\top\big) - \bm{p}, \qquad
+\nabla\bm{u}_0 = \frac{1}{w}\begin{pmatrix} h_{11} - X h_{31}/w & h_{12} - X h_{32}/w\\ h_{21} - Y h_{31}/w & h_{22} - Y h_{32}/w \end{pmatrix} - I $$
+
+i.e. the displacement and the Jacobian of the projective map minus the
+identity. As in §8.1.1 the full model seeds the lattice only when it moves a
+ROI corner more than $k_{\text{SimilarityMinCornerPx}} = 4$ px away from where
+its translation at the ROI centre puts it; below that every anchor starts from
+that translation. The median test of §8.3 runs on residuals from the model, and
+a model lattice that is not FULL or keeps less than
+$k_{\text{SimilarityKeepFraction}} = 90\%$ is replaced by the translation-only
+lattice, for the reason given under §8.1.1. Without a model the lattice
+searches for its own offsets (`INIT_AUTO_SEARCH`), the path v0.5.0 took without
+a phase lock.
+
+**Refit.** The anchors that survive the median test are good to about 0.01 px,
+the keypoints only to the RANSAC tolerance at the working scale. $H$ is
+therefore refitted to the anchor correspondences (RANSAC, 1 px,
+$\ge 8$ anchors), and that refitted model is the guess for the grid nodes the
+Delaunay mesh of §8.4 does not reach, which IC-GN then solves directly.
+
+**Why the keypoints are not mesh vertices.** Before v0.2.2 the matches
+themselves were the mesh. §8.4 derives gradients from triangle vertices, so a
+vertex error $e$ over an edge of length $L$ becomes a gradient error of order
+$e/L$: keypoints give $e \sim 1$ px on short clustered edges. Here they only
+fit an eight-parameter model, which averages that error over all inliers, and
+the mesh vertices remain the IC-GN anchors.
+
+**Incremental reuse.** The reference's keypoints are kept per scale with the
+reference. When `IncrementalSession` promotes the deformed frame to reference,
+the keypoints just detected on it are moved into the new padded ROI's
+coordinates, $\bm{p}'' = \bm{p}' + \sigma(\bm{o} - \bm{o}'')$, and kept if
+inside, provided the old crop covers at least 90% of the new one. A reference
+is thus detected once, as a deformed frame.
+
+**Where it does not reach.** AKAZE needs texture that survives the deformation
+at some scale. Under a 45% stretch the descriptors no longer match and there
+is no model, so the lattice searches; on the tensile video's 80 px ROI
+$0.25\times$ and $0.5\times$ find too few inliers and the model comes from
+$1\times$.
+
 ### 8.2 Anchor Lattice
 
 A regular lattice of ROI grid nodes with stride
 
 $$ s = \max\left(1,\ \operatorname{round}\sqrt{\frac{N_x N_y}{N_{\text{target}}}}\right) $$
 
-is solved by the engine's own IC-GN, initialised from §8.1 (under the
-similarity, at $\bm{u}_0(\bm{p})$ with gradients $sR - I$), with the last row
+is solved by the engine's own IC-GN, initialised from the global model of
+§8.1.2 (under the full model, at $\bm{u}_0(\bm{p})$ with its gradients), with the last row
 and column always included so the convex hull reaches the ROI boundary. Because
 the anchors coincide with grid nodes they reuse the pooled Hessians of §6, and a
 node whose ZNSSD clears the result gate is retained as a **final** measurement
@@ -649,14 +728,14 @@ does not have an affine displacement field — a global model rejects signal, no
 just blunders — whereas the median test assumes no field shape at all. The
 lattice makes the neighbourhood lookup $O(1)$.
 
-Under the similarity of §8.1.1 the test runs on the residual
-$u_i - u_0(\bm{p}_i)$, not on $u_i$. A rotation is a smooth field, but
+Under the full global model (§8.1.2; the similarity of §8.1.1 before v0.6.0)
+the test runs on the residual $u_i - u_0(\bm{p}_i)$, not on $u_i$. A rotation is a smooth field, but
 neighbours a lattice spacing $\ell$ apart differ by about $\ell\theta$: 5 px
 at $15°$ and $\ell = 20$ px. On the lattice edge every neighbour lies on one
 side, so the raw median is offset by that amount and an edge anchor fails a
 1 px tolerance however accurate it is. Subtracting the global model removes
 exactly that, and leaves the test free of assumptions about the deformation on
-top of it. Without the similarity the residual is the displacement itself and
+top of it. Without the full model the residual is the displacement itself and
 the test is unchanged.
 
 A rejected anchor is neither a mesh vertex nor an output point.

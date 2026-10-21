@@ -49,6 +49,15 @@ Downstream apps pin an **exact** engine tag and only auto-adopt minor/patch bump
 > images keep their contrast, and the solved field moves (IC-GN validity and
 > conditioning, MATHEMATICS §6.6; goldens re-captured).
 
+> **v0.6.0 is a minor release: a new capability, no surface change.** The
+> anchor lattice is seeded from an AKAZE homography instead of phase
+> correlation, so rotation past 90°, large stretch and shear now seed the
+> mesh. Every signature, Frozen value, slot index and the packing are
+> unchanged. What callers can observe: metrics slot 21 now reports a
+> global-motion (AKAZE) lock rather than a phase-correlation lock (§A.4, same
+> type and range), the field moves (goldens re-captured), and the engine
+> links three more OpenCV modules (`features2d`, `calib3d`, `flann`).
+
 > **Build-plumbing carve-out.** Export/visibility machinery — the `SEMPER_C_API`
 > macro, `-fvisibility=hidden`, `dllexport`/`dllimport` selection — is treated as
 > build plumbing, not public surface: it changes *how* the documented symbols are
@@ -146,8 +155,9 @@ struct ReferenceCache {                 // non-copyable, non-movable
 Must remain **non-copyable / non-movable**.
 
 `ReferenceCache` also keeps work that depends only on the reference and the
-grid: the node validity scan, the Hessian pool and the reference side of phase
-correlation. That cache is **Internal**. It is reused while `rect`, `step`,
+grid: the node validity scan, the Hessian pool and the reference's AKAZE
+keypoints (v0.6.0; the reference side of phase correlation before). That cache
+is **Internal**. It is reused while `rect`, `step`,
 `subset_size` and the ROI mask are unchanged, and dropped by `reset`,
 `set_from_gray` and `adopt`. Outputs are bit-identical with or without it.
 `adopt(...)` (added v0.4.0) hands an already-prepared image to the cache; it
@@ -364,7 +374,8 @@ before that it copied at most 19 slots, so slots 19–22 never reached Kotlin.
 and remain Frozen. Its *meaning* changed from "AKAZE + RANSAC time (ms)" to
 **"seeding time (ms)"** — phase correlation plus the anchor lattice — when the
 descriptor seeding front-end was replaced. Callers that display this value
-should relabel it; nothing about the buffer's shape moved. Slot 16 keeps
+should relabel it; nothing about the buffer's shape moved. From v0.6.0 it is
+AKAZE matching plus the anchor lattice — still "seeding time (ms)". Slot 16 keeps
 `2 = full mesh / 1 = sparse mesh / 0 = Path C fallback`.
 
 **Slots 3 and 4 narrowed (v0.3.0).** Their labels — "Solved via Mesh" (Path A)
@@ -380,7 +391,7 @@ than repurpose either Frozen slot, v0.3.0 **appends** the missing terms:
 | 18 | Total IC-GN time (ms), all paths | v0.2.2 |
 | 19 | Solved via the anchor lattice | v0.3.0 |
 | 20 | Converged, then discarded by the VSG strain post-filter | v0.3.0 |
-| 21 | Phase-correlation lock: `1` = locked, `0` = no lock | v0.3.0 |
+| 21 | Global-motion lock: `1` = locked, `0` = no lock (phase correlation until v0.6.0, the AKAZE homography since) | v0.3.0 |
 | 22 | Mesh coverage: convex hull of the accepted anchors / ROI area, `0..1` | v0.3.0 |
 | 23 | Converged, then rejected by the displacement median test before packing | v0.5.0 |
 
@@ -413,14 +424,23 @@ room for one more point; the identity is only guaranteed when that is false.
 `FullField.MetricsPointCountsAccountForEverySolvedPoint` passes a full-size
 buffer for that reason.
 
-**Slots 21 and 22 are the seeding health signals.** The anchor lattice estimates
-translation only, so past roughly 5° of rotation the phase lock fails and mesh
-coverage collapses — 0.45 at 5° and 0.15 at 15° against the old descriptor
-front-end's 0.96 (`docs/SEEDING_BENCHMARK.md` §4.5). Both numbers were already
-computed inside the seeder and then discarded, so a field solved off a
-15%-coverage mesh was reported exactly like a healthy one. Treat a `0` in slot
-21, or a slot 22 below roughly 0.5, as "these displacements are probably fine
-near the anchors and unreliable away from them" rather than as an error.
+**Slots 21 and 22 are the seeding health signals.** In v0.3.0 the anchor
+lattice estimated translation only, so past roughly 5° of rotation the phase
+lock failed and mesh coverage collapsed — 0.45 at 5° and 0.15 at 15° against
+the old descriptor front-end's 0.96 (`docs/SEEDING_BENCHMARK.md` §4.5). Both
+numbers were already computed inside the seeder and then discarded, so a field
+solved off a 15%-coverage mesh was reported exactly like a healthy one. Treat a
+`0` in slot 21, or a slot 22 below roughly 0.5, as "these displacements are
+probably fine near the anchors and unreliable away from them" rather than as an
+error.
+
+**Slot 21 meaning (v0.6.0).** Index, type and range are unchanged and Frozen.
+It reports whether the global motion model locked: since v0.6.0 that is an
+AKAZE homography with at least `kAkazeMinInliers` RANSAC inliers, where it was
+a phase-correlation peak before. The two fail in different places — AKAZE
+locks at any rotation and under large stretch, but needs enough texture at
+some scale to match — so the same image pair can read differently in the two
+versions. A `0` still means the lattice searched for its own offsets.
 
 Slots 17 and 18 also changed value in v0.3.0 without changing meaning: the
 anchor lattice runs a full IC-GN phase of its own, and its time was being
@@ -459,7 +479,7 @@ and smoke test in this repo was on the wrong side of it before v0.3.0.
 | `-2` | invalid ROI |
 | `-3` | init / argument failure |
 | `-4` | `strain_window` too small for `step` (**added v0.3.0**) |
-| `-5` | no seed: no anchor converged, phase correlation did not lock, and the fallback search failed (**added v0.5.0**; this case returned an undocumented `-1` before) |
+| `-5` | no seed: no anchor converged, the global motion model did not lock (AKAZE since v0.6.0, phase correlation before), and the fallback search failed (**added v0.5.0**; this case returned an undocumented `-1` before) |
 | `-99` (`kCancelled`) | cancelled mid-solve |
 
 ---

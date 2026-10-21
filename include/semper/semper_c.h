@@ -53,7 +53,7 @@ typedef struct semper_params {
 /* strain_window too small for step: the VSG plane fit would reject every point.
    Added in v0.3.0; this case previously returned 0 points with a success code. */
 #define SEMPER_ERR_STRAIN_WINDOW (-4)
-/* Nothing could seed the solve (no anchor converged, no phase-correlation
+/* Nothing could seed the solve (no anchor converged, no global-motion
    lock, and the fallback search failed) — e.g. a frame unrelated to the
    reference. Added in v0.5.0; this case previously returned an undocumented -1. */
 #define SEMPER_ERR_SEED      (-5)

@@ -48,7 +48,7 @@ _MESSAGES = {
     ERR_ROI: "invalid ROI",
     ERR_INIT: "init/argument failure (was set_reference called?)",
     ERR_STRAIN_WINDOW: "strain_window too small for step (need >= 2 * step)",
-    ERR_SEED: "no seed found (no anchor converged and phase correlation did not lock)",
+    ERR_SEED: "no seed found (no anchor converged and no global motion model locked)",
     ERR_CANCELLED: "cancelled",
 }
 
