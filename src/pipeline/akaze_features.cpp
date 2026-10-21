@@ -34,11 +34,25 @@ cv::Rect padded_rect(const cv::Rect& roi, double scale, cv::Size image) {
     return r & cv::Rect(0, 0, image.width, image.height);
 }
 
+// Runs f on the calling thread with OpenCV's thread pool left asleep: OpenCV
+// runs a parallel_for_ that starts inside another one serially, and a
+// one-stripe parallel_for_ runs its body inline. AKAZE on a few hundred
+// pixels gains under 1 ms from the pool, but the pool's workers were still
+// spinning when the engine's OpenMP region started right after, and on a host
+// a small-ROI frame took up to 2-3x as long (wall time, same CPU work). The
+// Android adapter pins OpenCV to one thread anyway.
+template <class F>
+void without_opencv_pool(F&& f) {
+    cv::parallel_for_(cv::Range(0, 1), [&](const cv::Range&) { f(); }, 1.0);
+}
+
 void detect(const cv::Mat& gray, const cv::Rect& rect, double scale,
             std::vector<cv::KeyPoint>& kp, cv::Mat& desc) {
-    cv::Mat small;
-    cv::resize(gray(rect), small, cv::Size(), scale, scale, cv::INTER_AREA);
-    cv::AKAZE::create()->detectAndCompute(small, cv::noArray(), kp, desc);
+    without_opencv_pool([&] {
+        cv::Mat small;
+        cv::resize(gray(rect), small, cv::Size(), scale, scale, cv::INTER_AREA);
+        cv::AKAZE::create()->detectAndCompute(small, cv::noArray(), kp, desc);
+    });
 }
 
 } // namespace
@@ -99,7 +113,7 @@ bool match_akaze(const AkazeRef& ref, const cv::Mat& def_gray, const cv::Mat& ro
     }
 
     std::vector<std::vector<cv::DMatch>> knn;
-    cv::BFMatcher(cv::NORM_HAMMING).knnMatch(ref.descriptors, desc, knn, 2);
+    without_opencv_pool([&] { cv::BFMatcher(cv::NORM_HAMMING).knnMatch(ref.descriptors, desc, knn, 2); });
     out.def_side.rect = ref.rect;
     out.def_side.scale = ref.scale;
 
@@ -126,7 +140,8 @@ bool match_akaze(const AkazeRef& ref, const cv::Mat& def_gray, const cv::Mat& ro
 
     const auto t1 = std::chrono::high_resolution_clock::now();
     std::vector<uchar> inlier;
-    cv::Mat H = cv::findHomography(p1, p2, cv::RANSAC, tuning::kAkazeRansacPx, inlier);
+    cv::Mat H;
+    without_opencv_pool([&] { H = cv::findHomography(p1, p2, cv::RANSAC, tuning::kAkazeRansacPx, inlier); });
     for (size_t i = 0; i < inlier.size(); ++i) {
         if (!inlier[i]) continue;
         out.ref_pts.emplace_back((float)(p1[i].x / s + ox), (float)(p1[i].y / s + oy));
