@@ -74,7 +74,15 @@ void run_path_a(
 
                 int simplex_count_before = local_engine.count_simplex;
 
-                auto search_flag = ALLOW_SIMPLEX_RESCUE ? INIT_NO_SEARCH : INIT_NO_SIMPLEX;
+                // A guess from outside the mesh (extrapolated, or from the
+                // homography) is good wherever there is material to match, so
+                // when IC-GN fails from it the node is usually off the
+                // specimen and a Simplex rescue fails too. Leave such a node
+                // to Path B, which retries it from solved neighbours with its
+                // own rescue, rather than paying for the rescue twice.
+                const int tag = resultGrid[y][x].mesh_assignment_type;
+                const bool outside_mesh = tag == kExtrapolatedTag || tag == kHomographyGuessTag;
+                auto search_flag = (ALLOW_SIMPLEX_RESCUE && !outside_mesh) ? INIT_NO_SEARCH : INIT_NO_SIMPLEX;
                 Semper::AnalysisResult res = local_engine.calculate_deformation(
                         local_subset, ctx.def_img, guess.u[idx], guess.v[idx], guess.ux[idx], guess.uy[idx], guess.vx[idx], guess.vy[idx], search_flag);
                 reject_if_ghosted(res, params.subset_size);

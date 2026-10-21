@@ -219,8 +219,10 @@ MeshSeedResult detect_mesh_seeds(
         const FullFieldParams &params,
         const std::string &debug_dir);
 
-// mesh_assignment_type of a node solved as a refined AKAZE vertex, and of a
-// node outside the mesh whose guess came from the RANSAC homography.
+// mesh_assignment_type of a node whose guess was extrapolated past the mesh
+// edge, of a node solved as a refined AKAZE vertex, and of a node outside the
+// mesh whose guess came from the RANSAC homography.
+inline constexpr int kExtrapolatedTag = 2;
 inline constexpr int kMeshVertexTag = 3;
 inline constexpr int kHomographyGuessTag = 5;
 

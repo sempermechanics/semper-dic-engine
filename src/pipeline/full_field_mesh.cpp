@@ -188,7 +188,7 @@ MeshGuessField build_mesh_guess_field(
                     const auto &tri = affTriangles[best_ti];
                     guess.u[idx] = (float)(tri.ux * gp.x + tri.uy * gp.y + tri.u); guess.v[idx] = (float)(tri.vx * gp.x + tri.vy * gp.y + tri.v);
                     guess.ux[idx] = (float)tri.ux; guess.uy[idx] = (float)tri.uy; guess.vx[idx] = (float)tri.vx; guess.vy[idx] = (float)tri.vy;
-                    guess.in_mesh[idx] = true; resultGrid[y][x].mesh_assignment_type = 2;
+                    guess.in_mesh[idx] = true; resultGrid[y][x].mesh_assignment_type = kExtrapolatedTag;
                 }
             }
         }
