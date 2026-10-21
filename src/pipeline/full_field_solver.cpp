@@ -18,6 +18,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
+#include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
 #include <string>
 #include <thread>
@@ -305,11 +306,43 @@ int run_full_field(
         const SolveContext ctx{cache, params, defImg, gridW, gridH, safe_cores,
                                hessian_pool, global_points_solved, compute_order_counter};
 
+        // Refine the AKAZE matches into IC-GN-solved grid nodes and mesh on
+        // those: exact vertices give the triangles accurate gradients. Keeps
+        // the keypoint mesh if fewer than three nodes survive.
+        std::vector<cv::Point2f> mesh_ref_pts = akaze_ref_pts;
+        std::vector<cv::Point2f> mesh_def_pts = akaze_def_pts;
+        cv::Mat global_H = seeds.homography;
+        if (mesh_quality != MeshQuality::NONE) {
+            VertexRefineResult vr = refine_mesh_vertices(ctx, seeds, resultGrid, stats_pathA);
+            timings.refine = vr.time_ms;
+            if (cancel_requested()) return kCancelled;
+            if (vr.ref_pts.size() >= 3) {
+                std::vector<cv::Point2f> hull;
+                cv::convexHull(vr.ref_pts, hull);
+                const float cov = (float)(cv::contourArea(hull) / ((double)params.rect_w * params.rect_h));
+                mesh_quality = cov >= 0.30f ? MeshQuality::FULL : MeshQuality::SPARSE;
+                mesh_ref_pts.swap(vr.ref_pts);
+                mesh_def_pts.swap(vr.def_pts);
+                // Refit the global model to the refined vertices: they are good
+                // to ~0.01 px where the keypoints were good to the 3 px RANSAC
+                // tolerance at the detection scale, and this model is what the
+                // nodes outside the mesh start from.
+                if (mesh_ref_pts.size() >= 8) {
+                    cv::Mat H = cv::findHomography(mesh_ref_pts, mesh_def_pts, cv::RANSAC, 1.0);
+                    if (H.rows == 3 && H.cols == 3 && cv::checkRange(H)) global_H = H;
+                }
+                LOGD("ROUTING: %d/%d AKAZE matches refined into vertices (%d converged), coverage %.2f -> %s",
+                     vr.accepted, vr.tried, vr.converged, cov, mesh_quality == MeshQuality::FULL ? "FULL" : "SPARSE");
+            } else {
+                LOGD("ROUTING: only %d of %d matches refined; keeping the keypoint mesh", vr.accepted, vr.tried);
+            }
+        }
+
         std::vector<AffineTriangle> affTriangles;
         MeshGuessField guess = build_mesh_guess_field(
-                cache, params, akaze_ref_pts, akaze_def_pts, mesh_quality,
+                cache, params, mesh_ref_pts, mesh_def_pts, mesh_quality,
                 globalU, globalV, gridW, gridH, local_debug_dir,
-                resultGrid, affTriangles, timings);
+                resultGrid, affTriangles, timings, global_H);
 
         if (execute_path_c) {
             int rc = run_path_c(ctx, akaze_ref_pts, resultGrid, path_c_seed_x, path_c_seed_y, globalU, globalV);

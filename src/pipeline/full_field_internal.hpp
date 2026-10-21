@@ -155,7 +155,7 @@ struct SolveContext {
 
 // Per-phase wall clock, aggregated for the profiling log and the metrics array.
 struct PhaseTimings {
-    double img_prep = 0, akaze = 0, ransac = 0, delaunay = 0, contour_assign = 0;
+    double img_prep = 0, akaze = 0, ransac = 0, refine = 0, delaunay = 0, contour_assign = 0;
     double extrapolate = 0, smoothing = 0, prepass = 0, pathA = 0, pathB = 0;
     double strain = 0, total = 0;
 };
@@ -205,6 +205,9 @@ struct MeshSeedResult {
     MeshQuality quality = MeshQuality::NONE;
     float globalU = 0.0f;
     float globalV = 0.0f;
+    // RANSAC homography of the matches in full-image coordinates (reference ->
+    // deformed), CV_64F 3x3; empty when there is no usable fit.
+    cv::Mat homography;
     double time_akaze_ms = 0.0;
     double time_ransac_ms = 0.0;
 };
@@ -215,6 +218,31 @@ MeshSeedResult detect_mesh_seeds(
         cv::Mat &roiMask,
         const FullFieldParams &params,
         const std::string &debug_dir);
+
+// mesh_assignment_type of a node solved as a refined AKAZE vertex, and of a
+// node outside the mesh whose guess came from the RANSAC homography.
+inline constexpr int kMeshVertexTag = 3;
+inline constexpr int kHomographyGuessTag = 5;
+
+// Image of (px, py) under the 3x3 CV_64F homography H, and H's Jacobian there
+// (dX/dx, dX/dy, dY/dx, dY/dy). False when the point maps to infinity.
+bool homography_at(const cv::Mat &H, float px, float py, double &X, double &Y, double J[4]);
+
+// AKAZE matches moved to their nearest grid nodes and solved there with IC-GN
+// (full_field_vertices.cpp). The accepted nodes are published into resultGrid
+// as final results and returned as exact mesh vertices.
+struct VertexRefineResult {
+    std::vector<cv::Point2f> ref_pts;   // node positions
+    std::vector<cv::Point2f> def_pts;   // node + solved displacement
+    int tried = 0, converged = 0, accepted = 0;
+    double time_ms = 0.0;
+};
+
+VertexRefineResult refine_mesh_vertices(
+        const SolveContext &ctx,
+        const MeshSeedResult &seeds,
+        ResultGrid &resultGrid,
+        std::vector<ThreadStats> &stats);
 
 // Per-grid-point 6-DOF initial guess produced by the Delaunay mesh.
 struct MeshGuessField {
@@ -235,7 +263,8 @@ MeshGuessField build_mesh_guess_field(
         const std::string &debug_dir,
         ResultGrid &resultGrid,
         std::vector<AffineTriangle> &affTriangles,
-        PhaseTimings &timings);
+        PhaseTimings &timings,
+        const cv::Mat &homography = cv::Mat());
 
 void run_path_a(
         const SolveContext &ctx,

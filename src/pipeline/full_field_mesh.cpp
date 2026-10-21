@@ -39,7 +39,8 @@ MeshGuessField build_mesh_guess_field(
         const std::string& local_debug_dir,
         ResultGrid& resultGrid,
         std::vector<AffineTriangle>& affTriangles,
-        PhaseTimings& timings) {
+        PhaseTimings& timings,
+        const cv::Mat& homography) {
 
     MeshGuessField guess;
     guess.u.assign(gridW * gridH, globalU);
@@ -193,6 +194,30 @@ MeshGuessField build_mesh_guess_field(
         }
     } else {
         LOGD("ROUTING: Mesh is SPARSE. Disabling extrapolation to prevent bad guesses.");
+    }
+
+    // Nodes the mesh does not reach: guess from the RANSAC homography (its
+    // displacement and gradients at the node), so Path A solves them in
+    // parallel instead of leaving them to the flood fill. Path A rejects a bad
+    // guess as it would any other, and Path B still covers what it rejects.
+    if (homography.rows == 3 && homography.cols == 3) {
+        int assigned = 0;
+        for (int y = 0; y < gridH; ++y) {
+            for (int x = 0; x < gridW; ++x) {
+                int idx = y * gridW + x;
+                if (guess.in_mesh[idx] || resultGrid[y][x].solved) continue;
+                const float gx = (float)(params.rect_x + x * params.step);
+                const float gy = (float)(params.rect_y + y * params.step);
+                double X, Y, J[4];
+                if (!homography_at(homography, gx, gy, X, Y, J)) continue;
+                guess.u[idx] = (float)(X - gx); guess.v[idx] = (float)(Y - gy);
+                guess.ux[idx] = (float)(J[0] - 1.0); guess.uy[idx] = (float)J[1];
+                guess.vx[idx] = (float)J[2]; guess.vy[idx] = (float)(J[3] - 1.0);
+                guess.in_mesh[idx] = true; resultGrid[y][x].mesh_assignment_type = kHomographyGuessTag;
+                ++assigned;
+            }
+        }
+        if (assigned > 0) LOGD("ROUTING: %d nodes outside the mesh seeded from the RANSAC homography", assigned);
     }
     timings.extrapolate = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_extrap_start).count();
 

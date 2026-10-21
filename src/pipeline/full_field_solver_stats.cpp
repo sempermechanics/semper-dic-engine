@@ -123,6 +123,7 @@ void log_profiling_summary(
     LOGD("=== ⏱️ ADVANCED PERFORMANCE PROFILING ===");
     LOGD("Image Prep & Masking: %.2f ms", t.img_prep);
     LOGD("AKAZE & RANSAC:       %.2f ms", t.akaze + t.ransac);
+    LOGD("Vertex refinement:    %.2f ms (IC-GN at the matched nodes)", t.refine);
     LOGD("Hessian Pre-pass:     %.2f ms (One-time Global Math)", t.prepass);
 
     LOGD("Delaunay Mesh Setup:  %.2f ms", t.delaunay);

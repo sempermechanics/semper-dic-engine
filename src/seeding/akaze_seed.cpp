@@ -16,8 +16,10 @@ bool extract_akaze_features(cv::Mat &ref, cv::Mat &def, cv::Mat &roi_mask, doubl
                               double &out_akaze_ms, double &out_ransac_ms,
                               std::vector<cv::KeyPoint>& cached_kp, cv::Mat& cached_desc,
                               int offset_x, int offset_y,
-                              const std::string &debug_dir) {
+                              const std::string &debug_dir,
+                              cv::Mat *out_homography) {
         (void)debug_dir;
+        if (out_homography) out_homography->release();
 
         auto t_start_akaze = std::chrono::high_resolution_clock::now();
         cv::Mat smallRef, smallDef;
@@ -78,7 +80,8 @@ bool extract_akaze_features(cv::Mat &ref, cv::Mat &def, cv::Mat &roi_mask, doubl
 
         auto t_start_ransac = std::chrono::high_resolution_clock::now();
         std::vector<uchar> inlier_mask;
-        cv::findHomography(p1, p2, cv::RANSAC, 3.0, inlier_mask);
+        cv::Mat H = cv::findHomography(p1, p2, cv::RANSAC, 3.0, inlier_mask);
+        if (out_homography) *out_homography = H;
 
         out_ref_pts.clear(); out_def_pts.clear();
         for (size_t i = 0; i < inlier_mask.size(); ++i) {
