@@ -149,8 +149,8 @@ bool match_akaze(const AkazeRef& ref, const cv::Mat& def_gray, const cv::Mat& ro
     }
     if (H.rows == 3 && H.cols == 3 && cv::checkRange(H) && out.inliers() >= tuning::kAkazeMinInliers) {
         // P_def = o + H(s (P - o)) / s, i.e. T^-1 H T with T = s (P - o).
-        const cv::Mat T = (cv::Mat_<double>(3, 3) << s, 0, -s * ox, 0, s, -s * oy, 0, 0, 1);
-        const cv::Mat Ti = (cv::Mat_<double>(3, 3) << 1.0 / s, 0, ox, 0, 1.0 / s, oy, 0, 0, 1);
+        const cv::Mat T(cv::Matx33d(s, 0, -s * ox, 0, s, -s * oy, 0, 0, 1));
+        const cv::Mat Ti(cv::Matx33d(1.0 / s, 0, ox, 0, 1.0 / s, oy, 0, 0, 1));
         out.homography = Ti * H * T;
     }
     out.ransac_ms = ms_since(t1);

@@ -40,6 +40,16 @@ slot index and the packing are unchanged; the field moves.
 - AKAZE runs without waking OpenCV's thread pool, whose spinning workers
   otherwise slowed the engine's next OpenMP region (host builds; Android pins
   OpenCV to one thread).
+- OpenCV 4.13.0 → **4.14.0** (submodule `0654a42e`). Its `core` and
+  `imgproc` grew upstream: the stripped x86-64 Python extension is 15.58 MB
+  (14.32 MB on 4.13; v0.5.0 12.30 MB). Results and timing unchanged (all 171
+  host tests, 16 Python tests). OpenCV 5.0 was not taken: it moves AKAZE out
+  of the main repository into opencv_contrib.
+- The deprecated `cv::Mat_ << ...` comma initialiser (a `-Werror` failure on
+  4.14) is replaced by `cv::Matx`.
+- Eigen stays at 5.0.1, the latest release. CI actions: `checkout` v7,
+  `cache` v6, `setup-python` v7, `upload-artifact` v7 (Node 24 runtime).
+  Python build requires `pybind11>=3.0` (built and tested with 3.1.0).
 
 ### Fixed
 - The mesh guess field's 5x5 smoothing moved nodes on the grid or mesh edge

@@ -454,7 +454,7 @@ with `git submodule status` rather than trusting this table.
 | Dependency | Path | Recorded commit | Tag at that commit | How it's used |
 |---|---|---|---|---|
 | **Eigen** | `third_party/eigen` | `bc3b3987` | 5.0.1 | header-only; added via `include_directories` |
-| **OpenCV** | `third_party/opencv` | `fe38fc60` | 4.13.0 | **compiled from source** in the engine build |
+| **OpenCV** | `third_party/opencv` | `0654a42e` | 4.14.0 | **compiled from source** in the engine build |
 
 **OpenCV modules compiled:** `core,imgproc,imgcodecs,features2d,calib3d,flann`
 (`SEMPER_OPENCV_BUILD_LIST` in `cmake/SemperOpenCV.cmake`, overridable from the

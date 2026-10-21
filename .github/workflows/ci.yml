@@ -26,12 +26,12 @@ jobs:
       CCACHE_MAXSIZE: 500M
       CCACHE_COMPILERCHECK: content
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
       - name: Cache OpenCV packages
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/apt-cache
           key: apt-libopencv-dev-${{ runner.os }}-v1
@@ -45,7 +45,7 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" ~/apt-cache
 
       - name: Cache ccache objects
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ github.workspace }}/.ccache
           key: ccache-host-tests-${{ github.sha }}
@@ -94,7 +94,7 @@ jobs:
       CCACHE_MAXSIZE: 500M
       CCACHE_COMPILERCHECK: content
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -112,7 +112,7 @@ jobs:
             clang-18 libomp-18-dev libclang-rt-18-dev
 
       - name: Cache ccache objects
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ github.workspace }}/.ccache
           key: ccache-san-${{ matrix.id }}-${{ github.sha }}
@@ -151,7 +151,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -223,7 +223,7 @@ jobs:
     # than Release; 30 min cut the run off mid-suite.
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -255,7 +255,7 @@ jobs:
 
       - name: Upload coverage.xml
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-xml
           path: coverage.xml
