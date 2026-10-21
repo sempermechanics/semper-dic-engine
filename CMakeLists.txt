@@ -27,6 +27,9 @@ set(SEMPER_OPENCV_INCLUDE_DIRS
         ${OPENCV_SRC_DIR}/modules/core/include
         ${OPENCV_SRC_DIR}/modules/imgproc/include
         ${OPENCV_SRC_DIR}/modules/imgcodecs/include
+        ${OPENCV_SRC_DIR}/modules/features2d/include
+        ${OPENCV_SRC_DIR}/modules/calib3d/include
+        ${OPENCV_SRC_DIR}/modules/flann/include
         ${CMAKE_BINARY_DIR}
 )
 
@@ -71,6 +74,7 @@ endif()
 # ---------------------------------------------------------------------------
 add_library(semper_pipeline STATIC
         src/io/image_codec.cpp
+        src/pipeline/akaze_features.cpp
         src/pipeline/phase_correlate.cpp
         src/pipeline/reference_cache.cpp
         src/pipeline/cancel.cpp
@@ -101,6 +105,9 @@ target_link_libraries(semper_pipeline
             opencv_core
             opencv_imgproc
             opencv_imgcodecs
+            opencv_features2d
+            opencv_calib3d
+            opencv_flann
 )
 target_compile_definitions(semper_pipeline PRIVATE
         $<$<BOOL:${SEMPER_ANDROID}>:SEMPER_ANDROID_LOG=1>

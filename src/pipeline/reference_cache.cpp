@@ -61,6 +61,10 @@ void ReferenceCache::set_from_gray(const cv::Mat& gray_in, const cv::Mat& roi_ma
 }
 
 void ReferenceCache::adopt(std::unique_ptr<Image> prepared, cv::Mat gray_in, const cv::Mat& roi_mask) {
+    // The AKAZE detection scale the outgoing reference settled on depends on
+    // the speckle, not on the frame: carry it over, so incremental DIC does not
+    // climb the scale pyramid again at every reference update.
+    const int akaze_level = precompute ? precompute->akaze_first_level : 0;
     reset();
     if (!prepared || gray_in.empty()) return;
     gray = std::move(gray_in);
@@ -68,6 +72,10 @@ void ReferenceCache::adopt(std::unique_ptr<Image> prepared, cv::Mat gray_in, con
     height = gray.rows;
     ref_img = std::move(prepared);
     stamp_ghost_wall(*ref_img, roi_mask);
+    if (akaze_level > 0) {
+        precompute = std::make_unique<internal::RefPrecompute>();
+        precompute->akaze_first_level = akaze_level;
+    }
 }
 
 namespace internal {

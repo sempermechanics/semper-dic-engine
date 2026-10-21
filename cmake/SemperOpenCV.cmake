@@ -11,11 +11,11 @@ foreach(_stub doc data)
     endif()
 endforeach()
 
-# The engine needs core/imgproc/imgcodecs only. features2d, flann and calib3d
-# went out with the descriptor seeding front-end (they served AKAZE, BFMatcher
-# and one cv::findHomography call); dropping them takes ~29% off the aarch64
-# libsemper_c.so. Overridable so the cost can be re-measured.
-set(SEMPER_OPENCV_BUILD_LIST "core,imgproc,imgcodecs"
+# features2d (AKAZE, BFMatcher), calib3d (findHomography) and flann (a
+# features2d dependency) serve the AKAZE global-motion front end; core, imgproc
+# and imgcodecs the rest. v0.5.0 built without the first three, ~29% smaller
+# on aarch64. Overridable so the cost can be re-measured.
+set(SEMPER_OPENCV_BUILD_LIST "core,imgproc,imgcodecs,features2d,calib3d,flann"
     CACHE STRING "OpenCV modules compiled from source")
 set(BUILD_LIST "${SEMPER_OPENCV_BUILD_LIST}" CACHE STRING "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)

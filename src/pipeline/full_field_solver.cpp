@@ -413,12 +413,12 @@ int run_full_field_impl(
 
         timings.prepass = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_prepass_start).count();
 
-        // Anchor-lattice seeding: phase correlation for the global rigid shift,
+        // Anchor-lattice seeding: an AKAZE homography for the global motion,
         // then IC-GN on a lattice of grid nodes. It records but publishes
         // nothing; see AnchorResult for why that has to be a separate step.
         std::vector<ThreadStats> stats_anchors(safe_cores);
         MeshSeedResult seeds = solve_anchor_seeds(
-                cache, defMat, defImg, params, gridW, gridH, safe_cores,
+                cache, defMat, roiMask, defImg, params, gridW, gridH, safe_cores,
                 hessian_pool, resultGrid, stats_anchors, timings, cancel);
 
         // Now apply them. Nodes that clear the result gate *and* survive the
@@ -436,14 +436,14 @@ int run_full_field_impl(
         float globalU = seeds.globalU, globalV = seeds.globalV;
 
         // Path C is the "we have no seed at all" fallback, and its failure aborts
-        // the solve. That was right when the front-end was AKAZE, which either
+        // the solve. That was right when AKAZE fed the mesh directly and either
         // produced a mesh or produced nothing. The anchor lattice also yields a
-        // phase-correlation lock and often some solved nodes, so a mesh too
-        // sparse to guide Path A is not the same as having no seed: Path B can
+        // global model and often some solved nodes, so a mesh too sparse to
+        // guide Path A is not the same as having no seed: Path B can
         // flood-fill from what the lattice already found.
         //
-        // A lock on its own is not a seed, though. Phase correlation can lock
-        // on a strong global shift while every anchor fails the result gate:
+        // A model on its own is not a seed, though. AKAZE can lock on the
+        // global motion while every anchor fails the result gate:
         // then solved == 0, accepted == 0, and Path B has nothing to flood
         // fill from but the blind grid-centre node. Require an actual point,
         // and let the lock inform Path C's search rather than replace it.
@@ -456,24 +456,23 @@ int run_full_field_impl(
         MeshGuessField guess = build_mesh_guess_field(
                 cache, params, anchor_ref_pts, anchor_def_pts, mesh_quality,
                 globalU, globalV, gridW, gridH, local_debug_dir,
-                resultGrid, affTriangles, timings);
+                resultGrid, affTriangles, timings, seeds.homography);
 
         const SolveContext ctx{cache, params, defImg, gridW, gridH, safe_cores,
                                hessian_pool, global_points_solved, compute_order_counter,
                                cancel};
 
         if (execute_path_c) {
-            // Path C now runs in cases a bare phase lock used to suppress (see
+            // Path C runs in cases a bare model lock does not suppress (see
             // have_seed above), so its failure can no longer abort the solve:
-            // that would turn fields the old code delivered via Path B into an
-            // error return. When the lattice locked, fall through instead --
-            // Path B still has the global shift and the grid-centre seed, which
-            // is exactly what the old code handed it. Without a lock there is
+            // that would turn fields Path B can deliver into an error return.
+            // When AKAZE locked, fall through instead -- Path B still has the
+            // global shift and the grid-centre seed. Without a lock there is
             // nothing left to try, so the abort stands.
             int rc = run_path_c(ctx, anchor_ref_pts, resultGrid, path_c_seed_x, path_c_seed_y, globalU, globalV);
             if (rc != 0) {
-                if (!seeds.phase_locked) return rc;
-                LOGE("Path C failed (%d); phase correlation locked, continuing to Path B with the global shift", rc);
+                if (!seeds.locked) return rc;
+                LOGE("Path C failed (%d); AKAZE locked, continuing to Path B with the global shift", rc);
             }
         }
 
@@ -557,6 +556,7 @@ int run_full_field_impl(
         if (capture && capture->keep_deformed) {
             capture->deformed = std::move(defImgOwner);
             capture->deformed_gray = def_gray.clone();
+            capture->akaze_deformed = std::move(seeds.def_features);
         }
 
         defMat.release(); roiMask.release();

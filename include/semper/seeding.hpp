@@ -3,8 +3,63 @@
 
 #include <opencv2/core.hpp>
 
+#include <vector>
+
 namespace Semper {
 namespace seeding {
+
+/**
+ * The reference half of AKAZE matching at one detection scale: keypoints and
+ * descriptors of `rect` (the ROI padded by tuning::kAkazePadPx / scale and
+ * clipped to the image) resized by `scale`. Depends only on the reference, so
+ * a batch against one reference detects it once.
+ */
+struct AkazeRef {
+    cv::Rect rect;
+    double scale = 0.0;
+    std::vector<cv::KeyPoint> keypoints;   // in scaled rect coordinates
+    cv::Mat descriptors;
+    bool usable() const { return !keypoints.empty() && !descriptors.empty(); }
+};
+
+AkazeRef prepare_akaze_ref(const cv::Mat& ref_gray, const cv::Rect& roi, double scale);
+
+/**
+ * The reference half for `roi` at `from.scale`, taken from features already
+ * detected on the same image over another padded rect (incremental DIC: the
+ * deformed frame's features become the next reference's). Keeps the keypoints
+ * that fall inside the new padded rect, re-expressed in its coordinates.
+ * False, leaving `out` alone, when the old rect does not cover at least
+ * tuning::kAkazeReuseCover of the new one -- detect afresh then.
+ */
+bool reuse_akaze_ref(const AkazeRef& from, const cv::Rect& roi, cv::Size image, AkazeRef& out);
+
+/**
+ * AKAZE matches between the reference and `def_gray` over `ref.rect`, filtered
+ * by Lowe's ratio test and the ROI mask (on the reference keypoint), then by a
+ * RANSAC homography. Points and the homography are in full-image coordinates,
+ * reference -> deformed: a reference point p appears at H(p). Returns false
+ * (and an empty homography) with fewer than tuning::kAkazeMinInliers inliers.
+ */
+struct AkazeMatches {
+    std::vector<cv::Point2f> ref_pts, def_pts;   // RANSAC inliers
+    cv::Mat homography;                          // 3x3 CV_64F; empty without a fit
+    double scale = 0.0;
+    double detect_ms = 0.0, ransac_ms = 0.0;
+    // The deformed frame's own features over the same rect and scale, for
+    // reuse_akaze_ref when that frame becomes a reference.
+    AkazeRef def_side;
+    int inliers() const { return (int)ref_pts.size(); }
+};
+
+bool match_akaze(const AkazeRef& ref, const cv::Mat& def_gray, const cv::Mat& roi_mask,
+                 AkazeMatches& out);
+
+/**
+ * Image of (px, py) under the 3x3 CV_64F homography H, and H's Jacobian there
+ * (dX/dx, dX/dy, dY/dx, dY/dy). False when the point maps to infinity.
+ */
+bool homography_at(const cv::Mat& H, double px, double py, double& X, double& Y, double J[4]);
 
 /**
  * Global rigid shift of `roi` between the two images, from the normalized

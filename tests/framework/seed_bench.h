@@ -191,10 +191,10 @@ struct Row {
     double mesh_frac = 0.0;        // fraction of grid points inside the mesh
     double mesh_med_du = -1.0;
     double mesh_med_dux = -1.0, mesh_p95_dux = -1.0;
-    bool phase_locked = false;         // anchor lattice: did phaseCorrelate trust its peak
-    bool similarity = false;           // ... and seed with rotation/scale as well
-    bool similarity_rejected = false;  // tried, weak, translation re-solve kept more
-    double lp_rot_deg = 0.0, lp_scale = 1.0;  // the log-polar estimate, used or not
+    bool locked = false;          // AKAZE found a global model
+    bool model = false;           // ... and the anchors were seeded with the full homography
+    bool model_rejected = false;  // tried, weak, translation re-solve kept more
+    double model_rot_deg = 0.0, model_scale = 1.0;  // the model at the ROI centre, used or not
     int anchors_accepted = 0;
     int anchors_attempted = 0;
     double seed_cpu_ms = 0.0;          // user+sys across the seeding call
@@ -255,8 +255,8 @@ inline void measure_seed(Row &row, const TruthFn &truth,
     PhaseTimings timings;
     MeshSeedResult seeds;
 
-    // First call warms nothing (there is no descriptor cache any more), but the
-    // repeats still give a median that survives VM scheduling noise.
+    // The first call detects the reference keypoints, which later ones reuse;
+    // the repeats give a median that survives VM scheduling noise.
     std::vector<double> seed_walls, seed_cpus;
     for (int rep = 0; rep < repeat_count(); ++rep) {
         ResultGrid g = grid;
@@ -266,7 +266,7 @@ inline void measure_seed(Row &row, const TruthFn &truth,
         auto t0 = std::chrono::high_resolution_clock::now();
         const CpuClock c0 = CpuClock::now();
         Semper::pipeline::CancelToken never;
-        seeds = solve_anchor_seeds(cache, def_gray, def_img, params, gridW, gridH,
+        seeds = solve_anchor_seeds(cache, def_gray, no_mask, def_img, params, gridW, gridH,
                                    cores, pool, g, st, t, never);
         // Publishing is a separate step in the pipeline now, but it is still
         // part of what the seeding phase costs, and `grid` below is expected to
@@ -279,13 +279,13 @@ inline void measure_seed(Row &row, const TruthFn &truth,
     }
     row.seed_ms = percentile(seed_walls, 0.50);
     row.seed_cpu_ms = percentile(seed_cpus, 0.50);
-    row.seed_precompute_ms = timings.phase_corr;
+    row.seed_precompute_ms = timings.akaze;
     row.seed_icgn_ms = timings.anchors;
-    row.phase_locked = seeds.phase_locked;
-    row.similarity = seeds.similarity;
-    row.similarity_rejected = seeds.similarity_rejected;
-    row.lp_rot_deg = seeds.rotation_deg;
-    row.lp_scale = seeds.scale;
+    row.locked = seeds.locked;
+    row.model = seeds.model;
+    row.model_rejected = seeds.model_rejected;
+    row.model_rot_deg = seeds.rotation_deg;
+    row.model_scale = seeds.scale;
     row.anchors_accepted = seeds.accepted;
     row.anchors_attempted = seeds.attempted;
     (void)solved_count; (void)order; (void)stats;
@@ -407,10 +407,10 @@ inline void print_table(const std::vector<Row> &rows) {
     std::printf("%s\n", std::string(200, '-').c_str());
     for (const Row &r : rows) {
         char lock[8];
-        // `sim`: locked, and the anchors were seeded with rotation/scale too.
+        // `sim`: locked, and the anchors were seeded with the full homography.
         if (r.anchors_attempted > 0)
             std::snprintf(lock, sizeof(lock), "%s",
-                          r.similarity ? "sim" : r.phase_locked ? "yes" : "NO");
+                          r.model ? "sim" : r.locked ? "yes" : "NO");
         else std::snprintf(lock, sizeof(lock), "-");
         std::printf("%-20s %-15s %6d %6.3f %3d %5s %8.2f %8.2f %11.4f %11.3e %7.3f %11.4f %10.1f %10.1f %6.2f %8.1f %8.2f %7.2f %11.5f\n",
                     r.scenario.c_str(), r.method.c_str(), r.vertices, (double)r.coverage,
@@ -428,27 +428,27 @@ inline void write_csv(const std::vector<Row> &rows, const char *path) {
         std::printf("    (could not open %s for writing)\n", path);
         return;
     }
-    std::fprintf(f, "scenario,method,vertices,coverage,quality,phase_locked,anchors_accepted,anchors_attempted,seed_ms,seed_cpu_ms,"
+    std::fprintf(f, "scenario,method,vertices,coverage,quality,locked,anchors_accepted,anchors_attempted,seed_ms,seed_cpu_ms,"
                     "seed_precompute_ms,seed_icgn_ms,"
                     "vtx_med_du,vtx_p95_du,mesh_frac,mesh_med_du,"
                     "mesh_med_dP,mesh_p95_dP,ff_total_ms,ff_cpu_ms,ff_par,"
                     "rss_retained_mb,ff_seed_ms,"
                     "ff_conv_pct,ff_mean_iters,ff_simplex_calls,ff_rms_u,ff_rc,"
-                    "similarity,lp_rot_deg,lp_scale\n");
+                    "similarity,model_rot_deg,model_scale\n");
     for (const Row &r : rows) {
         std::fprintf(f, "%s,%s,%d,%.6f,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,"
                         "%.6f,%.6f,%.6f,%.6f,%.6e,%.6e,"
                         "%.3f,%.3f,%.4f,%.2f,%.3f,%.4f,%.4f,%d,%.8f,%d,"
                         "%d,%.4f,%.5f\n",
                      r.scenario.c_str(), r.method.c_str(), r.vertices,
-                     (double)r.coverage, r.quality, r.phase_locked ? 1 : 0,
+                     (double)r.coverage, r.quality, r.locked ? 1 : 0,
                      r.anchors_accepted, r.anchors_attempted, r.seed_ms, r.seed_cpu_ms,
                      r.seed_precompute_ms, r.seed_icgn_ms, r.vtx_med_du,
                      r.vtx_p95_du, r.mesh_frac, r.mesh_med_du, r.mesh_med_dux,
                      r.mesh_p95_dux, r.ff_total_ms, r.ff_cpu_ms, r.ff_par,
                      r.rss_retained_mb, r.ff_seed_ms, r.ff_conv_pct,
                      r.ff_mean_iters, r.ff_simplex_calls, r.ff_rms_u, r.ff_rc,
-                     r.similarity ? 1 : 0, r.lp_rot_deg, r.lp_scale);
+                     r.model ? 1 : 0, r.model_rot_deg, r.model_scale);
     }
     std::fclose(f);
     std::printf("    CSV written to %s\n", path);

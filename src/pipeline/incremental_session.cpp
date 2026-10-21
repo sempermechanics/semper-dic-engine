@@ -115,6 +115,12 @@ struct IncrementalSession::Impl {
         const int margin = (tuning::kIncMaskExtrapCells + 1) * grid0.step + half;
         mask_k = warp_material_mask(material_mask0, grid0, Ubase, Vbase, alive, margin);
         cache.adopt(std::move(cap.deformed), std::move(cap.deformed_gray), mask_k);
+        // The AKAZE features were detected on this very image as the deformed
+        // frame: the next solve reuses them instead of detecting them again.
+        if (cap.akaze_deformed.usable()) {
+            if (!cache.precompute) cache.precompute = std::make_unique<RefPrecompute>();
+            cache.precompute->akaze_handover = std::move(cap.akaze_deformed);
+        }
 
         params_k = params.field;
         const cv::Rect bb = cv::boundingRect(mask_k);

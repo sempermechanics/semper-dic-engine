@@ -147,13 +147,13 @@ TEST_CASE(SeedBench, AnchorSeedingRotationGate) {
         measure_seed(row, affine_truth(g.def), ref_gray, def_gray, big_motion_params());
         std::printf("    %-20s lock=%s sim=%d rot=%+.3f x%.4f q=%d cov=%.3f "
                     "vtx=%.4f px kept %d/%d meshfr=%.3f\n",
-                    g.name, row.phase_locked ? "yes" : "NO", row.similarity ? 1 : 0,
-                    row.lp_rot_deg, row.lp_scale, row.quality, (double)row.coverage,
+                    g.name, row.locked ? "yes" : "NO", row.model ? 1 : 0,
+                    row.model_rot_deg, row.model_scale, row.quality, (double)row.coverage,
                     row.vtx_med_du, row.anchors_accepted, row.anchors_attempted,
                     row.mesh_frac);
 
-        CHECK(row.phase_locked);
-        CHECK(row.similarity);
+        CHECK(row.locked);
+        CHECK(row.model);
         CHECK(row.quality == 2);
         CHECK(row.coverage >= 0.90f);
         CHECK(row.mesh_frac >= 0.95);
@@ -163,26 +163,21 @@ TEST_CASE(SeedBench, AnchorSeedingRotationGate) {
 }
 
 // ---------------------------------------------------------------------------
-// The similarity's failure mode, and its fallback. The log-polar estimate is
-// a rotation plus an isotropic scale; a strong uniaxial stretch is neither,
-// and IncBench found frames where it reported one anyway and the corrected
-// translation peak still beat a translation peak the stretch had already
-// weakened. This is the noise-free one: IncBench S5 ("stretch to 60%"),
-// frame 150, a 45% stretch with Poisson 0.3 on a 110 px ROI, which the
-// estimate reads as about -5.8 deg x 0.918. The lattice that seeds keeps
-// 123 of 484 anchors and publishes 114 of them; the field built on that
-// measured 0.215 px rms in IncBench against 0.014 px translation-only. The
-// fallback must hand this frame back to the translation-only lattice, which
-// keeps fewer anchors (86) -- so a rule that kept the larger lattice would
-// pick the wrong one.
+// Strong anisotropic stretch: IncBench S5 ("stretch to 60%"), frame 150, a
+// 45% stretch with Poisson 0.3 on a 110 px ROI, noise-free.
 //
-// What the case does not fix: at 45% stretch the edge anchors' true
-// displacement is ~25 px, and from a zero-gradient seed some stick near zero
-// and still clear the loose vertex gate, in either lattice (p95 vertex error
-// ~25.7 px both ways). That is the translation-only seeder's behaviour too,
-// so it is reported here and not asserted.
+// Until v0.6.0 this was the log-polar similarity's failure mode: it read the
+// stretch as about -5.8 deg x 0.918, the lattice seeded from that kept 123 of
+// 484 anchors with blunders no gate caught (0.215 px field rms), and the
+// translation-only fallback kept 86 with a p95 vertex error of ~25.7 px.
+//
+// AKAZE descriptors do not survive a 45% stretch either -- no model here --
+// so every anchor runs its own offset search, the path v0.5.0 also took
+// without a phase lock. On this frame that search is what does the work, and
+// it keeps over 300 anchors with no blunders: the p95 vertex error is the
+// bound that matters.
 // ---------------------------------------------------------------------------
-TEST_CASE(SeedBench, SimilarityFallsBackUnderStretch) {
+TEST_CASE(SeedBench, StretchSeedsWithoutBlunders) {
     const int w = 384, h = 256;
     const dictest::SmoothSpeckleField field(101, w, h);
     const cv::Mat ref = dictest::render_frame(field, w, h, dictest::identity_motion(), 0.0f, 7919u);
@@ -213,22 +208,21 @@ TEST_CASE(SeedBench, SimilarityFallsBackUnderStretch) {
     Row row;
     row.scenario = "stretch_45pct";
     measure_seed(row, truth, ref, def, p);
-    std::printf("    lp %+.3f deg x%.4f: sim=%d rejected=%d kept %d/%d q=%d cov=%.3f "
-                "vtx med %.4f p95 %.4f px\n",
-                row.lp_rot_deg, row.lp_scale, row.similarity ? 1 : 0,
-                row.similarity_rejected ? 1 : 0, row.anchors_accepted,
+    std::printf("    lock=%s model %+.3f deg x%.4f applied=%d rejected=%d kept %d/%d q=%d "
+                "cov=%.3f vtx med %.4f p95 %.4f px\n",
+                row.locked ? "yes" : "NO", row.model_rot_deg, row.model_scale,
+                row.model ? 1 : 0, row.model_rejected ? 1 : 0, row.anchors_accepted,
                 row.anchors_attempted, row.quality, (double)row.coverage, row.vtx_med_du,
                 row.vtx_p95_du);
 
-    // The estimate must still be the misfire this case was chosen for, or the
-    // case no longer exercises the fallback.
-    REQUIRE(std::abs(row.lp_rot_deg) > 2.0);
-    CHECK(row.similarity_rejected);
-    CHECK(!row.similarity);
-    CHECK(row.phase_locked);
+    // Measured: FULL, 337/484 kept, cov 0.834, p95 0.026 px.
+    CHECK(row.quality == 2);
+    CHECK(row.anchors_accepted >= 200);
+    REQUIRE(row.vtx_p95_du >= 0.0);
+    CHECK(row.vtx_p95_du <= 0.25);
 
-    // The outcome that matters is the field: 0.215 px with the similarity
-    // lattice, 0.014 px translation-only. Bounded between the two.
+    // And the field: 0.215 px from the misfired similarity, 0.014 px from
+    // v0.5.0's translation-only fallback.
     measure_full_field(row, truth, ref, def, p);
     std::printf("    field: %d points, rms %.4f px\n", row.ff_rc, row.ff_rms_u);
     REQUIRE(row.ff_rc > 0);
@@ -327,13 +321,13 @@ TEST_CASE(SeedBench, AnchorSeedingQualityGate) {
 
         std::printf("    %-16s lock=%s q=%d cov=%.3f vtx=%.4f px "
                     "dP=%.3e du=%.4f px meshfr=%.3f\n",
-                    g.name, row.phase_locked ? "yes" : "NO", row.quality,
+                    g.name, row.locked ? "yes" : "NO", row.quality,
                     (double) row.coverage, row.vtx_med_du, row.mesh_med_dux,
                     row.mesh_med_du, row.mesh_frac);
 
         // A lost phase lock is the single failure that explains most of the
         // others, so check it first and by itself.
-        CHECK(row.phase_locked);
+        CHECK(row.locked);
         // MeshQuality::FULL. SPARSE means the hull did not cover the ROI and
         // Path B is doing work the mesh was supposed to do.
         CHECK(row.quality == 2);
