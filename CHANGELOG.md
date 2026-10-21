@@ -3,6 +3,16 @@
 Versions follow [docs/CONTRACT.md](docs/CONTRACT.md) §A.1. Entries before
 0.5.0 live in the git history (`git log --grep Version`).
 
+## Unreleased
+
+### Fixed
+- The mesh guess field's 5x5 smoothing moved nodes on the grid or mesh edge
+  by gradient x offset (about 5 px at a quarter turn), outside IC-GN's reach,
+  so every outer-ring node went to a Simplex rescue under large rotation.
+  u/v are now carried back to the node along the smoothed gradient; interior
+  nodes are unchanged bit for bit. 45-90 deg: Simplex rescues 1-83 -> 0,
+  field CPU 1.3-5x lower, accuracy unchanged. `FullFieldGolden` re-captured.
+
 ## 0.5.0
 
 Minor: additive surface, Frozen values unchanged, numerics move.

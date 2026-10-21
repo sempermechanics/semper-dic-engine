@@ -236,6 +236,33 @@ TEST_CASE(SeedBench, SimilarityFallsBackUnderStretch) {
 }
 
 // ---------------------------------------------------------------------------
+// The guess field at the grid edge. build_mesh_guess_field box-averages the
+// mesh guess over 5x5 in-mesh neighbours; on the outer two rings the box is
+// one-sided, and a plain average moved u/v by gradient x offset (about 5 px
+// at a quarter turn), outside IC-GN's reach. Every such node went to a
+// Simplex rescue: 70 of them at 85 deg (83 at 90), at 2.7x the field CPU.
+// Carrying the average back to the node along the smoothed gradient keeps an
+// affine guess exact, and the count at 0.
+// ---------------------------------------------------------------------------
+TEST_CASE(SeedBench, GuessSmoothingKeepsEdgesInReach) {
+    dictest::SpeckleField field(/*seed=*/11, W, H, BLOBS);
+    const Image ref = dictest::make_reference_image(field, W, H);
+    const cv::Mat ref_gray = dictest::gray8(ref, 0.0f, 101);
+    const dictest::AffineDeformation d = rotation(85.0);
+    const Image def = dictest::make_deformed_image(field, W, H, d);
+    const cv::Mat def_gray = dictest::gray8(def, 0.0f, 202);
+
+    Row row;
+    row.scenario = "R_rot_85deg";
+    measure_full_field(row, affine_truth(d), ref_gray, def_gray, big_motion_params());
+    std::printf("    field: %d points, %d Simplex rescues, %.2f mean iters, rms %.4f px\n",
+                row.ff_rc, row.ff_simplex_calls, row.ff_mean_iters, row.ff_rms_u);
+    REQUIRE(row.ff_rc > 0);
+    CHECK(row.ff_simplex_calls <= 5);
+    CHECK(row.ff_rms_u <= 0.05);
+}
+
+// ---------------------------------------------------------------------------
 // Quality gate.
 //
 // Every sweep in test_seeding_bench.cpp is gated behind SEMPER_RUN_SEEDBENCH,
