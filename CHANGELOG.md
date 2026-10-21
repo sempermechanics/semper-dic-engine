@@ -3,6 +3,20 @@
 Versions follow [docs/CONTRACT.md](docs/CONTRACT.md) §A.1. Entries before
 0.5.0 live in the git history (`git log --grep Version`).
 
+## Unreleased
+
+Patch: Internal only, no surface change.
+
+### Fixed
+- A frame turned 90 deg or more against the reference seeds again. The
+  log-polar estimate gives the angle modulo 180 deg, and L0 never tried
+  theta + 180: from 90.5 to 180 deg the solve returned `kSeedFailed` (`-5`),
+  and an exact 90 deg could be dropped by a range check and return no points.
+  L0 now undoes both theta and theta + 180 and keeps the stronger corrected
+  translation peak; a turn near 90 deg is re-correlated off the wrap of the
+  angle axis. Cost: one more warp and ROI phase correlation per solve.
+  Translation-only and small-rotation seeds are unchanged.
+
 ## 0.5.0
 
 Minor: additive surface, Frozen values unchanged, numerics move.

@@ -330,8 +330,12 @@ What it costs:
   spread 199.5–204.9 ms across repeats of the unchanged code. **Strictly, 0 deg
   regresses by the estimate's 1.3–1.6 ms; from 2 deg up, CPU is lower.**
 - **Limits.**
-  - The magnitude spectrum repeats every 180 deg, so rotation is recovered in
-    (−90, 90) deg. Scale is accepted in (0.5, 2).
+  - The magnitude spectrum repeats every 180 deg, so the estimate gives
+    rotation modulo 180. L0 undoes both θ and θ + 180 and keeps the stronger
+    corrected translation peak, so any turn seeds
+    (`SeedBench.AnchorSeedingHalfTurn`: ±90, 100, 135, 179 and −120 deg).
+    The second hypothesis costs one more warp and N² correlation per solve
+    (see section 4.5.2). Scale is accepted in (0.5, 2).
   - An ROI whose short side is under 64 px gets no estimate and stays
     translation-only — a 1000×30 beam ROI, for example.
   - **Small noisy ROIs get nothing from it.** At σ = 2 grey-level noise, the
@@ -343,6 +347,56 @@ What it costs:
   - Anisotropic stretch is outside the model. The third condition above
     returns such frames to the translation-only result, at the cost of
     solving the lattice twice.
+
+#### 4.5.2 Fixed: turns of 90 deg and beyond
+
+0.5.0 seeded every turn up to 89.5 deg and none from 90.5 to 180 deg. The
+magnitude spectrum is point-symmetric, so the log-polar peak gives θ modulo
+180: 100 deg read as −80, 135 as −45, and the similarity built from that
+seeded no anchor (`kSeedFailed`, −5). An exact quarter turn puts the peak on
+the wrap of the angle axis, where `cv::phaseCorrelate` clamps its centroid,
+and a range check that excluded ±90 deg could drop it: the solve then fell
+back to translation-only and returned no points. L0 now undoes both θ and
+θ + 180, keeps the stronger corrected translation peak, and re-correlates a
+peak more than 45 deg out with the angle axis rolled by half a period
+(MATHEMATICS.md §8.1).
+
+Exact rigid rotation of a rendered Gaussian speckle (600×600, a 300×300 ROI at
+the centre, rotation about the image centre, subset 41, step 5, strain window
+25, single fixed-reference solve): the percentage of the 3136 nodes a
+zero-motion solve returns that come back within 0.5 px of the truth.
+
+| turn (deg) | 0.5.0, σ = 0 | fixed, σ = 0 | 0.5.0, σ = 2 | fixed, σ = 2 |
+|---|---|---|---|---|
+| 0 to 89.5 (12 angles), −45 | 100 | 100 | 100 | 100 |
+| 90 | 0 (no points) | 100 | 100 | 100 |
+| 90.5, 91, 92, 95, 100, 110 | −5 | 100 | −5 | 100 |
+| 120 | 0 (no points) | 100 | −5 | 100 |
+| 135, 150, 165, 170 | −5 | 100 | −5 | 100 |
+| 175 | −5 | 100 | 0 (no points) | 100 |
+| 179, 179.5, 180 | −5 | 100 | −5 | 100 |
+| −89.5, −90.5, −100, −135, −179 | −5 | 100 | −5 | 100 |
+| −90 | 0 (no points) | 100 | −5 | 100 |
+
+Below 90 deg the two builds return the same points to the digit (RMS up to
+0.0037 px noise-free, 0.0069–0.0083 px at σ = 2). Past it the fixed build
+matches that: up to 0.0037 px and 0.0068–0.0086 px. Noise-free RMS is exactly 0
+at 0, ±90 and 180 deg, where the rendered turn maps pixels onto pixels.
+
+**Cost.** The half-turn is one more warp and one more ROI phase correlation in
+every solve that gets a log-polar estimate, translation included, because a
+turn of 180 deg reads as 0. LargeMotionSweep (640 px speckle, 320 px ROI,
+11 repeats, `taskset -c 0-3`, 0.5.0 and the fix alternated twice, i7-12700H
+under WSL2):
+
+- L0 serial time +2.3–3.7 ms per solve (translation 4.2 → 7.0 ms, rotation
+  7.0–7.5 → 9.5–11.2 ms).
+- Field wall +1.0–1.7% on the translation rows, +1.0–5.9% on the rotation
+  and scale rows.
+- Field CPU −2.0% to +3.9%, which is within the run-to-run spread.
+- Every accuracy column (vertex error, mesh error, field RMS, iterations,
+  anchors kept) is identical to 0.5.0, and FullFieldGolden's output is the
+  same to the last digit.
 
 
 ## 5. Cost accounting
@@ -614,6 +668,10 @@ Seven gates now run unconditionally (four since 0.3.0, three since the rotation 
 - `SeedBench.AnchorSeedingRotationGate` promotes the 5 deg, 15 deg and combined
   10 deg + 5% + 20 px rows of LargeMotionSweep: similarity applied, `FULL`, hull
   coverage ≥ 0.90, mesh fraction ≥ 0.95, vertex error ≤ 0.05 px.
+- `SeedBench.AnchorSeedingHalfTurn` pins §4.5.2: a pixel-exact quarter turn,
+  ±90, 100, 135, 179 and −120 deg each resolve to the right half-turn at L0
+  (≤ 0.15 deg, ≤ 0.25 px at the centre), and ≥ 95% of the nodes come back
+  within 0.5 px. 0.5.0 returned −5 for all but the two +90 deg cases.
 - `SeedBench.SimilarityFallsBackUnderStretch` pins the fallback of §4.5.1 on
   the IncBench frame that exposed it: the similarity is rejected and the field
   stays at the translation-only 0.014 px, not 0.215 px.

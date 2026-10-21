@@ -532,7 +532,11 @@ Implementation details, each for a stated reason:
   $|F(\bm{k})| = |F(-\bm{k})|$, so $\phi$ is sampled over $[0, \pi)$ in 256
   rows. That makes the $\phi$ axis exactly periodic, which is what the FFT
   inside the correlation assumes, and it means $\theta$ is recovered modulo
-  $180°$, i.e. in $(-90°, 90°)$.
+  $180°$, folded into $[-90°, 90°)$; which half-turn it is gets decided below.
+  A turn near $90°$ puts the peak on the wrap of the $\phi$ axis, where the
+  correlation's sub-pixel centroid only sees one side of it, so when the peak
+  is more than $45°$ out the deformed rows are rolled by half a period and
+  the correlation repeated.
 * **Radial band.** $\rho$ is sampled in 128 columns, log-spaced between
   $N/16$ and $0.45N$. The low end excludes the DC term and the Hann window's
   leakage, where the angle is also barely resolved; the high end stays inside
@@ -547,6 +551,15 @@ translation $\bm{t}' = (sR)^{-1}\bm{t}$ against the reference. The §8.1
 correlation then measures $\bm{t}'$, and $\bm{t} = sR\,\bm{t}'$. The resampling
 reads from the whole image, so pixels that rotated out of the ROI rectangle are
 still found.
+
+**Which half-turn.** $\theta$ and $\theta + 180°$ give the same magnitude
+spectrum, and for a real turn past $90°$ the folded estimate is the wrong one:
+$100°$ reads as $-80°$. Both are undone and their translations re-measured.
+Undoing the wrong half-turn leaves the image upside down against the
+reference, which has no correlation peak, so the stronger corrected peak picks
+the turn. $\theta$ is tried first and keeps ties; the half-turn has to beat it
+and the uncorrected translation, so a frame it does not beat seeds exactly as
+before.
 
 The seed is then the full first-order field
 
