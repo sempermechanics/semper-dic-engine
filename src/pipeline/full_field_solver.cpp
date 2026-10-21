@@ -23,6 +23,7 @@
 #include <thread>
 #include <vector>
 #include <algorithm>
+#include <memory>
 
 #undef LOG_TAG
 #define LOG_TAG "SemperPipeline"
@@ -129,6 +130,28 @@ int run_full_field(
         ResultGrid resultGrid(gridH, std::vector<GridPoint>(gridW));
         int total_valid_points = 0;
 
+        // The scan below and the Hessian pre-pass depend only on the reference,
+        // the grid and the mask, so a batch against one reference computes them
+        // once (RefPrecompute). A hit replays the stored per-node verdicts into
+        // the same initializer the scan uses.
+        if (!cache.precompute) cache.precompute = std::make_unique<RefPrecompute>();
+        RefPrecompute& pre = *cache.precompute;
+        const bool grid_cached = pre.grid_matches(params, roiMask) &&
+                                 pre.gridW == gridW && pre.gridH == gridH;
+        if (grid_cached) {
+            for (int y = 0; y < gridH; ++y) {
+                for (int x = 0; x < gridW; ++x) {
+                    const bool shouldSkip = pre.skip[(size_t)y * gridW + x] != 0;
+                    int realX = params.rect_x + x * params.step;
+                    int realY = params.rect_y + y * params.step;
+                    resultGrid[y][x] = {(float)realX, (float)realY, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, CORR_INVALID, shouldSkip, -1, -1, 0, false, 0};
+                }
+            }
+            total_valid_points = pre.total_valid_points;
+        } else {
+        pre.grid_valid = false;
+        pre.hessian_valid = false;
+
         // === 🚀 100% STRICT RULE: PURE SUBSETS ONLY ===
         // We scan the ENTIRE subset bounding box before allowing a grid point to exist.
         // If a single pixel of the subset touches the void, the image boundary, or the mask,
@@ -180,6 +203,19 @@ int run_full_field(
                 // workers will ignore it entirely, just like DICe's kd-tree ignores it.
                 resultGrid[y][x] = {(float)realX, (float)realY, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, CORR_INVALID, shouldSkip, -1, -1, 0, false, 0};
             }
+        }
+
+        pre.rect_x = params.rect_x; pre.rect_y = params.rect_y;
+        pre.rect_w = params.rect_w; pre.rect_h = params.rect_h;
+        pre.step = params.step; pre.subset_size = params.subset_size;
+        pre.roi_mask = roiMask.empty() ? cv::Mat() : roiMask.clone();
+        pre.gridW = gridW; pre.gridH = gridH;
+        pre.skip.assign((size_t)gridW * gridH, 0);
+        for (int y = 0; y < gridH; ++y)
+            for (int x = 0; x < gridW; ++x)
+                pre.skip[(size_t)y * gridW + x] = resultGrid[y][x].solved ? 1 : 0;
+        pre.total_valid_points = total_valid_points;
+        pre.grid_valid = true;
         }
 
         if (total_valid_points == 0) return -2; // 🚀 PRIORITY 3: Return -2 for Empty Mask
@@ -235,35 +271,45 @@ int run_full_field(
         };
         ThreadJoinGuard progressGuard{progress_thread, progress_thread_should_stop, progress_cv, progress_cv_mutex, progress_thread_detached};
 
-        std::vector<AffineTriangle> affTriangles;
-        MeshGuessField guess = build_mesh_guess_field(
-                cache, params, akaze_ref_pts, akaze_def_pts, mesh_quality,
-                globalU, globalV, gridW, gridH, local_debug_dir,
-                resultGrid, affTriangles, timings);
-
         // =========================================================
         // 🚀 GLOBAL HESSIAN PRE-PASS & CONTRAST THRESHOLDING
         // =========================================================
+        // Runs before the mesh is built: nothing is solved yet, so the pool
+        // covers exactly the nodes the scan kept and depends on nothing but the
+        // reference and the grid — which is what lets RefPrecompute keep it.
         auto t_prepass_start = std::chrono::high_resolution_clock::now();
-        HessianPool hessian_pool(gridW * gridH);
+        if (!pre.hessian_valid) {
+            pre.hessian_pool.assign((size_t)gridW * gridH, CachedHessianData());
+            HessianPool& hessian_pool = pre.hessian_pool;
 
     #pragma omp parallel for schedule(static) num_threads(safe_cores)
-        for (int pool_idx = 0; pool_idx < gridW * gridH; ++pool_idx) {
-            // OpenMP forbids breaking out of a parallel for, so a cancel skips
-            // the remaining iterations instead — the same shape the existing
-            // exception guard in Path A uses.
-            if (cancel_requested()) continue;
-            int gx = pool_idx % gridW, gy = pool_idx / gridW;
-            if (!resultGrid[gy][gx].solved) {
-                int realX = params.rect_x + gx * params.step, realY = params.rect_y + gy * params.step;
-                hessian_pool[pool_idx] = SubsetPrecomputer::compute_hessian_only(*cache.ref_img, realX, realY, params.subset_size);
+            for (int pool_idx = 0; pool_idx < gridW * gridH; ++pool_idx) {
+                // OpenMP forbids breaking out of a parallel for, so a cancel skips
+                // the remaining iterations instead — the same shape the existing
+                // exception guard in Path A uses.
+                if (cancel_requested()) continue;
+                int gx = pool_idx % gridW, gy = pool_idx / gridW;
+                if (!resultGrid[gy][gx].solved) {
+                    int realX = params.rect_x + gx * params.step, realY = params.rect_y + gy * params.step;
+                    hessian_pool[pool_idx] = SubsetPrecomputer::compute_hessian_only(*cache.ref_img, realX, realY, params.subset_size);
+                }
             }
+            // A cancelled pre-pass left holes; do not keep it.
+            if (cancel_requested()) return kCancelled;
+            pre.hessian_valid = true;
         }
+        const HessianPool& hessian_pool = pre.hessian_pool;
 
         timings.prepass = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_prepass_start).count();
 
         const SolveContext ctx{cache, params, defImg, gridW, gridH, safe_cores,
                                hessian_pool, global_points_solved, compute_order_counter};
+
+        std::vector<AffineTriangle> affTriangles;
+        MeshGuessField guess = build_mesh_guess_field(
+                cache, params, akaze_ref_pts, akaze_def_pts, mesh_quality,
+                globalU, globalV, gridW, gridH, local_debug_dir,
+                resultGrid, affTriangles, timings);
 
         if (execute_path_c) {
             int rc = run_path_c(ctx, akaze_ref_pts, resultGrid, path_c_seed_x, path_c_seed_y, globalU, globalV);

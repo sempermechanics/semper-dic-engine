@@ -122,6 +122,22 @@ enum class MeshQuality { NONE, SPARSE, FULL };
 
 using HessianPool = std::vector<CachedHessianData, Eigen::aligned_allocator<CachedHessianData>>;
 
+// ReferenceCache::precompute: the grid validity scan and the Hessian pool,
+// which depend only on the reference, the grid and the ROI mask. Kept between
+// solves against one reference; any change of the key drops them.
+struct RefPrecompute {
+    bool grid_valid = false;
+    int rect_x = 0, rect_y = 0, rect_w = 0, rect_h = 0, step = 0, subset_size = 0;
+    cv::Mat roi_mask;                 // the (resized) mask the scan used; empty = none
+    int gridW = 0, gridH = 0;
+    std::vector<unsigned char> skip;  // per node: boundary- or mask-rejected
+    int total_valid_points = 0;
+    bool hessian_valid = false;
+    HessianPool hessian_pool;
+
+    bool grid_matches(const FullFieldParams &p, const cv::Mat &mask) const;
+};
+
 // Everything the three solve paths read out of run_full_field's frame. Passed
 // by const reference so the extracted phases keep the same view of the solve
 // they had as inline blocks.

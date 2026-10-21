@@ -6,6 +6,7 @@
 #include <opencv2/core.hpp>
 #include <opencv2/features2d.hpp>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -15,6 +16,8 @@ namespace pipeline {
 
 using ProgressCallback = std::function<void(int percentage)>;
 
+namespace internal { struct RefPrecompute; }
+
 /**
  * Cached reference for multi-frame solves (AKAZE + Image).
  *
@@ -22,6 +25,12 @@ using ProgressCallback = std::function<void(int percentage)>;
  * avoid a double-free — there is one process-wide instance (see the JNI layer).
  * The embedded `mutex` does NOT make the struct's methods thread-safe; it is
  * held by the JNI caller around a whole solve so a cancel can still interrupt.
+ *
+ * Besides the image and the AKAZE reference keypoints it keeps what
+ * run_full_field derives from the reference alone (grid validity scan, Hessian
+ * pool), so frames 2..N of a batch skip that work. Same code, same inputs, so
+ * the values are bit-identical to recomputing them; a change of reference,
+ * params or ROI mask drops them.
  */
 struct ReferenceCache {
     Image* ref_img = nullptr;
@@ -33,9 +42,11 @@ struct ReferenceCache {
     double akaze_scale = 0.25;
     std::mutex mutex;
     std::string debug_dir;
+    // Reference-only work reused across solves. Internal; see the class comment.
+    std::unique_ptr<internal::RefPrecompute> precompute;
 
-    ReferenceCache() = default;
-    ~ReferenceCache() { reset(); }
+    ReferenceCache();
+    ~ReferenceCache();
     ReferenceCache(const ReferenceCache&) = delete;
     ReferenceCache& operator=(const ReferenceCache&) = delete;
     ReferenceCache(ReferenceCache&&) = delete;
