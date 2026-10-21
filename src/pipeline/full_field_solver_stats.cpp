@@ -131,10 +131,10 @@ void log_profiling_summary(
         int valid_count) {
     LOGD("=== ⏱️ ADVANCED PERFORMANCE PROFILING ===");
     LOGD("Image Prep & Masking: %.2f ms", t.img_prep);
-    LOGD("Seeding (phase+anchors): %.2f ms", t.phase_corr + t.anchors);
-    LOGD("  ↳ Phase lock: %s | Mesh coverage: %.1f%% of ROI | anchors %d/%d accepted, %d kept",
-         seeds.phase_locked ? "YES" : "NO", seeds.coverage * 100.0f,
-         seeds.accepted, seeds.attempted, seeds.solved);
+    LOGD("Seeding (AKAZE+anchors): %.2f ms", t.akaze + t.anchors);
+    LOGD("  ↳ AKAZE & RANSAC: %.2f ms | lock: %s (%d inliers at %.2fx) | Mesh coverage: %.1f%% of ROI | anchors %d/%d accepted, %d kept",
+         t.akaze, seeds.locked ? "YES" : "NO", seeds.matches, (double)seeds.akaze_scale,
+         seeds.coverage * 100.0f, seeds.accepted, seeds.attempted, seeds.solved);
     if (s.anchor_pts > 0 || s.n_simp_calls > 0) {
         LOGD("  ↳ Anchor ICGN Math: %.2f ms | Simplex: %.2f ms (%d pts kept as results)",
              s.n_icgn, s.n_simp, s.anchor_pts);
@@ -215,7 +215,7 @@ void fill_engine_metrics(
 
             // 9-13: Timestamps & Performance (ms)
             metrics_data[9]  = (float)t.total;                // Total Wall Time
-            metrics_data[10] = (float)(t.phase_corr + t.anchors); // Seeding time (Frozen slot)
+            metrics_data[10] = (float)(t.akaze + t.anchors);  // Seeding time (Frozen slot)
             metrics_data[11] = (float)t.prepass;              // Hessian Pre-Pass Time
             metrics_data[12] = (float)t.delaunay;             // Mesh Setup Time
             metrics_data[13] = (float)t.strain;               // Strain Calc Time
@@ -256,12 +256,12 @@ void fill_engine_metrics(
             //   slot 3 + slot 4 + slot 19 == slot 1 + slot 20
             metrics_data[20] = (float)dropped_by_post_filter;  // Dropped by strain post-filter
 
-            // 21/22: the two seeding health signals. The anchor lattice is a
-            // translation-only front end -- past roughly 5 degrees of rotation
-            // the phase lock fails and mesh coverage collapses (0.45 at 5 deg,
-            // 0.15 at 15 deg; docs/SEEDING_BENCHMARK.md 4.5), and without these
-            // slots that field is reported exactly like a healthy one.
-            metrics_data[21] = seeds.phase_locked ? 1.0f : 0.0f;  // Phase-correlation lock
+            // 21/22: the two seeding health signals: whether the front end
+            // found a global model (until v0.6.0 a phase-correlation lock, now
+            // an AKAZE homography), and how much of the ROI the anchor mesh
+            // covers. Without them a field seeded off a 15%-coverage mesh is
+            // reported exactly like a healthy one.
+            metrics_data[21] = seeds.locked ? 1.0f : 0.0f;        // Global-motion lock
             metrics_data[22] = seeds.coverage;                    // Mesh hull / ROI area, 0..1
 
             // 23: points that converged and were then rejected by the

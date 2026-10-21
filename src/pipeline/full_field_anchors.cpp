@@ -1,27 +1,31 @@
 // Anchor-lattice seeding: the front-end that produces the Delaunay mesh vertices.
 //
-// Two layers, neither of which uses a feature detector or a descriptor:
+// Two layers:
 //
-//   L0  cv::phaseCorrelate over the ROI gives the global rigid shift from every
-//       pixel, rather than from the median of sparse keypoint matches. A
-//       log-polar (Fourier-Mellin) correlation of the magnitude spectra adds
-//       rotation and scale when they move the ROI corners by more than
-//       kSimilarityMinCornerPx (phase_correlate.cpp).
+//   L0  AKAZE features are matched between the reference and the deformed
+//       frame over the padded ROI, at the coarsest scale that yields enough
+//       RANSAC inliers, and a homography is fitted to them
+//       (akaze_features.cpp). That is the global model: translation, rotation
+//       at any angle, scale, stretch and shear.
 //   L1  a regular lattice of ROI grid nodes is solved with the engine's own
-//       IC-GN, seeded from L0 -- under rotation, each node with the
-//       displacement and gradients the similarity puts there. The converged
-//       nodes become the mesh vertices.
+//       IC-GN, each node seeded with the displacement and gradients the model
+//       puts there (only its translation when the model moves the ROI corners
+//       by less than kSimilarityMinCornerPx). The converged nodes become the
+//       mesh vertices, and the homography is refitted to them for the nodes
+//       the mesh does not reach.
 //
 // Anchors sit on grid nodes on purpose. They reuse the Hessian pool the solve
 // already builds, and a node good enough to keep is a *final* result for that
 // node — Path A skips it and Path B picks it up as a boundary seed — so the
 // lattice adds almost no work beyond what the field costs anyway.
 //
-// Why this rather than descriptor matching: build_mesh_guess_field derives the
-// guess gradients from cv::getAffineTransform over triangle vertices, so a
-// vertex position error e over an edge of length L becomes a gradient error of
-// order e/L. Keypoints give e ~ 1 px on short, clustered edges; IC-GN anchors
-// give e ~ 0.01 px on edges fixed at stride * step. See docs/SEEDING_BENCHMARK.md.
+// Why the keypoints only fit the model and are not mesh vertices themselves:
+// build_mesh_guess_field derives the guess gradients from
+// cv::getAffineTransform over triangle vertices, so a vertex position error e
+// over an edge of length L becomes a gradient error of order e/L. Keypoints
+// give e ~ 1 px (several at 0.25x) on short, clustered edges; IC-GN anchors give
+// e ~ 0.01 px on edges fixed at stride * step. A homography fitted to all the
+// inliers averages that keypoint error out instead. See docs/SEEDING_BENCHMARK.md.
 
 #include "full_field_internal.hpp"
 
@@ -34,12 +38,14 @@
 #include "util/median.hpp"
 
 #include <omp.h>
+#include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -113,9 +119,119 @@ AnchorLattice plan_anchor_lattice(int gridW, int gridH) {
     return out;
 }
 
+namespace {
+
+// The L0 global model: the AKAZE homography, its translation at the ROI
+// centre, and whether its full form is worth seeding with.
+struct GlobalModel {
+    cv::Mat H;                    // empty: no model
+    double cx = 0.0, cy = 0.0;    // ROI centre
+    double t_u = 0.0, t_v = 0.0;  // H's displacement at the centre
+    bool full = false;            // corners move > kSimilarityMinCornerPx beyond t
+    int matches = 0;
+    double scale = 0.0;
+    double rotation_deg = 0.0, iso_scale = 1.0;
+    seeding::AkazeRef def_side;   // the deformed frame's features at `scale`
+
+    bool locked() const { return !H.empty(); }
+
+    // Displacement and gradients H puts at (x, y); false if it maps to infinity.
+    bool at(double x, double y, float g[6]) const {
+        double X, Y, J[4];
+        if (!seeding::homography_at(H, x, y, X, Y, J)) return false;
+        g[0] = (float)(X - x); g[1] = (float)(Y - y);
+        g[2] = (float)(J[0] - 1.0); g[3] = (float)J[1];
+        g[4] = (float)J[2];         g[5] = (float)(J[3] - 1.0);
+        return true;
+    }
+};
+
+// AKAZE at the coarsest scale that gives kAkazeGoodInliers, else the scale
+// with the most inliers if it has kAkazeMinInliers. The search starts at the
+// scale an earlier solve settled on (the coarser ones failed there and the
+// speckle has not changed) and tries the coarser ones only if nothing from
+// there up fits. The reference keypoints of every scale tried are kept on the
+// cache for the next solve.
+GlobalModel match_global_model(ReferenceCache& cache, const cv::Mat& defMat,
+                               const cv::Mat& roiMask, const FullFieldParams& params) {
+    GlobalModel gm;
+    gm.cx = params.rect_x + 0.5 * params.rect_w;
+    gm.cy = params.rect_y + 0.5 * params.rect_h;
+    if (cache.gray.empty() || defMat.cols != cache.gray.cols || defMat.rows != cache.gray.rows) {
+        return gm;
+    }
+
+    const cv::Rect roi(params.rect_x, params.rect_y, params.rect_w, params.rect_h);
+    if (!cache.precompute) cache.precompute = std::make_unique<RefPrecompute>();
+    RefPrecompute& pre = *cache.precompute;
+    const int levels = (int)std::size(tuning::kAkazeScales);
+    if (pre.akaze_roi != roi || (int)pre.akaze_refs.size() != levels) {
+        pre.akaze_refs.assign((size_t)levels, seeding::AkazeRef{});
+        pre.akaze_roi = roi;
+    }
+    const int first = std::min(std::max(pre.akaze_first_level, 0), levels - 1);
+
+    seeding::AkazeMatches best;
+    int best_level = -1;
+    auto try_level = [&](int lv) {
+        seeding::AkazeRef& ref = pre.akaze_refs[(size_t)lv];
+        if (ref.scale == 0.0) {
+            const bool reused = pre.akaze_handover.scale == tuning::kAkazeScales[lv] &&
+                    seeding::reuse_akaze_ref(pre.akaze_handover, roi, cache.gray.size(), ref);
+            if (!reused) ref = seeding::prepare_akaze_ref(cache.gray, roi, tuning::kAkazeScales[lv]);
+        }
+        seeding::AkazeMatches m;
+        const bool fit = seeding::match_akaze(ref, defMat, roiMask, m);
+        LOGD("ROUTING: AKAZE at %.2fx: %d inliers%s", ref.scale, m.inliers(), fit ? "" : " (no model)");
+        if (fit && m.inliers() > best.inliers()) {
+            best = std::move(m);
+            best_level = lv;
+        }
+        return best_level == lv && best.inliers() >= tuning::kAkazeGoodInliers;
+    };
+    bool good = false;
+    for (int lv = first; lv < levels && !good; ++lv) good = try_level(lv);
+    for (int lv = 0; lv < first && best_level < 0 && !good; ++lv) good = try_level(lv);
+    if (best_level < 0) return gm;
+    pre.akaze_first_level = best_level;
+
+    gm.H = best.homography;
+    gm.matches = best.inliers();
+    gm.scale = best.scale;
+    gm.def_side = std::move(best.def_side);
+    float g[6];
+    if (!gm.at(gm.cx, gm.cy, g)) {
+        gm.H.release();
+        return gm;
+    }
+    gm.t_u = g[0];
+    gm.t_v = g[1];
+    const double a = 1.0 + g[2], b = g[3], c = g[4], d = 1.0 + g[5];
+    gm.rotation_deg = std::atan2(c - b, a + d) * 180.0 / CV_PI;
+    gm.iso_scale = std::sqrt(std::abs(a * d - b * c));
+
+    // The full model only where it changes the seed: at a corner it puts the
+    // ROI more than kSimilarityMinCornerPx away from where its translation
+    // does. Below that IC-GN pulls in from the translation alone.
+    const double xs[2] = {(double)params.rect_x, (double)(params.rect_x + params.rect_w)};
+    const double ys[2] = {(double)params.rect_y, (double)(params.rect_y + params.rect_h)};
+    for (double x : xs) {
+        for (double y : ys) {
+            if (!gm.at(x, y, g) ||
+                std::hypot(g[0] - gm.t_u, g[1] - gm.t_v) > tuning::kSimilarityMinCornerPx) {
+                gm.full = true;
+            }
+        }
+    }
+    return gm;
+}
+
+} // namespace
+
 MeshSeedResult solve_anchor_seeds(
         ReferenceCache& cache,
         const cv::Mat& defMat,
+        const cv::Mat& roiMask,
         const Image& def_img,
         const FullFieldParams& params,
         int gridW,
@@ -131,30 +247,20 @@ MeshSeedResult solve_anchor_seeds(
     if (cache.ref_img == nullptr || gridW <= 0 || gridH <= 0) return out;
 
     // --- L0: global motion ------------------------------------------------
-    // Translation, or translation plus rotation and scale about the ROI centre
-    // when the log-polar estimate says the corners are far enough off for it
-    // to matter. Translation-only, every value below is exactly what the
-    // translation-only seeder produced.
-    seeding::SimilarityShift gm;
+    GlobalModel gm;
     {
-        ScopedTimer t(timings.phase_corr);
-        if (!cache.gray.empty() &&
-            defMat.cols == cache.gray.cols && defMat.rows == cache.gray.rows) {
-            // The reference half (crop, float conversion, Hann window, log-polar
-            // spectrum) is reused across solves against this reference.
-            const cv::Rect roi(params.rect_x, params.rect_y, params.rect_w, params.rect_h);
-            if (!cache.precompute) cache.precompute = std::make_unique<RefPrecompute>();
-            RefPrecompute& pre = *cache.precompute;
-            if (!pre.phase_valid || pre.phase_roi != roi) {
-                pre.phase_ref = seeding::prepare_phase_correlate_ref(cache.gray, roi);
-                pre.phase_roi = roi;
-                pre.phase_valid = true;
-            }
-            seeding::phase_correlate_similarity(pre.phase_ref, defMat, gm);
-        }
+        ScopedTimer t(timings.akaze);
+        gm = match_global_model(cache, defMat, roiMask, params);
     }
-    out.rotation_deg = (float)(gm.theta_rad * 180.0 / CV_PI);
-    out.scale = (float)gm.scale;
+    auto describe_model = [&](MeshSeedResult& r) {
+        r.locked = gm.locked();
+        r.matches = gm.matches;
+        r.akaze_scale = (float)gm.scale;
+        r.rotation_deg = (float)gm.rotation_deg;
+        r.scale = (float)gm.iso_scale;
+        r.homography = gm.H;
+    };
+    describe_model(out);
 
     ScopedTimer anchor_timer(timings.anchors);
 
@@ -174,10 +280,9 @@ MeshSeedResult solve_anchor_seeds(
 
     const int LW = (int)lat_x.size(), LH = (int)lat_y.size();
     if (LW < 2 || LH < 2) {
-        out.phase_locked = gm.locked;
-        out.similarity = gm.similarity;
-        out.globalU = (float)gm.u;
-        out.globalV = (float)gm.v;
+        out.model = gm.full;
+        out.globalU = (float)gm.t_u;
+        out.globalV = (float)gm.t_v;
         return out;
     }
 
@@ -191,29 +296,28 @@ MeshSeedResult solve_anchor_seeds(
     const int n_anchor = LW * LH;
 
     // Solve the lattice from one global model and run the median test on it.
-    // `sim` seeds every anchor with the similarity in `gm`; otherwise with the
-    // uncorrected translation (gm.t_*), exactly as the translation-only seeder
-    // did, so that path is bit-identical to it.
+    // `sim` seeds every anchor with the displacement and gradients of the
+    // homography at that anchor; otherwise every anchor gets its translation at
+    // the ROI centre (zero without a model).
     auto solve_lattice = [&](bool sim, MeshSeedResult& r) {
-        r.similarity = sim;
-        r.phase_locked = sim ? gm.locked : gm.t_locked;
-        r.globalU = (float)(sim ? gm.u : gm.t_u);
-        r.globalV = (float)(sim ? gm.v : gm.t_v);
-        const float gux = sim ? (float)gm.ux : 0.0f, guy = sim ? (float)gm.uy : 0.0f;
-        const float gvx = sim ? (float)gm.vx : 0.0f, gvy = sim ? (float)gm.vy : 0.0f;
-        const float gcx = (float)gm.cx, gcy = (float)gm.cy;
-        // The similarity's displacement at a reference point. Only evaluated
-        // under `sim`; the translation-only path never calls it.
-        const float model_u0 = r.globalU, model_v0 = r.globalV;
-        auto model_u = [=](float x, float y) { return model_u0 + gux * (x - gcx) + guy * (y - gcy); };
-        auto model_v = [=](float x, float y) { return model_v0 + gvx * (x - gcx) + gvy * (y - gcy); };
+        describe_model(r);
+        r.model = sim;
+        r.globalU = (float)gm.t_u;
+        r.globalV = (float)gm.t_v;
+        // The model's displacement at a reference point. Only evaluated under
+        // `sim`; a point it maps to infinity gets the translation.
+        auto model_at = [&](float x, float y, float g[6]) {
+            if (!gm.at(x, y, g)) {
+                g[0] = r.globalU; g[1] = r.globalV; g[2] = g[3] = g[4] = g[5] = 0.0f;
+            }
+        };
 
         std::vector<AnchorResult> anchors((size_t)n_anchor);
 
-        // With a phase-correlation lock the guess is already sub-pixel, so pure
-        // ICGN converges and the 6-DOF Simplex rescue is pure cost. Without a
-        // lock each anchor has to find its own offset, so the coarse search stays.
-        const auto init_mode = r.phase_locked ? INIT_NO_SIMPLEX : INIT_AUTO_SEARCH;
+        // With a model the guess is within a pixel or so, so pure ICGN
+        // converges and the 6-DOF Simplex rescue is pure cost. Without one each
+        // anchor has to find its own offset, so the coarse search stays.
+        const auto init_mode = r.locked ? INIT_NO_SIMPLEX : INIT_AUTO_SEARCH;
 
         std::atomic<int> attempted(0);
         RegionErrors errors;
@@ -250,12 +354,11 @@ MeshSeedResult solve_anchor_seeds(
                     const int realY = params.rect_y + gy * params.step;
                     attempted.fetch_add(1, std::memory_order_relaxed);
 
-                    // Under the similarity each anchor starts where the rotation puts
-                    // it, with the rotation's gradients: the one global shift is off
-                    // by 2 r sin(theta/2) at radius r.
-                    const float guess_sim[6] = {model_u((float)realX, (float)realY),
-                                                model_v((float)realX, (float)realY),
-                                                gux, guy, gvx, gvy};
+                    // Under the model each anchor starts where the homography puts
+                    // it, with its gradients there: under rotation the one global
+                    // shift is off by 2 r sin(theta/2) at radius r.
+                    float guess_sim[6];
+                    if (sim) model_at((float)realX, (float)realY, guess_sim);
                     const float guess_shift[6] = {r.globalU, r.globalV, 0.0f, 0.0f, 0.0f, 0.0f};
                     const NodeSolve node = solve_node(engine, subset, *cache.ref_img, def_img,
                                                       realX, realY, params.subset_size,
@@ -304,8 +407,8 @@ MeshSeedResult solve_anchor_seeds(
         // The 8-neighbourhood median assumes no field shape, and the lattice makes
         // the lookup O(1).
         //
-        // Under the similarity the test runs on the residual from it. Rotation is
-        // a smooth field, but at 15 deg lattice neighbours 20 px apart differ by
+        // Under the model the test runs on the residual from it. Rotation is a
+        // smooth field, but at 15 deg lattice neighbours 20 px apart differ by
         // 5 px, and on the lattice edge -- where every neighbour sits on one side
         // -- the raw median lands that far off and each edge anchor fails a 1 px
         // tolerance however good it is. Subtracting the model removes exactly
@@ -315,8 +418,10 @@ MeshSeedResult solve_anchor_seeds(
         for (size_t i = 0; i < anchors.size(); ++i) {
             const AnchorResult& a = anchors[i];
             if (!a.vertex) continue;
-            res_u[i] = sim ? a.u - model_u(a.rx, a.ry) : a.u;
-            res_v[i] = sim ? a.v - model_v(a.rx, a.ry) : a.v;
+            float g[6] = {0, 0, 0, 0, 0, 0};
+            if (sim) model_at(a.rx, a.ry, g);
+            res_u[i] = a.u - g[0];
+            res_v[i] = a.v - g[1];
         }
 
         std::vector<float> us, vs;
@@ -395,44 +500,51 @@ MeshSeedResult solve_anchor_seeds(
         return accepted_fraction;
     };
 
-    if (!gm.similarity) {
+    if (!gm.full) {
         solve_lattice(false, out);
     } else {
         const float kept = solve_lattice(true, out);
-        // The estimate is a similarity. Under strong anisotropic stretch it can
-        // report a rotation that is not there, and with the translation peak
-        // already weak the corrected peak still beats it. The lattice it seeds
-        // then comes out weak -- and not merely sparse: anchors started from
-        // the wrong model can converge, as a cluster, onto the wrong speckle.
-        // Such a cluster agrees with itself, so neither the ZNSSD gate nor a
-        // median test of residuals from that same wrong model catches it
-        // (SeedBench.SimilarityFallsBackUnderStretch: 25 px blunders at p95).
+        // A model fitted to a few clustered matches can be wrong away from
+        // them, and the lattice it seeds then comes out weak -- and not merely
+        // sparse: anchors started from a wrong model can converge, as a
+        // cluster, onto the wrong speckle. Such a cluster agrees with itself,
+        // so neither the ZNSSD gate nor a median test of residuals from that
+        // same wrong model catches it (seen with v0.5.0's log-polar similarity
+        // under stretch, SeedBench.StretchSeedsWithoutBlunders: 25 px at p95).
         // Counting kept anchors cannot choose between the two lattices either,
-        // because the blunders are kept. So the similarity is trusted only when
-        // its lattice says the model fits nearly everywhere; otherwise the
-        // translation-only lattice is used, which makes that frame identical
-        // to the translation-only seeder. A rotation the similarity fits keeps
-        // ~100% and never pays for the second solve.
+        // because the blunders are kept. So the model is trusted only when its
+        // lattice says it fits nearly everywhere; otherwise the
+        // translation-only lattice is used. A model that fits keeps ~100% and
+        // never pays for the second solve.
         if (out.quality != MeshQuality::FULL || kept < tuning::kSimilarityKeepFraction) {
-            LOGD("ROUTING: similarity lattice weak (%d/%d kept, quality %d); "
+            LOGD("ROUTING: homography lattice weak (%d/%d kept, quality %d); "
                  "re-solving from the translation alone",
                  out.accepted, out.attempted, (int)out.quality);
             out = MeshSeedResult{};
             solve_lattice(false, out);
-            out.similarity_rejected = true;
+            out.model_rejected = true;
         }
     }
-    out.rotation_deg = (float)(gm.theta_rad * 180.0 / CV_PI);
-    out.scale = (float)gm.scale;
 
-    LOGD("ROUTING: anchor lattice %d/%d kept (%d as output, cov %.2f, phase %s, "
-         "rot %.2f deg x%.4f %s) -> quality %d",
+    // Refit the global homography to the kept anchors: they are good to ~0.01 px
+    // where the keypoints were good to the RANSAC tolerance at the detection
+    // scale, and this is what the nodes outside the mesh start from. Without
+    // enough anchors the AKAZE fit stands (or nothing, without a model).
+    if (out.accepted >= tuning::kAnchorRefitMinPoints) {
+        cv::Mat H = cv::findHomography(out.ref_pts, out.def_pts, cv::RANSAC,
+                                       tuning::kAnchorRefitRansacPx);
+        if (H.rows == 3 && H.cols == 3 && cv::checkRange(H)) out.homography = H;
+    }
+    out.def_features = std::move(gm.def_side);
+
+    LOGD("ROUTING: anchor lattice %d/%d kept (%d as output, cov %.2f, AKAZE %s "
+         "%d inliers at %.2fx, rot %.2f deg x%.4f %s) -> quality %d",
          out.accepted, out.attempted, out.solved, (double)out.coverage,
-         out.phase_locked ? "locked" : "none", (double)out.rotation_deg,
-         (double)out.scale,
-         out.similarity ? "applied"
-                        : out.similarity_rejected ? "rejected, translation lattice used"
-                                                  : "not applied",
+         out.locked ? "locked" : "none", out.matches, (double)out.akaze_scale,
+         (double)out.rotation_deg, (double)out.scale,
+         out.model ? "applied"
+                   : out.model_rejected ? "rejected, translation lattice used"
+                                        : "not applied",
          (int)out.quality);
     return out;
 }

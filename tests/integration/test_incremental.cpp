@@ -241,9 +241,12 @@ TEST_CASE(Incremental, UpdateSchedule_FollowsInterval) {
     }
 }
 
-TEST_CASE(Incremental, StretchRotation_TracksWhereFixedReferenceDegrades) {
-    // 40% stretch and 30 degrees over 20 frames: past where a fixed
-    // reference's square subsets still match the deformed pattern.
+TEST_CASE(Incremental, StretchRotation_TracksTheStretchingRoi) {
+    // 40% stretch and 30 degrees over 20 frames. Until v0.6.0 this was past
+    // where a fixed reference held (its seeding was translation plus a
+    // similarity); with AKAZE seeding the fixed reference holds too, and more
+    // accurately, since it accumulates nothing. Incremental must track at
+    // least as many nodes within tolerance.
     const int T = 20;
     const Sequence s = stretch_rotate_sequence(448, 448, T, 0.40, 30.0);
     const FullFieldParams p = centred_params(448, 448, 160);
@@ -292,7 +295,7 @@ TEST_CASE(Incremental, StretchRotation_TracksWhereFixedReferenceDegrades) {
     CHECK(a.points >= (int)(0.95 * full));
     CHECK(a.rms_u <= 0.10);
     CHECK(a.rms_e <= 5e-3);
-    CHECK(a.within > f.within);
+    CHECK(a.within >= f.within);
 }
 
 TEST_CASE(Incremental, Rotation90_200Frames_TracksTheTurningRoi) {

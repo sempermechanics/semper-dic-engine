@@ -99,6 +99,7 @@ set(DIC_ENGINE_SOURCES
 # hosts without it still build the math suite; CI sets DIC_REQUIRE_OPENCV=ON.
 set(DIC_PIPELINE_SOURCES
         ${NATIVE_ROOT}/src/io/image_codec.cpp
+        ${NATIVE_ROOT}/src/pipeline/akaze_features.cpp
         ${NATIVE_ROOT}/src/pipeline/full_field_solver.cpp
         ${NATIVE_ROOT}/src/pipeline/full_field_anchors.cpp
         ${NATIVE_ROOT}/src/pipeline/full_field_mesh.cpp
@@ -162,12 +163,14 @@ option(DIC_REQUIRE_OPENCV "Fail configure if OpenCV is missing (CI sets this)" O
 # Prefer OpenCV targets already built by the parent `native/` package (vendored
 # third_party). Fall back to find_package for the standalone host-tests tree (CI).
 set(_SEMPER_OPENCV_READY FALSE)
-if (TARGET opencv_core AND TARGET opencv_imgcodecs AND TARGET opencv_imgproc)
+if (TARGET opencv_core AND TARGET opencv_imgcodecs AND TARGET opencv_imgproc
+        AND TARGET opencv_features2d AND TARGET opencv_calib3d)
     set(_SEMPER_OPENCV_READY TRUE)
-    set(OpenCV_LIBS opencv_core opencv_imgproc opencv_imgcodecs)
+    set(OpenCV_LIBS opencv_core opencv_imgproc opencv_imgcodecs
+            opencv_features2d opencv_calib3d opencv_flann)
     message(STATUS "Using parent-built OpenCV targets — full_field_solver linked")
 else ()
-    find_package(OpenCV QUIET COMPONENTS core imgcodecs imgproc)
+    find_package(OpenCV QUIET COMPONENTS core imgcodecs imgproc features2d calib3d flann)
     if (OpenCV_FOUND)
         set(_SEMPER_OPENCV_READY TRUE)
         message(STATUS "OpenCV ${OpenCV_VERSION} found — image-backed DICe + full_field_solver linked")
@@ -216,7 +219,8 @@ if (_SEMPER_OPENCV_READY)
     endif ()
 elseif (DIC_REQUIRE_OPENCV)
     message(FATAL_ERROR
-            "DIC_REQUIRE_OPENCV=ON but OpenCV (core, imgcodecs, imgproc) was not found. "
+            "DIC_REQUIRE_OPENCV=ON but OpenCV (core, imgcodecs, imgproc, features2d, "
+            "calib3d, flann) was not found. "
             "Install it (Debian/Ubuntu: libopencv-dev) or build via native/ with "
             "SEMPER_BUILD_TESTS=ON.")
 else ()

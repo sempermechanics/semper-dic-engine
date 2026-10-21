@@ -124,10 +124,10 @@ struct SolveOutput {
     //
     // DIVERGENCE from the upstream file: slots 19..23 are recorded too.
     // They are this branch's additions -- anchor points solved, points
-    // dropped by the strain post-filter, the phase lock, mesh coverage, and
+    // dropped by the strain post-filter, the global lock, mesh coverage, and
     // (v0.5.0) points dropped by the displacement median test.
     // Without them a seeding change that shifted work between the three
-    // solving paths, or that quietly lost the phase lock, would leave every
+    // solving paths, or that quietly lost the global lock, would leave every
     // recorded number unchanged and pass.
     float counts[kCountSlots] = {};
 };

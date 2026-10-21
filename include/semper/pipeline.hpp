@@ -27,7 +27,7 @@ namespace internal { struct RefPrecompute; }
  * whole solve so a cancel can still interrupt.
  *
  * Besides the image it keeps what run_full_field derives from the reference
- * alone (grid validity scan, Hessian pool, phase-correlation reference side),
+ * alone (grid validity scan, Hessian pool, reference AKAZE keypoints),
  * so frames 2..N of a fixed-reference batch skip that work. The values are
  * produced by the same code on the same inputs, so results are bit-identical
  * to recomputing them; any change of reference, params or ROI mask drops them.

@@ -24,8 +24,9 @@ this repository
 ```
 
 **Data flow for one analysis:** decode images → `Image` (float intensities +
-gradients) → Hessian pre-pass → **anchor-lattice seeding** (phase correlation for
-the global rigid shift, then IC-GN on a lattice of grid nodes) → Delaunay mesh →
+gradients) → Hessian pre-pass → **anchor-lattice seeding** (an AKAZE + RANSAC
+homography for the global motion, then IC-GN on a lattice of grid nodes seeded
+from it) → Delaunay mesh →
 for each remaining grid point: `SubsetPrecomputer` builds a `SubsetData` →
 `OptimizationEngine.calculate_deformation` solves the 6-DOF warp →
 displacement field → `StrainCalculator` → results buffer back through JNI.
@@ -34,7 +35,18 @@ Seeding runs **after** the Hessian pre-pass on purpose: the anchors sit on grid
 nodes, so they reuse the pooled Hessians and a node that converges well enough
 is a final result for that node. Path A then skips it and Path B takes it as a
 boundary seed. See [SEEDING_BENCHMARK.md](SEEDING_BENCHMARK.md) for why this
-replaced AKAZE feature matching.
+replaced AKAZE keypoints as mesh vertices (v0.2.2).
+
+AKAZE came back in v0.6.0 in a different role: its matches no longer become
+mesh vertices, they only fit the global model. Phase correlation (v0.2.2 to
+v0.5.0) gave translation, and a log-polar similarity added rotation and scale,
+but it had a 180° ambiguity and read anisotropic stretch as rotation. A
+homography fitted to AKAZE matches covers rotation at any angle, scale,
+stretch and shear. Matching runs at the coarsest of 0.25x, 0.5x and 1x that
+gives enough RANSAC inliers. Each anchor starts from the displacement and
+gradients the homography puts at it; a homography refitted to the converged
+anchors then seeds the nodes the mesh does not reach. Without a model the
+lattice searches for its own offsets, as v0.5.0 did without a phase lock.
 
 "Converges well enough" is decided in two steps, not one. The lattice solve
 records every node's outcome and writes nothing to the field; the universal
@@ -45,7 +57,8 @@ Path B can flood fill from it.
 
 **Work reused across frames.** `ReferenceCache` keeps what depends only on
 the reference and the grid: the node validity scan, the Hessian pool and the
-reference side of phase correlation (its float crop and Hann window). The
+reference's AKAZE keypoints and descriptors at each scale tried, plus the
+scale the last solve settled on, which is tried first. The
 second and later frames against one reference, with the same `rect`, `step`,
 `subset_size` and mask, skip those steps. The cache is internal, and outputs
 are bit-identical with or without it (`FullField.RefCache_*`). Steepest-descent
@@ -318,8 +331,10 @@ process_frame(t):
 - **Errors and cancel.** Every state change happens after a successful solve,
   so a negative return leaves the session as it was.
 - **Between updates (N > 1)** every frame after the first one on a reference
-  reuses that reference's cached grid scan, Hessian pool and phase-correlation
-  side.
+  reuses that reference's cached grid scan, Hessian pool and AKAZE keypoints.
+- **On an update** the keypoints AKAZE found on the deformed frame become the
+  new reference's (those inside its padded ROI), and the AKAZE scale carries
+  over, so a reference is never detected twice.
 - **Metrics** are the increment solve's; frame-0 counts are in
   `IncrementalFrameInfo`.
 
@@ -413,7 +428,7 @@ starts — a pending edit can never reach the engine uncommitted.
 | `src/math/` | Image / SubsetPrecomputer / OptimizationEngine |
 | `src/strain/` | StrainCalculator |
 | `src/io/` | Platform-agnostic OpenCV decode |
-| `src/pipeline/` | Anchor seeding (phase correlation + lattice) + full-field Path A/B/C + OpenMP; incremental session (composition, mask warp) |
+| `src/pipeline/` | Anchor seeding (AKAZE homography + lattice) + full-field Path A/B/C + OpenMP; incremental session (composition, mask warp) |
 | `adapters/android/` | JNI only → `libsemper_core.so` |
 | `adapters/c/` | Stable C ABI → `libsemper_c` |
 | `bindings/python/` | pybind11 module |
@@ -441,12 +456,21 @@ with `git submodule status` rather than trusting this table.
 | **Eigen** | `third_party/eigen` | `bc3b3987` | 5.0.1 | header-only; added via `include_directories` |
 | **OpenCV** | `third_party/opencv` | `fe38fc60` | 4.13.0 | **compiled from source** in the engine build |
 
-**OpenCV modules compiled:** `core,imgproc,imgcodecs` only
+**OpenCV modules compiled:** `core,imgproc,imgcodecs,features2d,calib3d,flann`
 (`SEMPER_OPENCV_BUILD_LIST` in `cmake/SemperOpenCV.cmake`, overridable from the
 cache). `features2d`, `flann` and `calib3d` were dropped in v0.2.2 along with the
-descriptor seeding front-end that used them; that removal is worth ~29% of the
-aarch64 `libsemper_c.so`. Nothing under `include/semper/` includes a header from
-the dropped modules, so re-adding one is a deliberate act, not an accident.
+descriptor seeding front-end that used them (~29% of the aarch64
+`libsemper_c.so`), and came back in v0.6.0 for the AKAZE global model: the
+stripped x86-64 Python extension grows from 12.30 MB to 14.32 MB (+16%). Only
+`src/pipeline/akaze_features.cpp` and `full_field_anchors.cpp` include their
+headers; nothing under `include/semper/` does.
+
+**OpenCV threads.** AKAZE, the matcher and RANSAC run inside a one-stripe
+`cv::parallel_for_`, so OpenCV runs their own parallel loops inline and never
+wakes its thread pool for them. On a few hundred pixels the pool saves under
+1 ms, and its workers would still be spinning when the engine's OpenMP region
+starts (2–3× the wall time of a small-ROI frame on a 20-thread host). The
+Android adapter pins OpenCV to one thread in `JNI_OnLoad`.
 
 **Sparse OpenCV checkout:** the full OpenCV repo includes `doc/`, `samples/`,
 `data/`, and `apps/` that this project never builds. After submodule init, run
