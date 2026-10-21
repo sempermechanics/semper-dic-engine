@@ -30,6 +30,8 @@ This report was re-run when the anchor lattice gained rotation-aware seeding (SE
 - A log-polar (Fourier-Mellin) estimate gives rotation and scale.
 - When those move the ROI corners by more than 4 px, they seed the lattice with a similarity instead of a bare translation.
 - The lattice keeps the similarity only when it routes FULL and keeps ≥ 90% of its anchors. Otherwise it re-solves from the translation alone.
+  - Since SEEDING_BENCHMARK.md §4.5.3, the re-solved lattice is used only if the similarity's does not route FULL, or both route FULL and the translation's keeps at least as many anchors.
+  - The tables below predate that change and were not re-run. Its one-seed re-run of S2, S5, S6, S8 and S9 is in §4.5.3. There, 65 frame rows changed and none got worse by more than 0.002 px. S6's fixed reference at σ = 0 improved from 0.163 / 0.167 px to 0.015 / 0.014 px at frames 55 and 57, which are not printed here.
 
 Both builds ran on the same host, interleaved scenario by scenario: `045a500` (translation-only seeding) and this one.
 

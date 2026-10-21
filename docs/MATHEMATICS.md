@@ -533,9 +533,10 @@ corners. The similarity seeds the anchors only when
 2. the translation correlation on the rotation-corrected image has a higher
    peak than the uncorrected one, and
 3. the anchor lattice it seeds (§8.2–8.3) routes FULL and keeps at least
-   $k_{\text{SimilarityKeepFraction}} = 90\%$ of the anchors it attempts.
-   Otherwise the lattice is solved again from the translation alone, and that
-   one is used.
+   $k_{\text{SimilarityKeepFraction}} = 90\%$ of the anchors it attempts, or,
+   failing that, it beats the lattice solved again from the translation
+   alone: it routes FULL and that one does not, or both route FULL and it
+   keeps more anchors.
 
 Otherwise the seed is the §8.1 translation, exactly the values that path always
 produced, so small motion is bit-identical to the translation-only seeder. The
@@ -551,7 +552,7 @@ correlation can still return a peak (−42° for a 40% uniaxial stretch on a
 condition 2 can let it through. Anchors seeded from that wrong model can
 converge, as a cluster, onto the wrong speckle. Such a cluster agrees with
 itself, so neither the ZNSSD gate nor a median test of residuals from that same
-model rejects it. Nor can counting kept anchors choose between the two
+model rejects it. Nor can counting kept anchors alone choose between the two
 lattices: on that frame the wrong lattice kept 24 anchors at a median vertex
 error of 31.6 px, and the translation-only one 16 at 0.008 px. A lattice that
 keeps almost every anchor is the evidence that the model fits; a rotation it
@@ -559,11 +560,23 @@ fits keeps ~100%. Since the response floor above, that frame (response
 0.145) and nearly all stretched frames stop before the lattice, and condition 3
 is a second line that rarely fires.
 
+When it does fire, routing separates the two lattices where the count cannot.
+Every wrong cluster measured sat in a lattice that routes SPARSE (both lattices
+on the frame above do). A FULL lattice has been clean in every frame measured,
+whichever model seeded it. The translation lattice can be the wrong one: under
+a stretch plus a real turn it is often SPARSE with blunders. So a FULL
+similarity lattice is kept over a SPARSE translation lattice, and between two
+FULL ones the one that keeps more wins. That sends a pure stretch, which the
+estimate reads as a spurious turn of a few degrees, back to the translation:
+there the translation lattice keeps more. No threshold on the keep fraction
+can do this, because both kinds of frame keep 60–90%
+(SEEDING_BENCHMARK.md §4.5.3).
+
 On pure translation the estimate is not free: one $N^2$ DFT and a 256×128
 correlation per solve, about 1.3 ms serial on a 320 px ROI, plus the
-reference's log-polar DFT once per reference. When condition 3 fails the
-lattice is solved twice, which is the translation-only cost plus the rejected
-attempt.
+reference's log-polar DFT once per reference. When the similarity's lattice
+keeps under 90%, the lattice is solved twice, which is the translation-only
+cost plus the similarity's attempt.
 
 **Where the estimate reaches.** On IncBench S4's frames (a turn to 90° in
 0.45° steps, three noise seeds) the similarity is applied with the angle

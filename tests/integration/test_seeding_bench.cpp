@@ -734,19 +734,25 @@ TEST_CASE(SeedBench, AnchorSeedingRotationGate) {
 // The first guard is the log-polar response (tuning::kLogPolarMinResponse):
 // this frame scores 0.145, under the 0.2 floor, so the estimate is not
 // used and the frame is seeded from the translation alone (median vertex
-// error 0.008 px). The second, the lattice keep fraction
-// (tuning::kSimilarityKeepFraction), no longer sees this frame. The second
-// half of the case runs a frame that does reach it -- 10% stretch turned by
-// 15 deg, read as +11.8 deg x1.016 at response 0.214 -- and asserts only that
-// the field is right, whichever lattice seeds it: there the similarity lattice
-// keeps 435 of 484 (just under 90%) and the translation lattice that replaces
-// it keeps 77, yet the field comes out at 0.0148 px either way.
+// error 0.008 px). The second is the lattice comparison: a similarity lattice
+// that keeps under tuning::kSimilarityKeepFraction is solved again from the
+// translation, and the similarity's is kept only if it routes FULL and the
+// translation's does not, or it keeps more. Three frames that reach it
+// (docs/SEEDING_BENCHMARK.md 4.5.3):
+//   - 10% stretch turned 15 deg, read as +11.8 deg x1.016 at response 0.214:
+//     the similarity lattice keeps 435 of 484 (FULL, vertex p95 0.019 px),
+//     the translation lattice 77 (SPARSE, p95 12.1 px). The similarity's is
+//     kept. Before the comparison the translation's replaced it.
+//   - 10% stretch turned 45 deg: 428 (FULL, p95 0.019 px) against 42
+//     (SPARSE, median 30 px -- a wrong cluster seeded by the translation).
+//   - 15% stretch turned 10 deg: 351 (FULL) against 473 (FULL). The
+//     translation lattice keeps more and is used.
 //
 // History: the case first pinned S5 frame 150 (45% stretch), which the
 // estimate then read as -5.8 deg x 0.918 and whose similarity lattice made a
 // 0.215 px field against 0.014 px translation-only. Since the log-polar peak
 // is located by its response (docs/SEEDING_BENCHMARK.md 4.5.2) neither frame
-// reaches the lattice fallback.
+// reaches the lattice.
 //
 // What the case does not fix: at 40% stretch the edge anchors' true
 // displacement is over 20 px, and from a zero-gradient seed some stick near
@@ -772,8 +778,13 @@ TEST_CASE(SeedBench, SimilarityFallsBackUnderStretch) {
             ref, cv::Rect(p.rect_x, p.rect_y, p.rect_w, p.rect_h));
     REQUIRE(pre.lp_usable());
 
-    struct Case { const char* name; double stretch, deg; };
-    for (const Case c : {Case{"stretch_40pct", 0.40, 0.0}, Case{"stretch_10pct_15deg", 0.10, 15.0}}) {
+    // expect: 0 the similarity is not tried, 1 its lattice is kept, 2 the
+    // translation lattice is.
+    struct Case { const char* name; double stretch, deg; int expect; };
+    for (const Case c : {Case{"stretch_40pct", 0.40, 0.0, 0},
+                         Case{"stretch_10pct_15deg", 0.10, 15.0, 1},
+                         Case{"stretch_10pct_45deg", 0.10, 45.0, 1},
+                         Case{"stretch_15pct_10deg", 0.15, 10.0, 2}}) {
         const dictest::Motion m = dictest::stretch_rotate(c.stretch, 0.3, c.deg * CV_PI / 180.0,
                                                           dictest::Vec2{}, dictest::Vec2{192, 128});
         const cv::Mat def = dictest::render_frame(field, w, h, m, 0.0f, 7919u + 150u);
@@ -798,9 +809,12 @@ TEST_CASE(SeedBench, SimilarityFallsBackUnderStretch) {
                     row.similarity_rejected ? 1 : 0, row.anchors_accepted,
                     row.anchors_attempted, row.quality, (double)row.coverage, row.vtx_med_du,
                     row.vtx_p95_du);
-        CHECK(row.phase_locked);
+        // At 15% + 10 deg the bare translation peak is too weak to lock, so
+        // the translation lattice that wins there searched each anchor's own
+        // offset; phase_locked describes the lattice used.
+        if (c.expect != 2) CHECK(row.phase_locked);
 
-        if (c.stretch > 0.3) {
+        if (c.expect == 0) {
             // Stopped at L0: the response is under the floor (measured 0.145),
             // so the lattice never sees the similarity and the seeds are the
             // translation lattice's: 0.008 px median against 31.6 px.
@@ -810,10 +824,20 @@ TEST_CASE(SeedBench, SimilarityFallsBackUnderStretch) {
             CHECK(!row.similarity_rejected);
             REQUIRE(row.vtx_med_du >= 0.0);
             CHECK(row.vtx_med_du <= 0.05);
+        } else {
+            // Reached the lattice and kept under the fraction, so both
+            // lattices were solved; whichever is used routes FULL with no
+            // blunders (vertex p95 0.019, 0.019, 0.022 px measured).
+            CHECK(gm.similarity);
+            CHECK(row.quality == 2);
+            CHECK(row.similarity == (c.expect == 1));
+            CHECK(row.similarity_rejected == (c.expect == 2));
+            REQUIRE(row.vtx_p95_du >= 0.0);
+            CHECK(row.vtx_p95_du <= 0.05);
         }
 
-        // And the field stays where translation-only seeding puts it
-        // (0.0151 px at 40%, 0.0148 px at 10% + 15 deg).
+        // And the field is right (0.0151 px at 40%; 0.0186, 0.0135 and
+        // 0.0160 px for the three that reach the lattice).
         measure_full_field(row, truth, ref, def, p);
         std::printf("    %-20s field: %d points, rms %.4f px\n", c.name, row.ff_rc, row.ff_rms_u);
         REQUIRE(row.ff_rc > 0);

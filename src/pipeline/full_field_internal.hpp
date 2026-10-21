@@ -301,7 +301,8 @@ struct MeshSeedResult {
     // Whether the anchors were seeded with the log-polar rotation/scale as
     // well as the shift, and that estimate (reported even when not applied).
     // similarity_rejected: the similarity was tried, its lattice came out
-    // weak, and the translation-only lattice re-solved after it was used.
+    // weak, and the translation-only lattice re-solved after it was used
+    // because it routed better or kept more.
     bool similarity = false;
     bool similarity_rejected = false;
     float rotation_deg = 0.0f;

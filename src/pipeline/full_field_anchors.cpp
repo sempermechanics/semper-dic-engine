@@ -420,19 +420,34 @@ MeshSeedResult solve_anchor_seeds(
         // Such a cluster agrees with itself, so neither the ZNSSD gate nor a
         // median test of residuals from that same wrong model catches it
         // (SeedBench.SimilarityFallsBackUnderStretch: 25 px blunders at p95).
-        // Counting kept anchors cannot choose between the two lattices either,
-        // because the blunders are kept. So the similarity is trusted only when
-        // its lattice says the model fits nearly everywhere; otherwise the
-        // translation-only lattice is used, which makes that frame identical
-        // to the translation-only seeder. A rotation the similarity fits keeps
-        // ~100% and never pays for the second solve.
+        // A rotation the similarity fits keeps ~100%, so a lattice that keeps
+        // nearly everything is used as it is and never pays for a second solve.
+        //
+        // Below that, the translation-only lattice is solved as well, and the
+        // two are compared. Such clusters have only ever been seen in lattices
+        // that route SPARSE: the wrong one can keep more anchors than the right
+        // one there (123 against 86), so a count between two SPARSE lattices
+        // proves nothing. A FULL lattice has not held one in any frame measured,
+        // whichever model seeded it, while the translation lattice it replaced
+        // was often SPARSE and wrong in its turn (docs/SEEDING_BENCHMARK.md
+        // 4.5.3). So the similarity's lattice is kept when it routes FULL and
+        // the translation's does not, or both route FULL and it keeps more; a
+        // pure stretch read as a small spurious turn keeps fewer than the
+        // translation lattice does, and goes back to it. Otherwise the frame
+        // is identical to the translation-only seeder.
         if (out.quality != MeshQuality::FULL || kept < tuning::kSimilarityKeepFraction) {
+            MeshSeedResult tr;
+            solve_lattice(false, tr);
+            const bool keep_sim = out.quality == MeshQuality::FULL &&
+                    (tr.quality != MeshQuality::FULL || out.accepted > tr.accepted);
             LOGD("ROUTING: similarity lattice weak (%d/%d kept, quality %d); "
-                 "re-solving from the translation alone",
-                 out.accepted, out.attempted, (int)out.quality);
-            out = MeshSeedResult{};
-            solve_lattice(false, out);
-            out.similarity_rejected = true;
+                 "translation lattice %d kept, quality %d -> %s",
+                 out.accepted, out.attempted, (int)out.quality, tr.accepted,
+                 (int)tr.quality, keep_sim ? "similarity kept" : "translation used");
+            if (!keep_sim) {
+                out = std::move(tr);
+                out.similarity_rejected = true;
+            }
         }
     }
     out.rotation_deg = (float)(gm.theta_rad * 180.0 / CV_PI);

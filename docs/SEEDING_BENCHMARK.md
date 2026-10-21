@@ -254,10 +254,12 @@ The similarity is used only when all three of these hold:
   the bare translation;
 - the rotation-corrected translation peak beats the uncorrected one;
 - the lattice it seeds routes `FULL` and keeps at least
-  `kSimilarityKeepFraction` = 90% of its anchors.
+  `kSimilarityKeepFraction` = 90% of its anchors, or, failing that, it beats
+  the lattice re-solved from the translation alone: it routes `FULL` and
+  that one does not, or both route `FULL` and it keeps more (§4.5.3).
 
 Otherwise every seed is the translation-only value, bit for bit. When the last
-condition fails, the lattice is re-solved from the translation alone.
+condition is decided by the comparison, the lattice has been solved twice.
 `FullFieldGolden` passes unchanged: its affine scenario implies 2.8 px at the
 corners and stays on the translation path, which
 `SeedBench.LogPolarRotationScale` asserts directly.
@@ -282,7 +284,11 @@ the same 0.0137 px. The test then pinned a 40% stretch that still reached the
 third, −42.4 deg, whose lattice kept 24 anchors at a 31.6 px median vertex
 error against the translation lattice's 16 at 0.008 px. That frame's
 log-polar response is 0.145, so §4.5.2's response floor now stops it before
-the lattice; the test asserts that.)
+the lattice; the test asserts that.) The "keeps more" half of the
+comparison added in §4.5.3 is not the count rejected here: it only ranks two
+`FULL` lattices. Every wrong cluster above sat in a lattice that routes
+`SPARSE` (123, 86, 24 and 16 of 484), and between two `SPARSE` lattices the
+translation's is used, as before.
 
 **Measured** on Ubuntu 22.04 (WSL2), GCC 11.4, `taskset -c 0-3`,
 `SEMPER_SEEDBENCH_REPEATS=11`, both columns on the same host. "Before" is
@@ -351,9 +357,8 @@ What it costs:
     cause turned out to be where the peak was looked for, not the spectrum.
   - Anisotropic stretch is outside the model. Since §4.5.2 most such frames
     score under the log-polar response floor and stay translation-only at no
-    extra cost; the few that pass it are returned to the translation-only
-    result by the third condition above, at the cost of solving the lattice
-    twice.
+    extra cost. The few that pass it and keep under 90% are solved twice,
+    and the third condition above keeps whichever lattice is better (§4.5.3).
 
 #### 4.5.2 Fixed: the log-polar peak on small noisy ROIs
 
@@ -480,11 +485,8 @@ smallest case measured. Higher floors cut into that case quickly.
 A frame can still reach the keep fraction. `SimilarityFallsBackUnderStretch`
 runs one: a 10% stretch turned by 15° reads +11.8° × 1.016 at response 0.214.
 Its similarity lattice keeps 435 of 484 anchors (89.9%, routed `FULL`), just
-under the 90% bar. The translation lattice that replaces it keeps 77 (routed
-`SPARSE`). The field is 0.0148 px rms either way. Here the fallback costs a
-second solve and keeps the poorer lattice, so 0.90 may now be stricter than
-it needs to be. That is left for IncBench to show (below); this change does
-not touch it.
+under the 90% bar. The translation lattice that replaced it kept 77 (routed
+`SPARSE`). §4.5.3 takes this up.
 
 **Cost.** At 0–2°, where a 110 px ROI never applies the similarity and
 every solve pays for the estimate for nothing, the per-solve cost went down.
@@ -516,6 +518,119 @@ and S9 the printed cells are unchanged, or within 0.012 px and mostly lower.
 The exception is S6's fixed reference at frame 50, which improves from 0.233 to
 0.016 px. Summed CPU per frame is 0.976–0.994× `5ea4fc0`'s. S4's accuracy
 is identical, to every CSV column, at floors of 0.05 and 0.2.
+
+#### 4.5.3 Fixed: which lattice the keep fraction falls back to
+
+With the response floor in front of it, the question was whether
+`kSimilarityKeepFraction` = 0.90 had become stricter than it needs to be.
+Below 0.90 the lattice was re-solved from the translation alone and that
+lattice was used, however it came out. The answer is that the threshold is
+right but the fallback was not. The similarity's lattice is now kept when it
+routes `FULL` and the translation's does not, or both route `FULL` and it keeps
+more anchors. Otherwise the translation's is used, as before.
+
+**Measured** against `16c924b` (§4.5.2), on Ubuntu 22.04 (WSL2), GCC 11.4, each
+variant pinned to six cores:
+- a SeedBench scan (a temporary test, not committed) of 168 frames rendered
+  like `SimilarityFallsBackUnderStretch`: 384×256 px image, 110 px ROI, stretch
+  5–50% (Poisson 0.3) × turn 0–45° × σ = 0 and 2, median of five runs;
+- IncBench S2, S5, S6, S8 and S9 with one seed and every σ and variant: 16,750
+  solves;
+- the same in quick mode: 4000 solves.
+
+**Where the fallback fires.** On 6 of the 168 scan frames, all noise-free; on
+8 of 4000 quick-mode solves; on 115 of 16,750 one-seed solves (S2 31, S5 3,
+S6 21, S8 43, S9 17). What separates the two outcomes is the scenario, not
+the keep fraction:
+
+| scenario | fallbacks | similarity lattice keeps | translation lattice |
+|---|---|---|---|
+| S2, pure slow stretch, read as a spurious −2.7 to −3.5° (once +2.8°) × 1.04–1.07 | 31 | 78–88%, `FULL` | `FULL`, keeps more in all 31 |
+| S5, 60% stretch | 3 | 69–75%, `FULL` | `FULL`, keeps more in all 3 |
+| S6, 40% stretch + 45° + 30 px | 21 | 67–90%, `FULL` | `SPARSE` in 15, keeps fewer in 20 |
+| S8, 20% stretch + 10° | 43 | 59–90%, `FULL` in 42 | keeps fewer in all 43 |
+| S9, ring mask, 72-node lattice | 17 | 13 `SPARSE`, 4 `FULL` | — |
+| scan, 10–15% stretch + 10–45° | 6 | 72–90%, `FULL` | `SPARSE` in 5, with p95 vertex error 12–53 px |
+
+The S2 events keep 78–88%, inside the range the S6 and S8 events span. So no
+threshold sends S6 and S8 to the similarity without also sending S2 there,
+where the translation is the right model.
+
+**Thresholds against the comparison**, one-seed IncBench, rows of the CSV
+(one per frame, mode and variant) against `16c924b`:
+
+| fallback rule | lattice solved twice | rows changed | better / worse by > 0.002 px | by > 0.02 px | good points | CPU of the changed rows |
+|---|---|---|---|---|---|---|
+| 0.90, translation always (`16c924b`) | 115 | — | — | — | — | — |
+| 0.85, translation always | 94 | 21 | 3 / 1 | 2 / 1 | +109 | 4.9 → 1.7 s |
+| 0.80, translation always | 66 | 48 | 4 / 3 | 3 / 1 | +291 | 11.2 → 4.5 s |
+| 0.90, the lattice that keeps more | 115 | 73 | 4 / 0, + 1 frame recovered | 3 / 0 | +935 | 22.8 → 16.2 s |
+| **0.90, `FULL` and (the other not `FULL` or keeps more)** | **115** | **65** | **4 / 0** | **3 / 0** | **+773** | **21.4 → 14.3 s** |
+
+The rows that moved by more than 0.02 px, or that a lower threshold made worse:
+
+| row | `16c924b` | 0.85 | 0.80 | shipped |
+|---|---|---|---|---|
+| S6 σ = 0 fixed, frame 55 | 0.163 px, max 3.09, 361 good | **0.015**, max 0.12, 400 | **0.015** | **0.015** |
+| S6 σ = 0 fixed, frame 57 | 0.167 px, max 3.31, 393 good | 0.167 | **0.014**, max 0.09, 400 | **0.014** |
+| S8 σ = 2 fixed, frame 95 | 0.120 px, max 1.93 | **0.072**, max 0.35 | **0.072** | **0.072** |
+| S8 σ = 2 fixed, frame 93 | 0.0998 px, 398 good | 0.0900, 390 | 0.0900, 390 | 0.0900, 390 |
+| S2 σ = 1 fixed, frame 108 | 0.040 px, max 0.28 | 0.063, max 1.02 | 0.063, max 1.02 | 0.040 |
+| S2 σ = 2 fixed, frame 108 (and its 6×6 variant) | 0.094 px, max 0.48 | 0.094 | 0.108, max 1.18 | 0.094 |
+
+So under the old rule the fallback did the harm it was written to prevent.
+On S6 frames 55 and 57 the translation lattice it fell back to was the wrong
+cluster, and it carried 3 px errors into the field. Every lowered threshold
+also takes S2's similarity at frame 108, which is worse. Comparing the two
+lattices, as shipped, gets the four S6/S8 rows and leaves S2 alone. Quick mode
+agrees: its eight events keep 28–83%, so 0.85 changes nothing there, while 0.80
+changes four frames by up to 0.014 px in both directions.
+
+**Why `FULL` decides, and not the count alone.** Over the 168 scan frames,
+every lattice that routed `FULL` was clean, whichever model seeded it: vertex
+p95 at most 0.028 px at σ = 0 and 0.32 px at σ = 2. Of the 122 frames whose
+lattice routed `SPARSE` under `16c924b`, 94 had a p95 over 1 px, up to a 45 px
+median. The wrong clusters of
+§4.5.1 all sat in `SPARSE` lattices (123, 86, 24 and 16 of 484). There, the
+wrong lattice kept more, which is why counting alone was rejected. Ranking
+by count only between two `FULL` lattices keeps that case on the translation.
+Counting between any two lattices, the fourth row of the table above, also
+takes `SPARSE` over `NONE`. That recovered one empty S9 frame (0 → 136 points
+at 0.083 px). It was not shipped, because one frame is not enough to trust a
+`SPARSE` similarity lattice.
+
+**The pinned frames** (`SimilarityFallsBackUnderStretch` now asserts three
+of them):
+
+| frame | similarity lattice | translation lattice | `16c924b`: vertex p95, field rms / points, field CPU | now |
+|---|---|---|---|---|
+| 10% + 15° | 435 `FULL` | 77 `SPARSE` | 12.1 px, 0.0148 / 400, 453 ms | similarity: 0.019 px, 0.0186 / 400, 224 ms |
+| 10% + 45° | 428 `FULL` | 42 `SPARSE`, median 30 px | 53.4 px, 0.0136 / 315, 1509 ms | similarity: 0.019 px, 0.0135 / 400, 520 ms |
+| 12% + 30° | 410 `FULL` | 24 `SPARSE` | 47.0 px, 0.0121 / 338, 584 ms | similarity: 0.019 px, 0.0141 / 400, 272 ms |
+| 12% + 45° | 388 `FULL` | 37 `SPARSE` | 53.7 px, 0.0135 / 324, 1214 ms | similarity: 0.023 px, 0.0137 / 400, 572 ms |
+| 15% + 10° | 351 `FULL` | 473 `FULL` | 0.022 px, 0.0160 / 400, 388 ms | translation, unchanged |
+| 15% + 30° | 356 `FULL` | 25 `SPARSE` | 50.5 px, 0.0107 / 347, 741 ms | similarity: 0.022 px, 0.0116 / 389, 403 ms |
+
+Where the similarity is now kept, the field covers 389–400 points instead
+of 315–400. Its rms moves by −0.0001 to +0.0038 px, all well inside the
+test's 0.05 px. Field CPU roughly halves on those frames. The worst rms move
+is on the first row, the frame the question was asked about: it is 0.0148 px
+from the translation lattice's mesh and 0.0186 px from the similarity's.
+
+**Cost.** The lattice is still solved twice on every frame that keeps under
+90%: 115 of 16,750 solves here, as before. A lower threshold would save some
+of those second solves (94 at 0.85, 66 at 0.80), but only by giving up the
+comparison, which is what fixes S6 and protects S2. On the rows that change,
+CPU falls by a third, because the field solve after a `FULL` mesh is cheaper
+than after a `SPARSE` one. Summed over a scenario, the difference is below
+what this host resolves: identical code re-run on other cores differed by up
+to 18% in summed CPU.
+
+**The old misfire.** The 40% stretch that once seeded a 31.6 px cluster still
+never reaches the lattice. All 70 scan frames at 30–50% stretch, σ = 0 and 2,
+0–45°, score at most 0.186 against the 0.2 floor. If one did reach it, both its
+lattices are `SPARSE` (24 against 16 of 484), so the translation's would be
+used, as before.
 
 
 ## 5. Cost accounting
@@ -788,10 +903,12 @@ Seven gates now run unconditionally (four since 0.3.0, three since the rotation 
   10 deg + 5% + 20 px rows of LargeMotionSweep: similarity applied, `FULL`, hull
   coverage ≥ 0.90, mesh fraction ≥ 0.95, vertex error ≤ 0.05 px.
 - `SeedBench.SimilarityFallsBackUnderStretch` pins the stretch guards of
-  §4.5.1 and §4.5.2: a 40% stretch the estimate once misread must score under
-  the log-polar response floor and seed from the translation alone, and a
-  10% stretch turned 15° that reaches the keep-fraction fallback must still
-  give a 0.015 px field.
+  §4.5.1–§4.5.3. A 40% stretch the estimate once misread must score under
+  the log-polar response floor and seed from the translation alone. Three
+  frames that reach the lattice comparison must keep the lattice that routes
+  `FULL` with no blunders: the similarity's for a 10% stretch turned 15° or
+  45°, and the translation's for a 15% stretch turned 10°. All four must give a
+  field ≤ 0.05 px.
 - `SeedBench.LogPolarNoisySmallRoi` pins §4.5.2: on IncBench S4's 110 px ROI
   at σ = 2, twelve turns from 9.9° to 70.2° must lock within 1° and 1 px.
 

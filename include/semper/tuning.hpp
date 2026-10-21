@@ -65,8 +65,8 @@ inline constexpr float kPhaseCorrMinResponse = 0.05f;
  *  A turn the estimate resolves scores 0.27-0.86 on a 110 px ROI at sigma
  *  0-4 GL (0.24 at 80 px, sigma 2); a uniaxial stretch of 10% or more, which
  *  a similarity cannot describe, scores 0.11-0.20. Below 0.2 such frames
- *  would pass to the anchor lattice, fail kSimilarityKeepFraction and be
- *  solved twice (docs/SEEDING_BENCHMARK.md 4.5.2). */
+ *  would pass to the anchor lattice, keep under kSimilarityKeepFraction and
+ *  be solved twice (docs/SEEDING_BENCHMARK.md 4.5.2). */
 inline constexpr float kLogPolarMinResponse = 0.2f;
 
 /** Log-polar estimate: the square crop it is taken from. Below the minimum
@@ -83,14 +83,18 @@ inline constexpr int kLogPolarMaxSide = 512;
  *  ROI already costs CPU (docs/SEEDING_BENCHMARK.md 4.5). */
 inline constexpr float kSimilarityMinCornerPx = 4.0f;
 
-/** The similarity is trusted only if the anchor lattice it seeds routes FULL
- *  and keeps at least this fraction of its attempted anchors; otherwise the
- *  lattice is solved again from the translation alone and that one is used.
- *  The log-polar estimate is a similarity; under strong anisotropic stretch it
- *  can report a rotation that is not there (IncBench S5/S9: about 90 deg with
- *  noise, -5.8 deg x 0.92 without), and the lattice it seeds can then hold a
- *  self-consistent cluster of wrong anchors that no gate catches. Rotations
- *  the similarity fits keep ~100%. */
+/** The anchor lattice the similarity seeds is used as it is if it routes FULL
+ *  and keeps at least this fraction of its attempted anchors. Otherwise the
+ *  lattice is solved again from the translation alone, and the similarity's
+ *  is kept only if it routes FULL and either the translation's does not or it
+ *  keeps more anchors. The log-polar estimate is a similarity; under strong
+ *  anisotropic stretch it can report a rotation that is not there (IncBench
+ *  S5/S9: about 90 deg with noise, -5.8 deg x 0.92 without), and the lattice
+ *  it seeds can then hold a self-consistent cluster of wrong anchors that no
+ *  gate catches -- seen only in lattices that route SPARSE. Rotations the
+ *  similarity fits keep ~100%. Not lowered: a pure stretch read as a spurious
+ *  3 deg turn keeps 78-88%, as stretched turns do, and only the comparison
+ *  tells them apart (docs/SEEDING_BENCHMARK.md 4.5.3). */
 inline constexpr float kSimilarityKeepFraction = 0.90f;
 
 /** Packed-field sentinel for "no valid correlation at this grid point". */
