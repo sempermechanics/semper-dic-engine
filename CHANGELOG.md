@@ -3,7 +3,43 @@
 Versions follow [docs/CONTRACT.md](docs/CONTRACT.md) §A.1. Entries before
 0.5.0 live in the git history (`git log --grep Version`).
 
-## Unreleased
+## 0.6.0
+
+Minor: a new capability, no surface change. Every signature, Frozen value,
+slot index and the packing are unchanged; the field moves.
+
+### Changed — seeding
+- The anchor lattice is seeded from an **AKAZE + RANSAC homography** instead
+  of phase correlation and the log-polar similarity. AKAZE runs over the
+  ROI padded by 40 px, at the coarsest of 0.25x / 0.5x / 1x that gives 25
+  inliers (else the best scale with 10). The lattice, its median test, the
+  fallback to a translation-only lattice when the model's lattice is weak,
+  and Paths A/B/C are as before; without a model the lattice searches for
+  its own offsets, as v0.5.0 did without a phase lock.
+- A homography has no 180° ambiguity and does not read stretch as rotation:
+  rotation past 90° and large stretch now seed the mesh. Fixed reference,
+  300 px ROI: 95–180° goes from 0% to 100% coverage; 15% stretch + 15° is up
+  to 17x faster on large ROIs (SEEDING_BENCHMARK §11).
+- The homography is refitted to the converged anchors and seeds the nodes
+  the mesh does not reach, solved with plain IC-GN.
+- `ReferenceCache` keeps the reference's AKAZE keypoints per scale and the
+  scale the last solve settled on. `IncrementalSession` hands the deformed
+  frame's keypoints to the next reference, so a reference is detected once.
+- Metrics slot 21 reports the global-motion (AKAZE) lock; slot 10 is AKAZE
+  plus the anchor lattice (CONTRACT §A.4).
+- Incremental: rotation to 180° at 4.5°/frame with N = 5 on 60–80 px ROIs
+  keeps every node (v0.5.0 lost all of them); elsewhere accuracy is identical
+  and time per frame is 0.45–1.11x v0.5.0's, faster on most ROIs. The one
+  cost: a cheap small-ROI frame pays ~1.5–3 ms for AKAZE, 1–10% on the
+  tensile video's run total. Sample 14 unchanged (≤ 0.00008 px).
+
+### Build
+- OpenCV `features2d`, `calib3d` and `flann` are back in
+  `SEMPER_OPENCV_BUILD_LIST`: the stripped x86-64 Python extension grows from
+  12.30 MB to 14.32 MB (+16%).
+- AKAZE runs without waking OpenCV's thread pool, whose spinning workers
+  otherwise slowed the engine's next OpenMP region (host builds; Android pins
+  OpenCV to one thread).
 
 ### Fixed
 - The mesh guess field's 5x5 smoothing moved nodes on the grid or mesh edge
