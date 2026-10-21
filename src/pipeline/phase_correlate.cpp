@@ -10,6 +10,8 @@
 //                    into a shift along the angle axis and scale into a shift
 //                    along log-radius. The translation is then re-measured on
 //                    the deformed image with that rotation and scale undone.
+//                    The spectrum cannot tell theta from theta + 180 deg, so
+//                    both are undone and the stronger peak picks the turn.
 //
 // The L0/L1 design is documented at the top of full_field_anchors.cpp, which is
 // this file's only pipeline caller, the derivation in docs/MATHEMATICS.md 8.1,
@@ -172,19 +174,42 @@ bool log_polar_rotation_scale(const PhaseCorrRef &ref, const cv::Mat &def,
     const cv::Rect &r = ref.lp_rect;
     if (r.x + r.width > def.cols || r.y + r.height > def.rows) return false;
 
-    cv::Mat lp_def = log_polar_of(def, ref);
-    cv::Mat lp_ref = ref.lp_ref.clone();   // phaseCorrelate windows in place
+    const cv::Mat lp_def = log_polar_of(def, ref);
+    // phaseCorrelate windows both inputs in place, and lp_def may be needed
+    // again below, so it sees copies.
+    cv::Mat lp_ref = ref.lp_ref.clone();
+    cv::Mat lp_cor = lp_def.clone();
     double response = 0.0;
-    const cv::Point2d shift = cv::phaseCorrelate(lp_ref, lp_def, ref.lp_win, &response);
+    cv::Point2d shift = cv::phaseCorrelate(lp_ref, lp_cor, ref.lp_win, &response);
+
+    // A turn near 90 deg puts the peak on the wrap of the angle axis, half a
+    // period out, where phaseCorrelate's 5x5 centroid and response are clamped
+    // to the rows on one side of it. Rolling the deformed rows by half a
+    // period -- a 90 deg turn of its spectrum, which the periodic axis allows --
+    // brings that peak to the middle, and the half period is added back.
+    // Below 45 deg nothing changes.
+    if (std::abs(shift.y) > kLpAngles / 4) {
+        const int half = kLpAngles / 2;
+        cv::Mat rolled(lp_def.size(), lp_def.type());
+        lp_def.rowRange(half, kLpAngles).copyTo(rolled.rowRange(0, half));
+        lp_def.rowRange(0, half).copyTo(rolled.rowRange(half, kLpAngles));
+        lp_ref = ref.lp_ref.clone();
+        shift = cv::phaseCorrelate(lp_ref, rolled, ref.lp_win, &response);
+        shift.y += half;
+    }
     out_response = response;
     if (!(response > (double)tuning::kLogPolarMinResponse)) return false;
 
     // A turn by theta rotates the spectrum by theta: the deformed rows sit
     // theta / (pi / kLpAngles) further down. Scaling the image by s shrinks
     // the spectrum by s: the deformed columns sit log(s) / dlogr further left.
-    const double theta = shift.y * CV_PI / (double)kLpAngles;
+    // The angle axis spans 180 deg, so theta is folded into [-90, 90): an
+    // exact 90 deg turn reads as either end, and both are the same turn.
+    double theta = shift.y * CV_PI / (double)kLpAngles;
     const double scale = std::exp(-shift.x * ref.lp_dlogr);
-    if (!(std::abs(theta) < CV_PI / 2.0) || !(scale > 0.5 && scale < 2.0)) return false;
+    if (!std::isfinite(theta) || !(scale > 0.5 && scale < 2.0)) return false;
+    if (theta >= CV_PI / 2.0) theta -= CV_PI;
+    else if (theta < -CV_PI / 2.0) theta += CV_PI;
 
     out_theta_rad = theta;
     out_scale = scale;
@@ -213,40 +238,53 @@ void phase_correlate_similarity(const PhaseCorrRef &ref, const cv::Mat &def,
     out.theta_rad = theta;
     out.scale = s;
 
-    // s R - I is itself a scaled rotation, so its operator norm is just the
-    // length of its first column; times the half-diagonal, that is how far the
-    // bare translation is off at the ROI corners.
-    const double a = s * std::cos(theta) - 1.0, b = s * std::sin(theta);
+    // The spectrum gives theta only modulo 180 deg: a turn by theta and by
+    // theta + 180 have the same |F|. Both are tried, each undone and its
+    // translation re-measured, and the stronger corrected peak wins -- over the
+    // uncorrected peak as well, so the similarity still has to beat the
+    // translation it would replace. theta goes first and keeps ties, so a frame
+    // the half-turn does not beat is seeded exactly as before.
     const double arm = 0.5 * std::hypot((double)r.width, (double)r.height);
-    if (!(arm * std::hypot(a, b) > (double)tuning::kSimilarityMinCornerPx)) return;
+    const double hyps[2] = {theta, theta < 0.0 ? theta + CV_PI : theta - CV_PI};
+    double best = r0;
+    for (const double th : hyps) {
+        // s R - I is itself a scaled rotation, so its operator norm is just the
+        // length of its first column; times the half-diagonal, that is how far
+        // the bare translation is off at the ROI corners. The half-turn always
+        // clears this: |s R + I| >= sqrt(1 + s^2) for |theta| <= 90 deg.
+        const double a = s * std::cos(th) - 1.0, b = s * std::sin(th);
+        if (!(arm * std::hypot(a, b) > (double)tuning::kSimilarityMinCornerPx)) continue;
 
-    // Undo the rotation and scale about the ROI centre: sample the deformed
-    // image at c + s R (x - c). What remains is a pure translation t' with
-    // t = s R t'. The source is the whole image, so a turned ROI still finds
-    // the pixels that rotated out of its rectangle.
-    const double sc = s * std::cos(theta), ss = s * std::sin(theta);
-    const double x0 = r.x - out.cx, y0 = r.y - out.cy;
-    const cv::Mat M = (cv::Mat_<double>(2, 3) <<
-            sc, -ss, out.cx + sc * x0 - ss * y0,
-            ss,  sc, out.cy + ss * x0 + sc * y0);
-    cv::Mat undone;
-    cv::warpAffine(def, undone, M, r.size(), cv::INTER_LINEAR | cv::WARP_INVERSE_MAP,
-                   cv::BORDER_REPLICATE);
-    cv::Mat und32;
-    undone.convertTo(und32, CV_32F);
-    cv::Mat ref32 = ref.ref32.clone();
-    double r1 = 0.0;
-    const cv::Point2d tp = cv::phaseCorrelate(ref32, und32, ref.hann, &r1);
-    if (!(r1 > (double)tuning::kPhaseCorrMinResponse) || !(r1 > r0)) return;
-    if (!(std::abs(tp.x) < 1e6 && std::abs(tp.y) < 1e6)) return;
+        // Undo the rotation and scale about the ROI centre: sample the deformed
+        // image at c + s R (x - c). What remains is a pure translation t' with
+        // t = s R t'. The source is the whole image, so a turned ROI still finds
+        // the pixels that rotated out of its rectangle.
+        const double sc = s * std::cos(th), ss = s * std::sin(th);
+        const double x0 = r.x - out.cx, y0 = r.y - out.cy;
+        const cv::Mat M = (cv::Mat_<double>(2, 3) <<
+                sc, -ss, out.cx + sc * x0 - ss * y0,
+                ss,  sc, out.cy + ss * x0 + sc * y0);
+        cv::Mat undone;
+        cv::warpAffine(def, undone, M, r.size(), cv::INTER_LINEAR | cv::WARP_INVERSE_MAP,
+                       cv::BORDER_REPLICATE);
+        cv::Mat und32;
+        undone.convertTo(und32, CV_32F);
+        cv::Mat ref32 = ref.ref32.clone();
+        double r1 = 0.0;
+        const cv::Point2d tp = cv::phaseCorrelate(ref32, und32, ref.hann, &r1);
+        if (!(r1 > (double)tuning::kPhaseCorrMinResponse) || !(r1 > best)) continue;
+        if (!(std::abs(tp.x) < 1e6 && std::abs(tp.y) < 1e6)) continue;
 
-    out.u = sc * tp.x - ss * tp.y;
-    out.v = ss * tp.x + sc * tp.y;
-    out.ux = a;  out.uy = -b;
-    out.vx = b;  out.vy = a;
-    out.response = r1;
-    out.locked = true;
-    out.similarity = true;
+        best = r1;
+        out.theta_rad = th;
+        out.u = sc * tp.x - ss * tp.y;
+        out.v = ss * tp.x + sc * tp.y;
+        out.ux = a;  out.uy = -b;
+        out.vx = b;  out.vy = a;
+        out.response = r1;
+        out.locked = true;
+        out.similarity = true;
+    }
 }
 
 } // namespace seeding

@@ -6,7 +6,10 @@
 //       pixel, rather than from the median of sparse keypoint matches. A
 //       log-polar (Fourier-Mellin) correlation of the magnitude spectra adds
 //       rotation and scale when they move the ROI corners by more than
-//       kSimilarityMinCornerPx (phase_correlate.cpp).
+//       kSimilarityMinCornerPx (phase_correlate.cpp). The spectrum gives the
+//       angle modulo 180 deg; L0 undoes both theta and theta + 180 and keeps
+//       the one whose corrected translation peak is stronger, so a frame
+//       turned up to 180 deg seeds as well as a small turn does.
 //   L1  a regular lattice of ROI grid nodes is solved with the engine's own
 //       IC-GN, seeded from L0 -- under rotation, each node with the
 //       displacement and gradients the similarity puts there. The converged
@@ -134,7 +137,9 @@ MeshSeedResult solve_anchor_seeds(
     // Translation, or translation plus rotation and scale about the ROI centre
     // when the log-polar estimate says the corners are far enough off for it
     // to matter. Translation-only, every value below is exactly what the
-    // translation-only seeder produced.
+    // translation-only seeder produced. gm.theta_rad is the half-turn L0
+    // chose when the similarity is applied, so the log below reports 100 deg
+    // as 100, not as the spectrum's -80.
     seeding::SimilarityShift gm;
     {
         ScopedTimer t(timings.phase_corr);

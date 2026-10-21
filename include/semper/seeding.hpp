@@ -64,9 +64,11 @@ bool phase_correlate_roi(const PhaseCorrRef& ref, const cv::Mat& def,
  *
  * Convention matches the engine's shape function: the deformed image holds a
  * reference point p at c + s R(theta) (p - c) + t, with R(theta) =
- * [cos -sin; sin cos] in image axes (y down). |theta| < 90 deg: the magnitude
- * spectrum repeats every 180 deg, so a larger turn is reported modulo 180.
- * Pinned by SeedBench.LogPolarRotationScale.
+ * [cos -sin; sin cos] in image axes (y down). theta is in [-90, 90) deg: the
+ * magnitude spectrum repeats every 180 deg, so a larger turn is reported
+ * modulo 180, and phase_correlate_similarity decides between theta and
+ * theta + 180. Pinned by SeedBench.LogPolarRotationScale and
+ * SeedBench.AnchorSeedingHalfTurn.
  */
 bool log_polar_rotation_scale(const PhaseCorrRef& ref, const cv::Mat& def,
                               double& out_theta_rad, double& out_scale,
@@ -84,6 +86,8 @@ bool log_polar_rotation_scale(const PhaseCorrRef& ref, const cv::Mat& def,
  * returns, bit for bit -- the rotation model is used only when it moves the
  * ROI corners by more than tuning::kSimilarityMinCornerPx and the
  * rotation-corrected translation correlates better than the uncorrected one.
+ * The log-polar angle is ambiguous by 180 deg, so both theta and theta + 180
+ * are corrected for and the stronger corrected peak is used.
  */
 struct SimilarityShift {
     double u = 0.0, v = 0.0;          // displacement of (cx, cy)
@@ -96,7 +100,9 @@ struct SimilarityShift {
     // so a caller can fall back to exactly the translation-only seeds.
     double t_u = 0.0, t_v = 0.0, t_response = 0.0;
     bool t_locked = false;
-    // The log-polar estimate, reported whether or not it was used.
+    // The log-polar estimate, reported whether or not it was used. theta_rad
+    // is the turn the similarity uses when `similarity` is set, in
+    // (-180, 180) deg; otherwise the raw estimate, in [-90, 90).
     double theta_rad = 0.0, scale = 1.0, lp_response = 0.0;
     bool lp_ok = false;
 };

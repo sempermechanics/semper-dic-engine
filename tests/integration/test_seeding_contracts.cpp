@@ -163,6 +163,90 @@ TEST_CASE(SeedBench, AnchorSeedingRotationGate) {
 }
 
 // ---------------------------------------------------------------------------
+// Turns of 90 deg and beyond. The magnitude spectrum is point-symmetric, so the
+// log-polar peak gives theta only modulo 180 deg: 100 deg reads as -80, 135 as
+// -45, 179 as -1, and -90 as +90. Before L0 tried theta + 180 as well, each of
+// these seeded from the wrong half-turn and the solve returned kSeedFailed
+// (-5). The pixel-exact quarter turn (cv::rotate) puts the log-polar peak
+// exactly on the wrap of the angle axis, which a range check excluding +-90
+// threw away: the solve fell back to translation-only and returned no points.
+//
+// A node counts only if the solve returns it within 0.5 px of the truth, out
+// of the nodes the same solve returns at zero motion (the strain window drops
+// the outer ring), so a dropped node counts against the fraction.
+// ---------------------------------------------------------------------------
+TEST_CASE(SeedBench, AnchorSeedingHalfTurn) {
+    struct Turn { double deg; bool exact; };
+    const Turn turns[] = {
+        {90.0, true}, {90.0, false}, {-90.0, false}, {100.0, false},
+        {135.0, false}, {179.0, false}, {-120.0, false},
+    };
+
+    dictest::SpeckleField field(/*seed=*/11, W, H, BLOBS);
+    const Image ref = dictest::make_reference_image(field, W, H);
+    const cv::Mat ref_gray = dictest::gray8(ref, 0.0f, 101);
+    const FullFieldParams p = big_motion_params();
+    const cv::Rect roi(p.rect_x, p.rect_y, p.rect_w, p.rect_h);
+    const auto pre = Semper::seeding::prepare_phase_correlate_ref(ref_gray, roi);
+    REQUIRE(pre.lp_usable());
+
+    const int gridW = p.rect_w / p.step, gridH = p.rect_h / p.step;
+    std::vector<float> out((size_t)gridW * gridH * 8, 0.0f);
+    auto solve = [&](const cv::Mat &def_gray) {
+        ReferenceCache cache;
+        cv::Mat no_mask;
+        cache.set_from_gray(ref_gray, no_mask);
+        float metrics[19] = {};
+        return Semper::pipeline::run_full_field(cache, def_gray, no_mask, p, out.data(),
+                                                (int)out.size(), metrics, 19, nullptr);
+    };
+    const int nodes = solve(ref_gray);
+    REQUIRE(nodes > 0);
+
+    for (const Turn &c : turns) {
+        dictest::AffineDeformation d = rotation(c.deg);
+        cv::Mat def_gray;
+        if (c.exact) {
+            // cv::rotate turns about the centre of the pixel grid.
+            d.cx = d.cy = 0.5f * (float)(W - 1);
+            cv::rotate(ref_gray, def_gray, cv::ROTATE_90_CLOCKWISE);
+        } else {
+            def_gray = dictest::gray8(dictest::make_deformed_image(field, W, H, d), 0.0f, 202);
+        }
+        const TruthFn truth = affine_truth(d);
+
+        // L0: the half-turn is resolved, and the centre lands where it should.
+        Semper::seeding::SimilarityShift gm;
+        Semper::seeding::phase_correlate_similarity(pre, def_gray, gm);
+        const double got = gm.theta_rad * 180.0 / CV_PI;
+        const Truth tc = truth((float)gm.cx, (float)gm.cy);
+
+        const int rc = solve(def_gray);
+        int good = 0;
+        for (int i = 0; i < rc; ++i) {
+            const float *o = &out[(size_t)i * 8];
+            const Truth t = truth(o[0], o[1]);
+            if (std::hypot(o[2] - t.u, o[3] - t.v) <= 0.5f) good++;
+        }
+        const double frac = (double)good / (double)nodes;
+        std::printf("    %+7.1f deg%s -> L0 %+9.4f deg (lp resp %.3f, sim=%d), centre "
+                    "(%.3f, %.3f) truth (%.3f, %.3f); rc=%d, %d/%d within 0.5 px\n",
+                    c.deg, c.exact ? " exact" : "      ", got, gm.lp_response,
+                    gm.similarity ? 1 : 0, gm.u, gm.v, (double)tc.u, (double)tc.v, rc, good,
+                    nodes);
+
+        REQUIRE(gm.lp_ok);
+        CHECK(gm.similarity);
+        CHECK(gm.locked);
+        CHECK(std::abs(std::remainder(got - c.deg, 360.0)) <= 0.15);
+        CHECK_NEAR(gm.u, tc.u, 0.25);
+        CHECK_NEAR(gm.v, tc.v, 0.25);
+        REQUIRE(rc > 0);
+        CHECK(frac >= 0.95);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The similarity's failure mode, and its fallback. The log-polar estimate is
 // a rotation plus an isotropic scale; a strong uniaxial stretch is neither,
 // and IncBench found frames where it reported one anyway and the corrected
