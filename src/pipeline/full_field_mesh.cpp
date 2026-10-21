@@ -222,7 +222,16 @@ MeshGuessField build_mesh_guess_field(
     timings.extrapolate = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_extrap_start).count();
 
     auto t_smooth_start = std::chrono::high_resolution_clock::now();
-    auto smoothGrid = [&](std::vector<float> &grid, int radius) {
+    // Box average over the in-mesh neighbours. A displacement neighbour is first
+    // carried back to this node along its own gradients (d - J * offset), so an
+    // affine field passes through unchanged. A plain average would not: where
+    // the box is one-sided (the grid edge, the mesh edge) its centre sits up to
+    // a grid step inside, and the guess moves by gradient x step, about 10 px
+    // at a half turn, which is outside IC-GN's reach and costs a Simplex rescue.
+    // The gradient grids are averaged as they are (exact for affine fields).
+    const float stepf = (float)params.step;
+    auto smoothGrid = [&](std::vector<float> &grid, int radius,
+                          const std::vector<float> *gx, const std::vector<float> *gy) {
         std::vector<float> temp = grid;
         for (int y = 0; y < gridH; ++y) {
             for (int x = 0; x < gridW; ++x) {
@@ -231,14 +240,22 @@ MeshGuessField build_mesh_guess_field(
                 for (int dy = -radius; dy <= radius; ++dy) {
                     for (int dx = -radius; dx <= radius; ++dx) {
                         int ny = y + dy, nx = x + dx;
-                        if (nx >= 0 && nx < gridW && ny >= 0 && ny < gridH && guess.in_mesh[ny * gridW + nx]) { sum += temp[ny * gridW + nx]; count++; }
+                        if (nx >= 0 && nx < gridW && ny >= 0 && ny < gridH && guess.in_mesh[ny * gridW + nx]) {
+                            const int n = ny * gridW + nx;
+                            float val = temp[n];
+                            if (gx) val -= ((*gx)[n] * dx + (*gy)[n] * dy) * stepf;
+                            sum += val; count++;
+                        }
                     }
                 }
                 if (count > 0) grid[y * gridW + x] = sum / count;
             }
         }
     };
-    smoothGrid(guess.u, 2); smoothGrid(guess.v, 2); smoothGrid(guess.ux, 2); smoothGrid(guess.uy, 2); smoothGrid(guess.vx, 2); smoothGrid(guess.vy, 2);
+    // u and v first, while the gradient grids are still unsmoothed.
+    smoothGrid(guess.u, 2, &guess.ux, &guess.uy); smoothGrid(guess.v, 2, &guess.vx, &guess.vy);
+    smoothGrid(guess.ux, 2, nullptr, nullptr); smoothGrid(guess.uy, 2, nullptr, nullptr);
+    smoothGrid(guess.vx, 2, nullptr, nullptr); smoothGrid(guess.vy, 2, nullptr, nullptr);
     timings.smoothing = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_smooth_start).count();
 
     return guess;
