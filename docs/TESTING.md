@@ -363,6 +363,7 @@ Interpolation ladder + gradients + blur, validated via mathematical identities
 | `FastPathMatchesFullPrecompute` | `compute_hessian_only` + `precompute_subset_fast` ≡ full `precompute_subset`, byte for byte (v0.5.0: the full path is built from the other two); an invalid pool entry gives an uninitialized subset |
 | `LargeSubset_HinvFinite` | A 301 px subset is accepted and `H·H⁻¹ ≈ I` with a finite inverse | The conditioning test overflows with subset size again (the old `\|det H\|` did past ~170 px) |
 | `IllConditioned_Rejected` | Vertical stripes (2×2 check) and a pattern symmetric about the subset centre, which cannot see rotation, are rejected at 21 and 201 px. The second had `det H` of +1e9 to +8e16 and was accepted with a meaningless inverse before v0.5.0 | The 6×6 Hessian is no longer checked as a whole (`hessian::well_conditioned`, `tuning::kHessianMinRcond`) |
+| `Finite.FiniteBitsCatchesInfAndNan` | `util::finite_bits` is false for ±Inf and NaN and true for the largest finite value and a denormal, as `float` and as `double` | An Inf/NaN guard compiled under `-ffast-math` (where `std::isfinite` may fold to true) stops catching anything |
 | `EvenDimRejected` | An even, zero, one or negative `dim` gives an uninitialized subset from all three functions, even with a valid pool entry. Before v0.5.0 an even `dim` wrote `(dim+1)²` values into `dim²` buffers (heap overflow under ASan) |
 
 ## Suite: `Strain` — `unit/test_strain_calculator.cpp`
@@ -419,7 +420,7 @@ so a pixel-corrupting decode bug was invisible to the whole pipeline. OpenCV-gat
 | `EncodedColor_ConvertsToGray` | Encoded 3-channel image collapses to one channel | Colour images enter the solver as multi-channel garbage |
 | `EncodedNon8U_ConvertsTo8U` | 16-bit PNG is converted to `CV_8U` | Non-8U depth reaches the solver, which assumes 8-bit |
 | `Encoded16Bit_PreservesContrast` | A 12-bit ramp in a 16-bit PNG decodes to 0..255, strictly increasing | The depth conversion saturates again (before v0.5.0 the ramp came out nearly all 255) |
-| `FloatAndSigned_ScaledToGray8` | `to_gray8`: a [0, 1] float image spans 0..255, a flat one is 128, 8-bit gray passes through, colour collapses, empty stays empty | The one conversion every non-8-bit input goes through (decode, Python arrays) changed |
+| `FloatAndSigned_ScaledToGray8` | `to_gray8`: a [0, 1] float image spans 0..255, a flat one or one holding an Inf is 128, 8-bit gray passes through, colour collapses, empty stays empty | The one conversion every non-8-bit input goes through (decode, Python arrays) changed |
 | `EncodedWithRawLength_StillDecoded` | A PNG whose byte length equals `w*h` for the expected size is decoded as a PNG; a raw buffer that merely starts like a JPEG is still raw | Raw-vs-encoded is decided by length alone again |
 | `MismatchedLength_FallsThroughToEncoded` | `expected_w/h` set but `len` matching neither raw size → encoded path | A wrong-length raw buffer is misread as raw instead of decoded |
 | `NullAndEmpty_ReturnEmpty` | `nullptr` / `len == 0` → empty `cv::Mat`, no crash | Null-deref on a bad caller argument |
@@ -627,6 +628,7 @@ but keeps as Internal API:
 | `AnchorSeedingQualityGate` | Three of the seven sweep scenarios — 0.4 px translation, 0.5° rotation, 12 px translation — hold a global lock, route `FULL`, cover ≥ 90% of the ROI, and stay inside loose vertex- and gradient-error bounds | Seeding stopped working, rather than merely got slower |
 | `PublishAnchorResultsRespectsMedianTest` | `publish_anchor_results` writes only anchors that cleared the result gate *and* survived the universal median test, consumes one compute-order number per published point, and credits the thread that ran the IC-GN | A periodic-speckle blunder reaches the field and Path B floods from it — the failure the median test exists to prevent |
 | `AnchorLatticeSizing` | `plan_anchor_lattice` keeps the isotropic stride on a square ROI (64×64 → 289 anchors, the count the sweep reports), holds a 3-node floor on the short axis of a 1000×6 ROI without exceeding 2×`kAnchorTarget`, is symmetric under transpose, and returns an empty lattice for a degenerate grid | A long thin ROI — a beam, a weld seam — silently costs several times the intended seeding budget |
+| `PathCTriesNextNodeWhenCentreFails` | With no AKAZE lock and the deformed frame blanked under the node nearest the grid centre, Path C goes on to the next nearest nodes, seeds, and Path B solves the row (the solve used to return `kSeedFailed`) | Path C stakes the whole solve on one node again (`tuning::kPathCMaxCandidates`) |
 
 The gate's bounds are 3–5× the measured medians, each annotated in-file
 with the value it was set from. It is deliberately not a benchmark: it should
