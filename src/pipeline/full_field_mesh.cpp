@@ -42,7 +42,8 @@ MeshGuessField build_mesh_guess_field(
         const std::string& local_debug_dir,
         ResultGrid& resultGrid,
         std::vector<AffineTriangle>& affTriangles,
-        PhaseTimings& timings) {
+        PhaseTimings& timings,
+        const cv::Mat& homography) {
 
     MeshGuessField guess;
     guess.u.assign(gridW * gridH, globalU);
@@ -211,26 +212,68 @@ MeshGuessField build_mesh_guess_field(
     } else {
         LOGD("ROUTING: Mesh is SPARSE. Disabling extrapolation to prevent bad guesses.");
     }
-    timings.extrapolate = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_extrap_start).count();
+
+    // Nodes the mesh does not reach: guess from the global homography (its
+    // displacement and gradients at the node), so Path A solves them in
+    // parallel instead of leaving them to the flood fill. Path A rejects a bad
+    // guess as it would any other, and Path B still covers what it rejects.
+    if (homography.rows == 3 && homography.cols == 3) {
+        int assigned = 0;
+        for (int y = 0; y < gridH; ++y) {
+            for (int x = 0; x < gridW; ++x) {
+                const int idx = y * gridW + x;
+                if (guess.in_mesh[idx] || resultGrid[y][x].solved) continue;
+                const double gx = params.rect_x + (double)x * params.step;
+                const double gy = params.rect_y + (double)y * params.step;
+                double X, Y, J[4];
+                if (!seeding::homography_at(homography, gx, gy, X, Y, J)) continue;
+                guess.u[idx] = (float)(X - gx); guess.v[idx] = (float)(Y - gy);
+                guess.ux[idx] = (float)(J[0] - 1.0); guess.uy[idx] = (float)J[1];
+                guess.vx[idx] = (float)J[2]; guess.vy[idx] = (float)(J[3] - 1.0);
+                guess.in_mesh[idx] = true; resultGrid[y][x].mesh_assignment_type = kMeshHomography;
+                ++assigned;
+            }
+        }
+        if (assigned > 0) LOGD("ROUTING: %d nodes outside the mesh seeded from the homography", assigned);
+    }
+    timings.extrapolate =std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_extrap_start).count();
 
     auto t_smooth_start = std::chrono::high_resolution_clock::now();
-    auto smoothGrid = [&](std::vector<float> &grid, int radius) {
+    // Box average over the in-mesh neighbours. Where the box is one-sided (the
+    // grid edge, the mesh edge) its centroid sits up to a grid step inside the
+    // node, and a plain average of u/v moves the guess by gradient x offset:
+    // about 5 px at a quarter turn, outside IC-GN's reach, so the node costs a
+    // Simplex rescue. u/v are therefore carried from the centroid back to the
+    // node along the node's smoothed gradient (exact for an affine field). The
+    // smoothed gradient, not each neighbour's own: on a sparse mesh a few
+    // triangles carry wrong gradients, and a symmetric box (every interior
+    // node) has a zero centroid offset and keeps the plain average bit-exact.
+    const float stepf = (float)params.step;
+    auto smoothGrid = [&](std::vector<float> &grid, int radius,
+                          const std::vector<float> *gx, const std::vector<float> *gy) {
         std::vector<float> temp = grid;
         for (int y = 0; y < gridH; ++y) {
             for (int x = 0; x < gridW; ++x) {
-                if (!guess.in_mesh[y * gridW + x]) continue;
-                float sum = 0.0f; int count = 0;
+                const int idx = y * gridW + x;
+                if (!guess.in_mesh[idx]) continue;
+                float sum = 0.0f; int count = 0, sdx = 0, sdy = 0;
                 for (int dy = -radius; dy <= radius; ++dy) {
                     for (int dx = -radius; dx <= radius; ++dx) {
                         int ny = y + dy, nx = x + dx;
-                        if (nx >= 0 && nx < gridW && ny >= 0 && ny < gridH && guess.in_mesh[ny * gridW + nx]) { sum += temp[ny * gridW + nx]; count++; }
+                        if (nx >= 0 && nx < gridW && ny >= 0 && ny < gridH && guess.in_mesh[ny * gridW + nx]) { sum += temp[ny * gridW + nx]; count++; sdx += dx; sdy += dy; }
                     }
                 }
-                if (count > 0) grid[y * gridW + x] = sum / count;
+                if (count == 0) continue;
+                grid[idx] = sum / count;
+                if (gx && (sdx != 0 || sdy != 0))
+                    grid[idx] -= ((*gx)[idx] * sdx + (*gy)[idx] * sdy) * stepf / count;
             }
         }
     };
-    smoothGrid(guess.u, 2); smoothGrid(guess.v, 2); smoothGrid(guess.ux, 2); smoothGrid(guess.uy, 2); smoothGrid(guess.vx, 2); smoothGrid(guess.vy, 2);
+    // Gradients first: u and v are carried along the smoothed ones.
+    smoothGrid(guess.ux, 2, nullptr, nullptr); smoothGrid(guess.uy, 2, nullptr, nullptr);
+    smoothGrid(guess.vx, 2, nullptr, nullptr); smoothGrid(guess.vy, 2, nullptr, nullptr);
+    smoothGrid(guess.u, 2, &guess.ux, &guess.uy); smoothGrid(guess.v, 2, &guess.vx, &guess.vy);
     timings.smoothing = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_smooth_start).count();
 
     return guess;

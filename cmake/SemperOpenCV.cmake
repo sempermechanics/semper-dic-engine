@@ -11,14 +11,41 @@ foreach(_stub doc data)
     endif()
 endforeach()
 
-# The engine needs core/imgproc/imgcodecs only. features2d, flann and calib3d
-# went out with the descriptor seeding front-end (they served AKAZE, BFMatcher
-# and one cv::findHomography call); dropping them takes ~29% off the aarch64
-# libsemper_c.so. Overridable so the cost can be re-measured.
-set(SEMPER_OPENCV_BUILD_LIST "core,imgproc,imgcodecs"
-    CACHE STRING "OpenCV modules compiled from source")
-set(BUILD_LIST "${SEMPER_OPENCV_BUILD_LIST}" CACHE STRING "" FORCE)
+# Modules semper_pipeline links (keep in sync with CMakeLists.txt).
+# features2d (AKAZE, BFMatcher), calib3d (findHomography) and flann (a
+# features2d dependency) serve the AKAZE global-motion front end; core, imgproc
+# and imgcodecs the rest. v0.5.0 built without the first three, ~29% smaller
+# on aarch64.
+set(SEMPER_OPENCV_REQUIRED_MODULES core imgproc imgcodecs features2d calib3d flann)
+
+# SEMPER_OPENCV_BUILD_LIST adds modules on top of the required ones; it can't
+# remove them. Until v0.6.0 it was the whole list, and build trees configured
+# by v0.3.0-v0.5.x cache it as core,imgproc,imgcodecs: replacing BUILD_LIST
+# with it dropped features2d/calib3d/flann and failed the link.
+set(SEMPER_OPENCV_BUILD_LIST ""
+    CACHE STRING "Extra OpenCV modules to compile (comma-separated), beyond the ones the engine links")
+string(REPLACE "," ";" _semper_cv_modules "${SEMPER_OPENCV_BUILD_LIST}")
+list(TRANSFORM _semper_cv_modules STRIP)
+list(PREPEND _semper_cv_modules ${SEMPER_OPENCV_REQUIRED_MODULES})
+list(FILTER _semper_cv_modules EXCLUDE REGEX "^$")
+list(REMOVE_DUPLICATES _semper_cv_modules)
+string(REPLACE ";" "," _semper_cv_modules "${_semper_cv_modules}")
+set(BUILD_LIST "${_semper_cv_modules}" CACHE STRING "" FORCE)
+message(STATUS "Semper: OpenCV BUILD_LIST=${BUILD_LIST}")
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+
+# Call after add_subdirectory(OpenCV): a required module that OpenCV still
+# skipped (e.g. a cached BUILD_opencv_<module>=OFF) fails here, not at link.
+function(semper_check_opencv_modules)
+    foreach(_m IN LISTS SEMPER_OPENCV_REQUIRED_MODULES)
+        if(NOT TARGET opencv_${_m})
+            message(FATAL_ERROR
+                "OpenCV module '${_m}' was not configured, but the engine links "
+                "opencv_${_m}. BUILD_LIST=${BUILD_LIST}. Check the cache for "
+                "BUILD_opencv_${_m}=OFF, or configure a fresh build directory.")
+        endif()
+    endforeach()
+endfunction()
 
 # Python extensions (and most host toolchains) use the dynamic CRT (/MD). OpenCV's
 # default static CRT (/MT) on MSVC then fails with LNK2038 at link time.

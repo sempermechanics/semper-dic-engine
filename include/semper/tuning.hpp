@@ -57,6 +57,31 @@ inline constexpr int kAnchorFullMinVertices = 10;
 /** Anchor-lattice seeding: convex-hull coverage of the ROI for a FULL mesh. */
 inline constexpr float kAnchorFullCoverage = 0.30f;
 
+/** AKAZE global-motion front end. Detection runs on the ROI padded by
+ *  kAkazePadPx / scale (so features just outside a small ROI still vote), at
+ *  0.25x, then 0.5x, then 1x, stopping at the first scale with
+ *  kAkazeGoodInliers RANSAC inliers; failing that, the scale with the most
+ *  inliers is used if it has kAkazeMinInliers. Once a batch has escalated it
+ *  starts at that scale for the rest of the reference. */
+inline constexpr double kAkazeScales[] = {0.25, 0.5, 1.0};
+inline constexpr double kAkazePadPx = 40.0;
+inline constexpr float kAkazeRatio = 0.75f;          // Lowe's ratio test
+inline constexpr double kAkazeRansacPx = 3.0;        // at the detection scale
+inline constexpr int kAkazeGoodInliers = 25;
+inline constexpr int kAkazeMinInliers = 10;
+
+/** Incremental DIC hands the deformed frame's AKAZE features to the next
+ *  reference instead of detecting them again, if the rect they were detected
+ *  over covers at least this fraction of the new padded rect. */
+inline constexpr double kAkazeReuseCover = 0.90;
+
+/** Refit of the global homography to the kept anchors (full-scale px). The
+ *  anchors are good to ~0.01 px where the keypoints were good to the RANSAC
+ *  tolerance at the detection scale; the refit is what nodes outside the mesh
+ *  start from. Needs this many kept anchors. */
+inline constexpr double kAnchorRefitRansacPx = 1.0;
+inline constexpr int kAnchorRefitMinPoints = 8;
+
 /** Phase-correlation peak response below which the global shift is not trusted. */
 inline constexpr float kPhaseCorrMinResponse = 0.05f;
 
@@ -70,22 +95,23 @@ inline constexpr float kLogPolarMinResponse = 0.05f;
 inline constexpr int kLogPolarMinSide = 64;
 inline constexpr int kLogPolarMaxSide = 512;
 
-/** Seed anchors with the rotation/scale model only when it moves the ROI
- *  corners by more than this (px) relative to the bare translation. Below it,
+/** Seed anchors with the full global model (the AKAZE homography; formerly
+ *  the log-polar similarity) only when it moves the ROI corners by more than
+ *  this (px) relative to its own translation at the ROI centre. Below it,
  *  IC-GN pulls in from the translation alone and seeding stays bit-identical
  *  to the translation-only path. Set above the 2.8 px the FullFieldGolden
  *  affine scenario implies, and below the ~8 px at which 2 deg on a 320 px
  *  ROI already costs CPU (docs/SEEDING_BENCHMARK.md 4.5). */
 inline constexpr float kSimilarityMinCornerPx = 4.0f;
 
-/** The similarity is trusted only if the anchor lattice it seeds routes FULL
- *  and keeps at least this fraction of its attempted anchors; otherwise the
- *  lattice is solved again from the translation alone and that one is used.
- *  The log-polar estimate is a similarity; under strong anisotropic stretch it
- *  can report a rotation that is not there (IncBench S5/S9: about 90 deg with
- *  noise, -5.8 deg x 0.92 without), and the lattice it seeds can then hold a
- *  self-consistent cluster of wrong anchors that no gate catches. Rotations
- *  the similarity fits keep ~100%. */
+/** The global model is trusted only if the anchor lattice it seeds routes
+ *  FULL and keeps at least this fraction of its attempted anchors; otherwise
+ *  the lattice is solved again from the translation alone and that one is
+ *  used. Written for the log-polar similarity, which under strong anisotropic
+ *  stretch could report a rotation that is not there (IncBench S5/S9: about
+ *  90 deg with noise, -5.8 deg x 0.92 without); the lattice such a model seeds
+ *  can hold a self-consistent cluster of wrong anchors that no gate catches.
+ *  A homography fits stretch, and a model that fits keeps ~100%. */
 inline constexpr float kSimilarityKeepFraction = 0.90f;
 
 /** Ghost Wall: value stamped into reference pixels outside the ROI mask

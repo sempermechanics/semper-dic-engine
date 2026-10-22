@@ -5,17 +5,101 @@ Versions follow [docs/CONTRACT.md](docs/CONTRACT.md) §A.1. Entries before
 
 ## Unreleased
 
-Patch: Internal only, no surface change.
+Patch: Internal only, no surface change; the field does not move.
 
 ### Fixed
-- A frame turned 90 deg or more against the reference seeds again. The
-  log-polar estimate gives the angle modulo 180 deg, and L0 never tried
-  theta + 180: from 90.5 to 180 deg the solve returned `kSeedFailed` (`-5`),
-  and an exact 90 deg could be dropped by a range check and return no points.
-  L0 now undoes both theta and theta + 180 and keeps the stronger corrected
-  translation peak; a turn near 90 deg is re-correlated off the wrap of the
-  angle axis. Cost: one more warp and ROI phase correlation per solve.
-  Translation-only and small-rotation seeds are unchanged.
+- `seeding::phase_correlate_similarity` (Internal) no longer reads a turn of
+  90 deg or more as the wrong half-turn. The log-polar estimate gives the
+  angle modulo 180 deg; the function now undoes both theta and theta + 180
+  and keeps the stronger corrected translation peak, and
+  `log_polar_rotation_scale` re-correlates a turn near 90 deg off the wrap of
+  the angle axis instead of rejecting it. Since 0.6.0 the anchor lattice is
+  seeded from AKAZE and no solve calls either function, so seeding, the
+  field and the timings are unchanged.
+
+## 0.6.1
+
+Patch: no surface change. The field moves only where 0.6.0 kept an anchor
+the median test could not check; the build no longer depends on a fresh
+CMake cache.
+
+### Fixed — seeding
+- An anchor the lattice median test cannot check (fewer than three converged
+  neighbours) is no longer kept as a mesh vertex or published; Path A or B
+  solves its node. It used to be kept on its ZNSSD alone. On the real PMMA
+  3-point bend (material_testing `real_data_pmma_bending`), v0.6.0's
+  translation-only fallback kept such anchors under the load nose on frames
+  24–29. They were ~20 px off at ZNSSD 0.17–0.30, and Path A followed them
+  onto the wrong speckle. The outlier filter then dropped up to 3,861 of the
+  9,431 deflection-probe points, and the deflection there read up to 1.5%
+  low. Now 91 points are missing on one frame. The deflection RMSE
+  (0.0080 mm) and E from the graph (2.002 GPa) match v0.4.2 again, and steel
+  tensile is unchanged.
+
+### Build
+- The OpenCV modules the engine links (`core,imgproc,imgcodecs,features2d,
+  calib3d,flann`) are always compiled. `SEMPER_OPENCV_BUILD_LIST` now names
+  extra modules only (empty by default) and is merged in. A build tree
+  configured by v0.3.0–v0.5.x caches it as `core,imgproc,imgcodecs`, and
+  with v0.6.0 that dropped `features2d`/`calib3d`/`flann` and failed the link
+  (`-lopencv_features2d`). A required module that still has no target now
+  fails at configure time.
+
+## 0.6.0
+
+Minor: a new capability, no surface change. Every signature, Frozen value,
+slot index and the packing are unchanged; the field moves.
+
+### Changed — seeding
+- The anchor lattice is seeded from an **AKAZE + RANSAC homography** instead
+  of phase correlation and the log-polar similarity. AKAZE runs over the
+  ROI padded by 40 px, at the coarsest of 0.25x / 0.5x / 1x that gives 25
+  inliers (else the best scale with 10). The lattice, its median test, the
+  fallback to a translation-only lattice when the model's lattice is weak,
+  and Paths A/B/C are as before; without a model the lattice searches for
+  its own offsets, as v0.5.0 did without a phase lock.
+- A homography has no 180° ambiguity and does not read stretch as rotation:
+  rotation past 90° and large stretch now seed the mesh. Fixed reference,
+  300 px ROI: 95–180° goes from 0% to 100% coverage; 15% stretch + 15° is up
+  to 17x faster on large ROIs (SEEDING_BENCHMARK §11).
+- The homography is refitted to the converged anchors and seeds the nodes
+  the mesh does not reach, solved with plain IC-GN.
+- `ReferenceCache` keeps the reference's AKAZE keypoints per scale and the
+  scale the last solve settled on. `IncrementalSession` hands the deformed
+  frame's keypoints to the next reference, so a reference is detected once.
+- Metrics slot 21 reports the global-motion (AKAZE) lock; slot 10 is AKAZE
+  plus the anchor lattice (CONTRACT §A.4).
+- Incremental: rotation to 180° at 4.5°/frame with N = 5 on 60–80 px ROIs
+  keeps every node (v0.5.0 lost all of them); elsewhere accuracy is identical
+  and time per frame is 0.45–1.11x v0.5.0's, faster on most ROIs. The one
+  cost: a cheap small-ROI frame pays ~1.5–3 ms for AKAZE, 1–10% on the
+  tensile video's run total. Sample 14 unchanged (≤ 0.00008 px).
+
+### Build
+- OpenCV `features2d`, `calib3d` and `flann` are back in
+  `SEMPER_OPENCV_BUILD_LIST`: the stripped x86-64 Python extension grows from
+  12.30 MB to 14.32 MB (+16%).
+- AKAZE runs without waking OpenCV's thread pool, whose spinning workers
+  otherwise slowed the engine's next OpenMP region (host builds; Android pins
+  OpenCV to one thread).
+- OpenCV 4.13.0 → **4.14.0** (submodule `0654a42e`). Its `core` and
+  `imgproc` grew upstream: the stripped x86-64 Python extension is 15.58 MB
+  (14.32 MB on 4.13; v0.5.0 12.30 MB). Results and timing unchanged (all 171
+  host tests, 16 Python tests). OpenCV 5.0 was not taken: it moves AKAZE out
+  of the main repository into opencv_contrib.
+- The deprecated `cv::Mat_ << ...` comma initialiser (a `-Werror` failure on
+  4.14) is replaced by `cv::Matx`.
+- Eigen stays at 5.0.1, the latest release. CI actions: `checkout` v7,
+  `cache` v6, `setup-python` v7, `upload-artifact` v7 (Node 24 runtime).
+  Python build requires `pybind11>=3.0` (built and tested with 3.1.0).
+
+### Fixed
+- The mesh guess field's 5x5 smoothing moved nodes on the grid or mesh edge
+  by gradient x offset (about 5 px at a quarter turn), outside IC-GN's reach,
+  so every outer-ring node went to a Simplex rescue under large rotation.
+  u/v are now carried back to the node along the smoothed gradient; interior
+  nodes are unchanged bit for bit. 45-90 deg: Simplex rescues 1-83 -> 0,
+  field CPU 1.3-5x lower, accuracy unchanged. `FullFieldGolden` re-captured.
 
 ## 0.5.0
 

@@ -274,7 +274,7 @@ noise-free frame the field went from 0.014 to 0.215 px rms, and with noise
 frames were lost outright: 27 against 14 dropped in the ring-mask scenario.
 Counting kept anchors cannot pick the better lattice, since the bad one keeps
 more (123 against 86). Only a lattice that keeps nearly everything shows that
-the model fits. `SeedBench.SimilarityFallsBackUnderStretch` pins that frame:
+the model fits. `SeedBench.SimilarityFallsBackUnderStretch` pinned that frame until v0.6.0 (now `SeedBench.StretchSeedsWithoutBlunders`, §11):
 0.2150 px with the condition disabled, 0.0137 px with it.
 
 **Measured** on Ubuntu 22.04 (WSL2), GCC 11.4, `taskset -c 0-3`,
@@ -669,13 +669,102 @@ Seven gates now run unconditionally (four since 0.3.0, three since the rotation 
   10 deg + 5% + 20 px rows of LargeMotionSweep: similarity applied, `FULL`, hull
   coverage ≥ 0.90, mesh fraction ≥ 0.95, vertex error ≤ 0.05 px.
 - `SeedBench.AnchorSeedingHalfTurn` pins §4.5.2: a pixel-exact quarter turn,
-  ±90, 100, 135, 179 and −120 deg each resolve to the right half-turn at L0
-  (≤ 0.15 deg, ≤ 0.25 px at the centre), and ≥ 95% of the nodes come back
-  within 0.5 px. 0.5.0 returned −5 for all but the two +90 deg cases.
-- `SeedBench.SimilarityFallsBackUnderStretch` pins the fallback of §4.5.1 on
+  ±90, 100, 135, 179 and −120 deg each resolve to the right half-turn in the
+  log-polar similarity (≤ 0.15 deg, ≤ 0.25 px at the centre), and ≥ 95% of
+  the nodes come back within 0.5 px. 0.5.0 returned −5 for all but the two
+  +90 deg cases. Since v0.6.0 the solve seeds from AKAZE, so the node check
+  covers the homography and the angle check the similarity alone.
+- `SeedBench.SimilarityFallsBackUnderStretch` pinned the fallback of §4.5.1 on
   the IncBench frame that exposed it: the similarity is rejected and the field
-  stays at the translation-only 0.014 px, not 0.215 px.
+  stayed at the translation-only 0.014 px, not 0.215 px. Since v0.6.0 it is
+  `StretchSeedsWithoutBlunders`: AKAZE finds no model on that frame, and the
+  test bounds the p95 vertex error and the field instead.
 
 Verified by perturbing the anchor stride by one in
 `src/pipeline/full_field_anchors.cpp`: the golden reports slots 3, 8, 19 and 22
 moved and fails. See `docs/TESTING.md` for both suites.
+
+## 11. v0.6.0: the AKAZE homography as the global model
+
+v0.6.0 replaces the L0 of §4.5.1 (phase correlation plus the log-polar
+similarity) with an AKAZE + RANSAC homography (MATHEMATICS §8.1.2). The anchor
+lattice, its median test and the weak-lattice fallback are unchanged. The
+acceptance run compared v0.5.0 with v0.6.0 on the same inputs.
+
+**Method.** Ubuntu 22.04 (WSL2), GCC 11.4, 20 logical CPUs,
+`OMP_NUM_THREADS=8`, Python bindings, 3 interleaved rounds. Accuracy comes from
+round 1; both builds were checked to be deterministic across rounds. Time is the
+median over rounds, and for incremental runs the per-frame best of the rounds,
+then the median. Synthetic frames are exact speckle at 2 GL noise; a node is
+correct within 0.5 px of the truth. The host had an Android emulator running,
+so single timings vary by about ±15%; read ratios near 1 as equal.
+
+**Fixed reference, 300 px ROI, subset 41, step 5** (3136 nodes):
+
+| Motion | Coverage v0.5.0 / v0.6.0 | RMS px v0.5.0 / v0.6.0 | Median ms v0.5.0 / v0.6.0 |
+|---|---|---|---|
+| Sub-pixel shift (11 cases) | 100% / 100% | 0.0087 / 0.0087 | 69 / 71 |
+| Pixel shift to 20 px (10) | 100% / 100% | 0.0078 / 0.0078 | 73 / 71 |
+| Rotation 5–45° (9) | 100% / 100% | 0.0077 / 0.0077 | 76 / 71 |
+| Rotation 50–90° (9) | 100% / 100% | 0.0077 / 0.0077 | 90 / 67 |
+| Rotation 95–180° (11) | **0% / 100%** | — / 0.0076 | — |
+| First solve on a new reference | | | 84 / 91 |
+
+No wrong nodes in either build. v0.5.0 recovers no node past 90°, because its
+log-polar estimate reads θ and θ ± 180° alike.
+
+**ROI size sweep, fixed reference, subset 21, step 3, 6×6** (steady-state ms,
+v0.5.0 / v0.6.0; coverage 100% and RMS equal to 4 decimals in every cell):
+
+| ROI (px) | Shift (20, 10) px | Rotation 30° | Stretch 15% + rotation 15° |
+|---|---|---|---|
+| 60 | 36 / 40 | 80 / 42 | 123 / 43 |
+| 80 | 45 / 52 | 138 / 46 | 100 / 46 |
+| 120 | 56 / 54 | 53 / 53 | 66 / 57 |
+| 160 | 58 / 53 | 59 / 55 | 332 / 64 |
+| 240 | 74 / 69 | 69 / 70 | 558 / 63 |
+| 320 | 88 / 93 | 87 / 81 | 1463 / 83 |
+
+Under stretch v0.5.0's similarity misfired, its lattice was rejected, and the
+translation-only lattice left most nodes to the Simplex rescue. The homography
+describes the stretch, and the lattice seeded from it is kept.
+
+**Incremental, `IncrementalSession`, 40 frames, subset 21, step 3, 6×6.**
+Accuracy at frame 40 is identical in every cell where both builds track, with no
+wrong nodes. Two cells differ in coverage: rotation to 180° at 4.5° per frame
+with N = 5 on 60 and 80 px ROIs. v0.5.0 loses every node there and v0.6.0
+keeps all of them (256/441 and 484/729, RMS 0.029 and 0.026 px). Time per frame,
+v0.6.0 / v0.5.0:
+
+| ROI (px) | Stretch to 30% + 30°, N = 1 / 5 | Rotation to 180°, N = 1 / 5 |
+|---|---|---|
+| 60 | 0.51 / 0.45 | 0.77 / (v0.5.0 lost) |
+| 80 | 1.11 / 0.94 | 0.78 / (v0.5.0 lost) |
+| 120 | 1.05 / 0.87 | 0.98 / 0.79 |
+| 160 | 0.90 / 0.89 | 0.74 / 0.98 |
+| 240 | 0.88 / 0.82 | 0.82 / 0.77 |
+| 320 | 0.86 / 0.73 | 0.82 / 0.74 |
+
+**Tensile video** (real, about 730 frames, app ROI 80 × 72 and a taller 80 × 104):
+
+| ROI, N | ms/frame v0.5.0 / v0.6.0 | Total s v0.5.0 / v0.6.0 | Nodes alive at the end v0.5.0 / v0.6.0 |
+|---|---|---|---|
+| app, 1 | 21.9 / 22.1 | 16.1 / 16.8 | 428 / 423 of 675 |
+| app, 10 | 10.4 / 13.2 | 10.3 / 11.3 | 405 / 405 |
+| tall, 1 | 26.0 / 27.8 | 18.9 / 20.0 | 657 / 657 of 945 |
+| tall, 10 | 16.9 / 17.0 | 14.3 / 14.9 | 599 / 599 |
+
+This is the one place v0.6.0 costs time: 1–10% on the run total. On an 80 px
+ROI the coarse scales find too few inliers, so AKAZE runs at 1× on every
+frame, about 1.5–3 ms. Phase correlation cost a fraction of a millisecond, and
+between reference updates a frame here takes only about 10 ms.
+
+**DIC Challenge Sample 14** (sinusoid of rising frequency, L1/L3/L5, subsets
+21/31/41, 4×4 and 6×6): the two builds' u fields differ by at most 0.00008 px
+on the line cut, and every Challenge metric matches.
+
+**Thread pool.** Before AKAZE was kept off OpenCV's thread pool (ARCHITECTURE,
+*OpenCV threads*), the first run of this comparison measured 7–19% slower
+small-ROI incremental frames. The cause was OpenCV's idle workers spinning into
+the engine's OpenMP region. The early, near-static video frames took 31 ms
+instead of v0.5.0's 10 ms. The tables above are from after the fix.

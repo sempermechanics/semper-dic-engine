@@ -105,12 +105,12 @@ int run_path_c(
 
     Semper::SubsetData seed_subset;
     // The same engine configuration as every other solve (it used to leave
-    // LM damping off). Seed the search from the phase-correlation shift when
+    // LM damping off). Seed the search from the global model's shift when
     // there is one: INIT_AUTO_SEARCH honours a non-zero guess and otherwise
     // falls back to its own +/-15 px scan, so passing the global shift both
     // starts Path C closer and extends its reach past that scan window.
     // globalU/globalV are overwritten below only on success, so a failure
-    // leaves the phase-correlation values intact for Path B.
+    // leaves the global model's values intact for Path B.
     OptimizationEngine seed_engine = make_engine(params.use_6x6_interpolator);
     const float guess[6] = {globalU, globalV, 0.0f, 0.0f, 0.0f, 0.0f};
     const NodeSolve node = solve_node(seed_engine, seed_subset, *ctx.cache.ref_img, ctx.def_img,

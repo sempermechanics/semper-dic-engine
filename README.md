@@ -58,7 +58,10 @@ for frame in frames[1:]:
     print(res.info["reference_frame"], res.info["tracked_points"])
 ```
 
-`update_interval=0` is the fixed reference. On small or moderate deformation
+`update_interval=0` is the fixed reference. Since v0.6.0 the solve is seeded
+from an AKAZE homography, so a fixed reference also handles rotation at any
+angle and moderate stretch; incremental is for deformation the image texture
+itself no longer survives (large strain). On small or moderate deformation
 the fixed reference is more accurate, because every reference update adds a
 little interpolation bias; see
 [docs/INCREMENTAL_BENCHMARK.md](docs/INCREMENTAL_BENCHMARK.md). C++:

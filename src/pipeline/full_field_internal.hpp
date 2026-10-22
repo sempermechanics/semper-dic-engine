@@ -131,6 +131,7 @@ enum MeshAssign : int {
     kMeshInTriangle   = 1,
     kMeshExtrapolated = 2,  // just outside a triangle
     kMeshAnchor       = 3,
+    kMeshHomography   = 4,  // outside the mesh; guessed from the global homography
 };
 
 // GridPoint keeps a bare bool `solved` rather than a richer state enum so the
@@ -172,10 +173,18 @@ struct RefPrecompute {
     int total_valid_points = 0;
     HessianPool hessian_pool;
 
-    // Reference side of the L0 phase correlation: keyed on the ROI rect.
-    bool phase_valid = false;
-    cv::Rect phase_roi;
-    seeding::PhaseCorrRef phase_ref;
+    // Reference side of the L0 AKAZE matching, one entry per detection scale
+    // (tuning::kAkazeScales; an entry with no keypoints is not detected yet),
+    // keyed on the ROI rect they are padded from. Once a solve has had to
+    // escalate past a scale, later solves against this reference start at the
+    // scale it settled on: the coarser ones will not have changed.
+    cv::Rect akaze_roi;
+    std::vector<seeding::AkazeRef> akaze_refs;
+    int akaze_first_level = 0;
+    // Features detected on this reference while it was the previous solve's
+    // deformed frame (incremental DIC); used in place of a fresh detection at
+    // their scale when they cover the ROI (seeding::reuse_akaze_ref).
+    seeding::AkazeRef akaze_handover;
 
     bool grid_matches(const FullFieldParams &p, const cv::Mat &mask) const;
 };
@@ -194,6 +203,9 @@ struct FieldCapture {
     bool keep_deformed = false;
     std::unique_ptr<Image> deformed;
     cv::Mat deformed_gray;
+    // With keep_deformed: the deformed frame's AKAZE features from the scale
+    // the model came from, for the next reference to reuse (empty if none).
+    seeding::AkazeRef akaze_deformed;
 };
 
 // The one place solve parameters are checked, for run_full_field and
@@ -258,9 +270,9 @@ struct SolveContext {
 
 // Per-phase wall clock, aggregated for the profiling log and the metrics array.
 struct PhaseTimings {
-    // `anchors` and `phase_corr` were `akaze` and `ransac`; they feed the same
-    // Frozen metrics[10] slot, whose meaning is now "seeding time (ms)".
-    double img_prep = 0, anchors = 0, phase_corr = 0, delaunay = 0, contour_assign = 0;
+    // `akaze` (matching + RANSAC) and `anchors` (the lattice) together feed the
+    // Frozen metrics[10] slot, "seeding time (ms)".
+    double img_prep = 0, anchors = 0, akaze = 0, delaunay = 0, contour_assign = 0;
     double extrapolate = 0, smoothing = 0, prepass = 0, pathA = 0, pathB = 0;
     double strain = 0, total = 0;
 };
@@ -355,8 +367,9 @@ struct AnchorResult {
     bool kept = false;     // and survived the median test
 };
 
-// Outcome of the anchor lattice: the mesh vertices it produced, how well they
-// cover the ROI, and the median rigid shift.
+// Outcome of the seeding: the AKAZE global model, the mesh vertices the anchor
+// lattice produced from it, how well they cover the ROI, and the median rigid
+// shift.
 //
 // The anchors are grid nodes, so they reuse the Hessian pool and the ones that
 // clear the strict gate are final for those nodes — Path A skips them and Path B
@@ -380,15 +393,27 @@ struct MeshSeedResult {
     int attempted = 0;
     int accepted = 0;      // kept as mesh vertices
     int solved = 0;        // also good enough to publish as output points
-    bool phase_locked = false;
-    // Whether the anchors were seeded with the log-polar rotation/scale as
-    // well as the shift, and that estimate (reported even when not applied).
-    // similarity_rejected: the similarity was tried, its lattice came out
-    // weak, and the translation-only lattice re-solved after it was used.
-    bool similarity = false;
-    bool similarity_rejected = false;
+    // AKAZE found a global model (metrics slot 21). Without one the lattice
+    // starts from zero and each anchor searches for its own offset.
+    bool locked = false;
+    int matches = 0;            // RANSAC inliers behind the model
+    float akaze_scale = 0.0f;   // detection scale they came from
+    // Whether the anchors were seeded with the full homography rather than its
+    // translation at the ROI centre. model_rejected: the homography was tried,
+    // its lattice came out weak, and the translation-only lattice re-solved
+    // after it was used.
+    bool model = false;
+    bool model_rejected = false;
+    // The model's rotation and isotropic scale at the ROI centre (reported
+    // whether or not the model was applied).
     float rotation_deg = 0.0f;
     float scale = 1.0f;
+    // Global homography, reference -> deformed, full-image coordinates: the
+    // AKAZE fit refitted to the kept anchors when there are enough of them.
+    // Seeds the nodes the mesh does not reach. Empty without a model.
+    cv::Mat homography;
+    // The deformed frame's features at the model's scale (FieldCapture).
+    seeding::AkazeRef def_features;
 };
 
 // Per-axis sizing of the anchor lattice. Exposed rather than kept private in
@@ -403,11 +428,28 @@ struct AnchorLattice {
 
 AnchorLattice plan_anchor_lattice(int gridW, int gridH);
 
-// Solves the lattice. Takes resultGrid as const: it reads the pre-set `solved`
-// flags to skip masked and boundary-rejected nodes, and writes nothing.
+// Universal median test (Westerweel & Scarano) over the solved lattice: sets
+// `kept` on each vertex whose residual (res_u, res_v; one entry per lattice
+// node, row-major, LW x LH, as `anchors`) is within kAnchorMedianTol of the
+// median of its vertex 8-neighbours'. A global affine or homography fit would
+// be the wrong model: under a real strain field the displacements are not
+// affine, so a global fit rejects signal. The 8-neighbourhood median assumes
+// no field shape, and the lattice makes the lookup O(1). A vertex with fewer
+// than three vertex neighbours cannot be tested and is not kept. Exposed, like
+// plan_anchor_lattice, so the rule can be checked without staging a
+// real-speckle blunder.
+void mark_kept_anchors(std::vector<AnchorResult> &anchors, int LW, int LH,
+                       const std::vector<float> &res_u, const std::vector<float> &res_v);
+
+// Matches AKAZE features for the global model, then solves the lattice from
+// it. Takes resultGrid as const: it reads the pre-set `solved` flags to skip
+// masked and boundary-rejected nodes, and writes nothing. roiMask is the
+// full-size mask (empty for none); matches on masked reference pixels are
+// dropped.
 MeshSeedResult solve_anchor_seeds(
         ReferenceCache &cache,
         const cv::Mat &defMat,
+        const cv::Mat &roiMask,
         const Image &def_img,
         const FullFieldParams &params,
         int gridW,
@@ -449,7 +491,8 @@ MeshGuessField build_mesh_guess_field(
         const std::string &debug_dir,
         ResultGrid &resultGrid,
         std::vector<AffineTriangle> &affTriangles,
-        PhaseTimings &timings);
+        PhaseTimings &timings,
+        const cv::Mat &homography = cv::Mat());
 
 void run_path_a(
         const SolveContext &ctx,

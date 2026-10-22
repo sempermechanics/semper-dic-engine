@@ -178,7 +178,7 @@ TEST_CASE(IncrementalMath, Anchor_MatchesTheNodeWhereItMoved) {
     // (a cubic sub-pixel warp of it is off by ~0.05 px); the node's sub-pixel
     // offset from its anchor pixel is still exercised.
     const float tx = 12.0f, ty = -7.0f;
-    const cv::Mat M = (cv::Mat_<double>(2, 3) << 1, 0, tx, 0, 1, ty);
+    const cv::Mat M(cv::Matx23d(1, 0, tx, 0, 1, ty));
     cv::Mat def;
     cv::warpAffine(ref, def, M, ref.size(), cv::INTER_CUBIC, cv::BORDER_REFLECT);
     Semper::Image img(def.cols, def.rows, def.data);

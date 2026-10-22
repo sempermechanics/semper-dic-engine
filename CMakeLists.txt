@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.22)
 # Version tracks include/semper/version.hpp (keep the two in sync).
 # C is required: vendored OpenCV and the C ABI smoke binary compile C sources.
-project(semper VERSION 0.5.0 LANGUAGES C CXX)
+project(semper VERSION 0.6.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -21,12 +21,16 @@ endif()
 
 include(SemperOpenCV)
 add_subdirectory(${OPENCV_SRC_DIR} ${CMAKE_BINARY_DIR}/opencv_build EXCLUDE_FROM_ALL)
+semper_check_opencv_modules()
 
 set(SEMPER_OPENCV_INCLUDE_DIRS
         ${OPENCV_SRC_DIR}/include
         ${OPENCV_SRC_DIR}/modules/core/include
         ${OPENCV_SRC_DIR}/modules/imgproc/include
         ${OPENCV_SRC_DIR}/modules/imgcodecs/include
+        ${OPENCV_SRC_DIR}/modules/features2d/include
+        ${OPENCV_SRC_DIR}/modules/calib3d/include
+        ${OPENCV_SRC_DIR}/modules/flann/include
         ${CMAKE_BINARY_DIR}
 )
 
@@ -71,6 +75,7 @@ endif()
 # ---------------------------------------------------------------------------
 add_library(semper_pipeline STATIC
         src/io/image_codec.cpp
+        src/pipeline/akaze_features.cpp
         src/pipeline/phase_correlate.cpp
         src/pipeline/reference_cache.cpp
         src/pipeline/cancel.cpp
@@ -95,12 +100,16 @@ target_include_directories(semper_pipeline SYSTEM PUBLIC
             ${SEMPER_OPENCV_INCLUDE_DIRS}
             ${EIGEN_SRC_DIR}
 )
+# OpenCV modules: keep in sync with SEMPER_OPENCV_REQUIRED_MODULES.
 target_link_libraries(semper_pipeline
         PUBLIC
             semper_math
             opencv_core
             opencv_imgproc
             opencv_imgcodecs
+            opencv_features2d
+            opencv_calib3d
+            opencv_flann
 )
 target_compile_definitions(semper_pipeline PRIVATE
         $<$<BOOL:${SEMPER_ANDROID}>:SEMPER_ANDROID_LOG=1>

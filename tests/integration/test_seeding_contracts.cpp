@@ -6,7 +6,7 @@
 // of them behind an external DICe checkout. What CI defends on every run is
 // here: the phase-correlation sign convention, the log-polar rotation/scale
 // estimate, the rotation and quality gates, the similarity fallback, the
-// median-test publication rule, and the lattice sizing. Harness:
+// median test and its publication rule, and the lattice sizing. Harness:
 // framework/seed_bench.h.
 // =====================================================================
 
@@ -126,12 +126,17 @@ TEST_CASE(SeedBench, LogPolarRotationScale) {
 // coverage at 5 deg, 0.152 and no lock at 15 deg), as always-on assertions.
 // Same bounds as AnchorSeedingQualityGate for coverage; vertex error is
 // bounded at 0.05 px against a measured ~0.009.
+//
+// The 120 and 180 deg rows are v0.6.0's: the log-polar similarity before it
+// could not tell theta from theta + 180 deg, and the AKAZE homography can.
 // ---------------------------------------------------------------------------
 TEST_CASE(SeedBench, AnchorSeedingRotationGate) {
     const struct { const char *name; dictest::AffineDeformation def; } gates[] = {
         {"R_rot_5deg", rotation(5.0)},
         {"R_rot_15deg", rotation(15.0)},
         {"RST_10deg_1.05_20px", similarity(10.0, 1.05, 20.0f, -12.0f)},
+        {"R_rot_120deg", rotation(120.0)},
+        {"R_rot_180deg", rotation(180.0)},
     };
 
     dictest::SpeckleField field(/*seed=*/11, W, H, BLOBS);
@@ -145,15 +150,15 @@ TEST_CASE(SeedBench, AnchorSeedingRotationGate) {
         Row row;
         row.scenario = g.name;
         measure_seed(row, affine_truth(g.def), ref_gray, def_gray, big_motion_params());
-        std::printf("    %-20s lock=%s sim=%d rot=%+.3f x%.4f q=%d cov=%.3f "
+        std::printf("    %-20s lock=%s model=%d rot=%+.3f x%.4f q=%d cov=%.3f "
                     "vtx=%.4f px kept %d/%d meshfr=%.3f\n",
-                    g.name, row.phase_locked ? "yes" : "NO", row.similarity ? 1 : 0,
-                    row.lp_rot_deg, row.lp_scale, row.quality, (double)row.coverage,
+                    g.name, row.locked ? "yes" : "NO", row.model ? 1 : 0,
+                    row.model_rot_deg, row.model_scale, row.quality, (double)row.coverage,
                     row.vtx_med_du, row.anchors_accepted, row.anchors_attempted,
                     row.mesh_frac);
 
-        CHECK(row.phase_locked);
-        CHECK(row.similarity);
+        CHECK(row.locked);
+        CHECK(row.model);
         CHECK(row.quality == 2);
         CHECK(row.coverage >= 0.90f);
         CHECK(row.mesh_frac >= 0.95);
@@ -165,12 +170,14 @@ TEST_CASE(SeedBench, AnchorSeedingRotationGate) {
 // ---------------------------------------------------------------------------
 // Turns of 90 deg and beyond. The magnitude spectrum is point-symmetric, so the
 // log-polar peak gives theta only modulo 180 deg: 100 deg reads as -80, 135 as
-// -45, 179 as -1, and -90 as +90. Before L0 tried theta + 180 as well, each of
-// these seeded from the wrong half-turn and the solve returned kSeedFailed
-// (-5). The pixel-exact quarter turn (cv::rotate) puts the log-polar peak
-// exactly on the wrap of the angle axis, which a range check excluding +-90
-// threw away: the solve fell back to translation-only and returned no points.
+// -45, 179 as -1, and -90 as +90. Until phase_correlate_similarity tried
+// theta + 180 as well, each of these came out as the wrong half-turn, and in
+// v0.5.0, which seeded from it, the solve returned kSeedFailed (-5). The
+// pixel-exact quarter turn (cv::rotate) puts the log-polar peak exactly on the
+// wrap of the angle axis, which a range check excluding +-90 threw away.
 //
+// Since v0.6.0 the solve seeds from AKAZE and does not call the similarity, so
+// the angle checks cover the similarity and the node checks the homography.
 // A node counts only if the solve returns it within 0.5 px of the truth, out
 // of the nodes the same solve returns at zero motion (the strain window drops
 // the outer ring), so a dropped node counts against the fraction.
@@ -247,26 +254,21 @@ TEST_CASE(SeedBench, AnchorSeedingHalfTurn) {
 }
 
 // ---------------------------------------------------------------------------
-// The similarity's failure mode, and its fallback. The log-polar estimate is
-// a rotation plus an isotropic scale; a strong uniaxial stretch is neither,
-// and IncBench found frames where it reported one anyway and the corrected
-// translation peak still beat a translation peak the stretch had already
-// weakened. This is the noise-free one: IncBench S5 ("stretch to 60%"),
-// frame 150, a 45% stretch with Poisson 0.3 on a 110 px ROI, which the
-// estimate reads as about -5.8 deg x 0.918. The lattice that seeds keeps
-// 123 of 484 anchors and publishes 114 of them; the field built on that
-// measured 0.215 px rms in IncBench against 0.014 px translation-only. The
-// fallback must hand this frame back to the translation-only lattice, which
-// keeps fewer anchors (86) -- so a rule that kept the larger lattice would
-// pick the wrong one.
+// Strong anisotropic stretch: IncBench S5 ("stretch to 60%"), frame 150, a
+// 45% stretch with Poisson 0.3 on a 110 px ROI, noise-free.
 //
-// What the case does not fix: at 45% stretch the edge anchors' true
-// displacement is ~25 px, and from a zero-gradient seed some stick near zero
-// and still clear the loose vertex gate, in either lattice (p95 vertex error
-// ~25.7 px both ways). That is the translation-only seeder's behaviour too,
-// so it is reported here and not asserted.
+// Until v0.6.0 this was the log-polar similarity's failure mode: it read the
+// stretch as about -5.8 deg x 0.918, the lattice seeded from that kept 123 of
+// 484 anchors with blunders no gate caught (0.215 px field rms), and the
+// translation-only fallback kept 86 with a p95 vertex error of ~25.7 px.
+//
+// AKAZE descriptors do not survive a 45% stretch either -- no model here --
+// so every anchor runs its own offset search, the path v0.5.0 also took
+// without a phase lock. On this frame that search is what does the work, and
+// it keeps over 300 anchors with no blunders: the p95 vertex error is the
+// bound that matters.
 // ---------------------------------------------------------------------------
-TEST_CASE(SeedBench, SimilarityFallsBackUnderStretch) {
+TEST_CASE(SeedBench, StretchSeedsWithoutBlunders) {
     const int w = 384, h = 256;
     const dictest::SmoothSpeckleField field(101, w, h);
     const cv::Mat ref = dictest::render_frame(field, w, h, dictest::identity_motion(), 0.0f, 7919u);
@@ -297,26 +299,136 @@ TEST_CASE(SeedBench, SimilarityFallsBackUnderStretch) {
     Row row;
     row.scenario = "stretch_45pct";
     measure_seed(row, truth, ref, def, p);
-    std::printf("    lp %+.3f deg x%.4f: sim=%d rejected=%d kept %d/%d q=%d cov=%.3f "
-                "vtx med %.4f p95 %.4f px\n",
-                row.lp_rot_deg, row.lp_scale, row.similarity ? 1 : 0,
-                row.similarity_rejected ? 1 : 0, row.anchors_accepted,
+    std::printf("    lock=%s model %+.3f deg x%.4f applied=%d rejected=%d kept %d/%d q=%d "
+                "cov=%.3f vtx med %.4f p95 %.4f px\n",
+                row.locked ? "yes" : "NO", row.model_rot_deg, row.model_scale,
+                row.model ? 1 : 0, row.model_rejected ? 1 : 0, row.anchors_accepted,
                 row.anchors_attempted, row.quality, (double)row.coverage, row.vtx_med_du,
                 row.vtx_p95_du);
 
-    // The estimate must still be the misfire this case was chosen for, or the
-    // case no longer exercises the fallback.
-    REQUIRE(std::abs(row.lp_rot_deg) > 2.0);
-    CHECK(row.similarity_rejected);
-    CHECK(!row.similarity);
-    CHECK(row.phase_locked);
+    // Measured: FULL, 337/484 kept, cov 0.834, p95 0.026 px.
+    CHECK(row.quality == 2);
+    CHECK(row.anchors_accepted >= 200);
+    REQUIRE(row.vtx_p95_du >= 0.0);
+    CHECK(row.vtx_p95_du <= 0.25);
 
-    // The outcome that matters is the field: 0.215 px with the similarity
-    // lattice, 0.014 px translation-only. Bounded between the two.
+    // And the field: 0.215 px from the misfired similarity, 0.014 px from
+    // v0.5.0's translation-only fallback.
     measure_full_field(row, truth, ref, def, p);
     std::printf("    field: %d points, rms %.4f px\n", row.ff_rc, row.ff_rms_u);
     REQUIRE(row.ff_rc > 0);
     CHECK(row.ff_rms_u <= 0.05);
+}
+
+// ---------------------------------------------------------------------------
+// The guess field at the grid edge. build_mesh_guess_field box-averages the
+// mesh guess over 5x5 in-mesh neighbours; on the outer two rings the box is
+// one-sided, and a plain average moved u/v by gradient x offset (about 5 px
+// at a quarter turn), outside IC-GN's reach. Every such node went to a
+// Simplex rescue: 70 of them at 85 deg (83 at 90), at 2.7x the field CPU.
+// Carrying the average back to the node along the smoothed gradient keeps an
+// affine guess exact, and the count at 0.
+// ---------------------------------------------------------------------------
+TEST_CASE(SeedBench, GuessSmoothingKeepsEdgesInReach) {
+    dictest::SpeckleField field(/*seed=*/11, W, H, BLOBS);
+    const Image ref = dictest::make_reference_image(field, W, H);
+    const cv::Mat ref_gray = dictest::gray8(ref, 0.0f, 101);
+    const dictest::AffineDeformation d = rotation(85.0);
+    const Image def = dictest::make_deformed_image(field, W, H, d);
+    const cv::Mat def_gray = dictest::gray8(def, 0.0f, 202);
+
+    Row row;
+    row.scenario = "R_rot_85deg";
+    measure_full_field(row, affine_truth(d), ref_gray, def_gray, big_motion_params());
+    std::printf("    field: %d points, %d Simplex rescues, %.2f mean iters, rms %.4f px\n",
+                row.ff_rc, row.ff_simplex_calls, row.ff_mean_iters, row.ff_rms_u);
+    REQUIRE(row.ff_rc > 0);
+    CHECK(row.ff_simplex_calls <= 5);
+    CHECK(row.ff_rms_u <= 0.05);
+}
+
+// ---------------------------------------------------------------------------
+// A half turn, end to end. v0.5.0 read 180 deg as 0 deg (the log-polar
+// spectrum is the same for both), seeded every anchor from the wrong side of
+// the ROI and returned no usable field. The homography carries the whole
+// field, mesh and the nodes outside it alike.
+// ---------------------------------------------------------------------------
+TEST_CASE(SeedBench, HalfTurnSolvesTheField) {
+    dictest::SpeckleField field(/*seed=*/11, W, H, BLOBS);
+    const Image ref = dictest::make_reference_image(field, W, H);
+    const cv::Mat ref_gray = dictest::gray8(ref, 0.0f, 101);
+    const dictest::AffineDeformation d = rotation(180.0);
+    const Image def = dictest::make_deformed_image(field, W, H, d);
+    const cv::Mat def_gray = dictest::gray8(def, 0.0f, 202);
+
+    Row row;
+    row.scenario = "R_rot_180deg";
+    measure_full_field(row, affine_truth(d), ref_gray, def_gray, big_motion_params());
+    std::printf("    field: %d points, %d Simplex rescues, %.2f mean iters, rms %.4f px\n",
+                row.ff_rc, row.ff_simplex_calls, row.ff_mean_iters, row.ff_rms_u);
+    REQUIRE(row.ff_rc > 0);
+    CHECK(row.ff_simplex_calls <= 5);
+    CHECK(row.ff_rms_u <= 0.05);
+}
+
+// ---------------------------------------------------------------------------
+// The incremental handover: keypoints detected on a deformed frame become the
+// next reference's instead of being detected again. reuse_akaze_ref must give
+// the same keypoints and descriptors, in the new rect's own coordinates, as a
+// fresh detection would for every keypoint far enough inside both rects that
+// the crop did not change it -- and refuse a rect it covers too little of.
+// ---------------------------------------------------------------------------
+TEST_CASE(SeedBench, AkazeHandoverMatchesFreshDetection) {
+    using namespace Semper::seeding;
+    dictest::SpeckleField field(/*seed=*/7, W, H, BLOBS);
+    const cv::Mat gray = dictest::gray8(dictest::make_reference_image(field, W, H), 0.0f, 0);
+    const cv::Rect roi(BIG_ORIGIN, BIG_ORIGIN, BIG_RECT, BIG_RECT);
+    const cv::Rect moved = roi + cv::Point(6, -4);
+    const double s = 0.5;
+
+    const AkazeRef from = prepare_akaze_ref(gray, roi, s);
+    REQUIRE(from.usable());
+    AkazeRef reused;
+    REQUIRE(reuse_akaze_ref(from, moved, gray.size(), reused));
+    const AkazeRef fresh = prepare_akaze_ref(gray, moved, s);
+    CHECK(reused.rect == fresh.rect);
+    CHECK(reused.scale == fresh.scale);
+    CHECK(reused.descriptors.rows == (int)reused.keypoints.size());
+
+    // A keypoint of the reused set, mapped back to image coordinates, must
+    // also be in the fresh set at the same place with the same descriptor.
+    const float margin = 20.0f;   // AKAZE's support at this scale, in scaled px
+    const float w = (float)(s * reused.rect.width), h = (float)(s * reused.rect.height);
+    int inside = 0, found = 0;
+    for (size_t i = 0; i < reused.keypoints.size(); ++i) {
+        const cv::Point2f q = reused.keypoints[i].pt;
+        const cv::Point2f img(q.x / (float)s + reused.rect.x, q.y / (float)s + reused.rect.y);
+        const cv::Point2f in_from((img.x - from.rect.x) * (float)s, (img.y - from.rect.y) * (float)s);
+        if (q.x < margin || q.y < margin || q.x > w - margin || q.y > h - margin ||
+            in_from.x < margin || in_from.y < margin ||
+            in_from.x > s * from.rect.width - margin || in_from.y > s * from.rect.height - margin) {
+            continue;
+        }
+        ++inside;
+        for (size_t j = 0; j < fresh.keypoints.size(); ++j) {
+            if (cv::norm(fresh.keypoints[j].pt - q) < 0.01 &&
+                cv::norm(fresh.descriptors.row((int)j), reused.descriptors.row((int)i),
+                         cv::NORM_HAMMING) == 0) {
+                ++found;
+                break;
+            }
+        }
+    }
+    std::printf("    reused %zu, fresh %zu keypoints; %d well inside, %d identical\n",
+                reused.keypoints.size(), fresh.keypoints.size(), inside, found);
+    // Measured 113 of 117: AKAZE sets its contrast factor from the whole crop,
+    // so a few keypoints near threshold come and go with the crop.
+    REQUIRE(inside >= 20);
+    CHECK(found >= (int)(0.90 * inside));
+
+    // Too little overlap: a rect shifted by most of its width is refused.
+    AkazeRef far;
+    CHECK(!reuse_akaze_ref(from, roi + cv::Point(BIG_RECT / 2, 0), gray.size(), far));
 }
 
 // ---------------------------------------------------------------------------
@@ -336,7 +448,7 @@ TEST_CASE(SeedBench, SimilarityFallsBackUnderStretch) {
 //                    that the lattice degrades above ~5 deg, so the lower end
 //                    of that range is the boundary worth pinning
 //   S5_trans_12px    motion far outside IC-GN's own capture range, which only
-//                    succeeds if the L0 phase-correlation lock is real
+//                    succeeds if the L0 global-motion lock is real
 //
 // The bounds are deliberately loose -- 3x to 5x the measured value, listed
 // per row below. This is a regression gate, not a benchmark: it should fire
@@ -364,7 +476,7 @@ TEST_CASE(SeedBench, AnchorSeedingQualityGate) {
         // measured: 0.0106 px / 5.41e-4 / 0.0083 px
         {"S4_rot_0.5deg", rotation(0.5), 0.05, 2.0e-3, 0.04},
         // measured: 0.0000 px / 1.31e-6 / 0.0000 px. Bounded well above the
-        // measurement because what is being asserted is that the phase lock
+        // measurement because what is being asserted is that the global lock
         // carried a 12 px motion at all, not the last digit of an exact hit.
         {"S5_trans_12px", affine(12.0f, -7.0f), 0.02, 5.0e-5, 0.02},
     };
@@ -384,13 +496,13 @@ TEST_CASE(SeedBench, AnchorSeedingQualityGate) {
 
         std::printf("    %-16s lock=%s q=%d cov=%.3f vtx=%.4f px "
                     "dP=%.3e du=%.4f px meshfr=%.3f\n",
-                    g.name, row.phase_locked ? "yes" : "NO", row.quality,
+                    g.name, row.locked ? "yes" : "NO", row.quality,
                     (double) row.coverage, row.vtx_med_du, row.mesh_med_dux,
                     row.mesh_med_du, row.mesh_frac);
 
-        // A lost phase lock is the single failure that explains most of the
+        // A lost global lock is the single failure that explains most of the
         // others, so check it first and by itself.
-        CHECK(row.phase_locked);
+        CHECK(row.locked);
         // MeshQuality::FULL. SPARSE means the hull did not cover the ROI and
         // Path B is doing work the mesh was supposed to do.
         CHECK(row.quality == 2);
@@ -466,6 +578,62 @@ TEST_CASE(SeedBench, PublishAnchorResultsRespectsMedianTest) {
     // Credit lands on the thread that ran the ICGN, not on whoever published.
     CHECK(stats[0].points_solved == 1);
     CHECK(stats[1].points_solved == 0);
+}
+
+// ---------------------------------------------------------------------------
+// The median test itself, on a hand-made 4 x 3 lattice. Its blind spot was a
+// vertex with fewer than three converged neighbours: nothing to take a median
+// of, so it was kept on its ZNSSD alone. On the real PMMA 3-point bend
+// (material_testing real_data_pmma_bending, frames 24-29) the translation
+// lattice under the load nose kept exactly such anchors, ~20 px off at ZNSSD
+// 0.17-0.30, and the mesh on them sent Path A to the wrong speckle: up to
+// 3,861 of the 9,431 deflection-probe points were lost. Requiring the output
+// gate instead is not enough: StretchSeedsWithoutBlunders has untested
+// blunders at 0.095 and 0.150. An untested node is now never a vertex.
+// ---------------------------------------------------------------------------
+TEST_CASE(SeedBench, MedianTestKeepsNoUntestedAnchor) {
+    using Semper::pipeline::internal::AnchorResult;
+    using Semper::pipeline::internal::mark_kept_anchors;
+
+    const int LW = 4, LH = 3;
+    std::vector<AnchorResult> anchors((size_t)LW * LH);   // default: never converged
+    std::vector<float> res_u((size_t)LW * LH, 0.0f), res_v((size_t)LW * LH, 0.0f);
+    auto set = [&](int li, int lj, bool output, float u) {
+        AnchorResult &a = anchors[(size_t)lj * LW + li];
+        a.vertex = true;
+        a.output = output;
+        a.kept = true;   // stale: the test must decide afresh
+        res_u[(size_t)lj * LW + li] = u;
+        res_v[(size_t)lj * LW + li] = 2.0f;
+    };
+    // Column 2 never converged except its bottom node.
+    set(0, 0, true, 1.0f);  set(1, 0, true, 1.0f);                         set(3, 0, true, 1.0f);
+    set(0, 1, true, 1.0f);  set(1, 1, false, 1.2f);                        set(3, 1, true, 1.0f);
+    set(0, 2, true, 6.0f);  set(1, 2, true, 1.0f);  set(2, 2, true, 1.0f); set(3, 2, false, -18.0f);
+
+    mark_kept_anchors(anchors, LW, LH, res_u, res_v);
+    auto kept = [&](int li, int lj) { return anchors[(size_t)lj * LW + li].kept; };
+
+    // Tested and consistent, including the loose vertex (1, 1): where the
+    // median test can run, the looser vertex gate is still enough.
+    CHECK(kept(0, 0));
+    CHECK(kept(1, 0));
+    CHECK(kept(0, 1));
+    CHECK(kept(1, 1));
+    CHECK(kept(1, 2));
+    CHECK(kept(2, 2));
+    // A blunder with three neighbours is rejected.
+    CHECK(!kept(0, 2));
+    // (3, 1) has the far-off (3, 2) among its three neighbours and is kept on
+    // the other two.
+    CHECK(kept(3, 1));
+    // Untested (one neighbour), however good its ZNSSD: not kept.
+    CHECK(!kept(3, 0));
+    // Untested (two neighbours) and only a loose vertex: the PMMA case.
+    CHECK(!kept(3, 2));
+    // Never converged.
+    CHECK(!kept(2, 0));
+    CHECK(!kept(2, 1));
 }
 
 // ---------------------------------------------------------------------------
