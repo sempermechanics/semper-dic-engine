@@ -544,7 +544,7 @@ configure.
 | platform | status | gated by |
 |---|---|---|
 | Linux x86_64 (GCC, Clang) | supported | every CI job |
-| Android arm64-v8a | shipping target | not built in CI; built by the app |
+| Android arm64-v8a | shipping target | `android-ndk` compiles the JNI adapter (no device run); the app builds the APK |
 | Windows x86_64 (MinGW-w64) | **works, but ungated** | nothing |
 | aarch64 Linux cross | measurement only | nothing (see the toolchain header) |
 | MSVC | headers declare `dllexport`/`dllimport`, never built | nothing |
