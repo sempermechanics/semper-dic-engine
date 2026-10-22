@@ -3,7 +3,11 @@
 Versions follow [docs/CONTRACT.md](docs/CONTRACT.md) §A.1. Entries before
 0.5.0 live in the git history (`git log --grep Version`).
 
-## Unreleased
+## 0.6.1
+
+Patch: no surface change. The field moves only where 0.6.0 kept an anchor
+the median test could not check; the build no longer depends on a fresh
+CMake cache.
 
 ### Fixed — seeding
 - An anchor the lattice median test cannot check (fewer than three converged
