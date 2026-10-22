@@ -347,7 +347,7 @@ Tunables: `tuning::kIncTaylorMaxCells`, `kIncMaskMaxSamplesPerPx`,
 `kIncMaskExtrapCells`, `kIncCoastRadiusCells`, `kIncCoastMinNodes`,
 `kIncCoastMaxTravelSubsets`, `kIncCoastTrustedTravelSubsets`,
 `kIncReanchorMaxShiftFraction`, `kIncReanchorMinShiftPx`, `kIncAnchorMarginPx`,
-`kIncEarlyUpdateDrop`.
+`kIncEarlyUpdateDrop`, `kIncUpdateMinReported`.
 
 ---
 

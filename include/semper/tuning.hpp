@@ -244,6 +244,21 @@ inline constexpr int kIncAnchorMarginPx = 10;
 inline constexpr float kIncEarlyUpdateDrop = 0.05f;
 
 /**
+ * Incremental DIC update floor: the reference does not move, early or on
+ * schedule, to a frame that reports fewer than this fraction of the points
+ * reported on the first frame against the current reference, or, before that
+ * frame (and always with N = 1), of the points the reference itself reported
+ * when it was solved. Frame 1 has nothing to compare with.
+ * Such a frame is a failed solve, not an increment outgrowing the images: the
+ * seed locked onto a wrong solution or nothing matched (now and then on a
+ * 6-10 deg step over a small noisy ROI), and the few points it reports may be
+ * tens of pixels off. Moving onto it would keep only those and lose every
+ * other node for good. The reference stays, and the next frame is solved
+ * against it and moves it if it solves.
+ */
+inline constexpr float kIncUpdateMinReported = 0.5f;
+
+/**
  * Incremental DIC mask warp: how far past the outermost frame-0 nodes (in
  * grid cells, plus half a subset) the warped mask is evaluated. The field is
  * extended linearly from the edge cells over that window. The material
