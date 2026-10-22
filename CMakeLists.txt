@@ -21,6 +21,7 @@ endif()
 
 include(SemperOpenCV)
 add_subdirectory(${OPENCV_SRC_DIR} ${CMAKE_BINARY_DIR}/opencv_build EXCLUDE_FROM_ALL)
+semper_check_opencv_modules()
 
 set(SEMPER_OPENCV_INCLUDE_DIRS
         ${OPENCV_SRC_DIR}/include
@@ -99,6 +100,7 @@ target_include_directories(semper_pipeline SYSTEM PUBLIC
             ${SEMPER_OPENCV_INCLUDE_DIRS}
             ${EIGEN_SRC_DIR}
 )
+# OpenCV modules: keep in sync with SEMPER_OPENCV_REQUIRED_MODULES.
 target_link_libraries(semper_pipeline
         PUBLIC
             semper_math
