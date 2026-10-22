@@ -5,6 +5,19 @@ Versions follow [docs/CONTRACT.md](docs/CONTRACT.md) §A.1. Entries before
 
 ## Unreleased
 
+### Fixed — seeding
+- An anchor the lattice median test cannot check (fewer than three converged
+  neighbours) is no longer kept as a mesh vertex or published; Path A or B
+  solves its node. It used to be kept on its ZNSSD alone. On the real PMMA
+  3-point bend (material_testing `real_data_pmma_bending`), v0.6.0's
+  translation-only fallback kept such anchors under the load nose on frames
+  24–29. They were ~20 px off at ZNSSD 0.17–0.30, and Path A followed them
+  onto the wrong speckle. The outlier filter then dropped up to 3,861 of the
+  9,431 deflection-probe points, and the deflection there read up to 1.5%
+  low. Now 91 points are missing on one frame. The deflection RMSE
+  (0.0080 mm) and E from the graph (2.002 GPa) match v0.4.2 again, and steel
+  tensile is unchanged.
+
 ### Build
 - The OpenCV modules the engine links (`core,imgproc,imgcodecs,features2d,
   calib3d,flann`) are always compiled. `SEMPER_OPENCV_BUILD_LIST` now names

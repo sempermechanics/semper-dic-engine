@@ -428,6 +428,19 @@ struct AnchorLattice {
 
 AnchorLattice plan_anchor_lattice(int gridW, int gridH);
 
+// Universal median test (Westerweel & Scarano) over the solved lattice: sets
+// `kept` on each vertex whose residual (res_u, res_v; one entry per lattice
+// node, row-major, LW x LH, as `anchors`) is within kAnchorMedianTol of the
+// median of its vertex 8-neighbours'. A global affine or homography fit would
+// be the wrong model: under a real strain field the displacements are not
+// affine, so a global fit rejects signal. The 8-neighbourhood median assumes
+// no field shape, and the lattice makes the lookup O(1). A vertex with fewer
+// than three vertex neighbours cannot be tested and is not kept. Exposed, like
+// plan_anchor_lattice, so the rule can be checked without staging a
+// real-speckle blunder.
+void mark_kept_anchors(std::vector<AnchorResult> &anchors, int LW, int LH,
+                       const std::vector<float> &res_u, const std::vector<float> &res_v);
+
 // Matches AKAZE features for the global model, then solves the lattice from
 // it. Takes resultGrid as const: it reads the pre-set `solved` flags to skip
 // masked and boundary-rejected nodes, and writes nothing. roiMask is the

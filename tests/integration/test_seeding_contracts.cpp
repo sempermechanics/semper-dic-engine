@@ -6,7 +6,7 @@
 // of them behind an external DICe checkout. What CI defends on every run is
 // here: the phase-correlation sign convention, the log-polar rotation/scale
 // estimate, the rotation and quality gates, the similarity fallback, the
-// median-test publication rule, and the lattice sizing. Harness:
+// median test and its publication rule, and the lattice sizing. Harness:
 // framework/seed_bench.h.
 // =====================================================================
 
@@ -492,6 +492,62 @@ TEST_CASE(SeedBench, PublishAnchorResultsRespectsMedianTest) {
     // Credit lands on the thread that ran the ICGN, not on whoever published.
     CHECK(stats[0].points_solved == 1);
     CHECK(stats[1].points_solved == 0);
+}
+
+// ---------------------------------------------------------------------------
+// The median test itself, on a hand-made 4 x 3 lattice. Its blind spot was a
+// vertex with fewer than three converged neighbours: nothing to take a median
+// of, so it was kept on its ZNSSD alone. On the real PMMA 3-point bend
+// (material_testing real_data_pmma_bending, frames 24-29) the translation
+// lattice under the load nose kept exactly such anchors, ~20 px off at ZNSSD
+// 0.17-0.30, and the mesh on them sent Path A to the wrong speckle: up to
+// 3,861 of the 9,431 deflection-probe points were lost. Requiring the output
+// gate instead is not enough: StretchSeedsWithoutBlunders has untested
+// blunders at 0.095 and 0.150. An untested node is now never a vertex.
+// ---------------------------------------------------------------------------
+TEST_CASE(SeedBench, MedianTestKeepsNoUntestedAnchor) {
+    using Semper::pipeline::internal::AnchorResult;
+    using Semper::pipeline::internal::mark_kept_anchors;
+
+    const int LW = 4, LH = 3;
+    std::vector<AnchorResult> anchors((size_t)LW * LH);   // default: never converged
+    std::vector<float> res_u((size_t)LW * LH, 0.0f), res_v((size_t)LW * LH, 0.0f);
+    auto set = [&](int li, int lj, bool output, float u) {
+        AnchorResult &a = anchors[(size_t)lj * LW + li];
+        a.vertex = true;
+        a.output = output;
+        a.kept = true;   // stale: the test must decide afresh
+        res_u[(size_t)lj * LW + li] = u;
+        res_v[(size_t)lj * LW + li] = 2.0f;
+    };
+    // Column 2 never converged except its bottom node.
+    set(0, 0, true, 1.0f);  set(1, 0, true, 1.0f);                         set(3, 0, true, 1.0f);
+    set(0, 1, true, 1.0f);  set(1, 1, false, 1.2f);                        set(3, 1, true, 1.0f);
+    set(0, 2, true, 6.0f);  set(1, 2, true, 1.0f);  set(2, 2, true, 1.0f); set(3, 2, false, -18.0f);
+
+    mark_kept_anchors(anchors, LW, LH, res_u, res_v);
+    auto kept = [&](int li, int lj) { return anchors[(size_t)lj * LW + li].kept; };
+
+    // Tested and consistent, including the loose vertex (1, 1): where the
+    // median test can run, the looser vertex gate is still enough.
+    CHECK(kept(0, 0));
+    CHECK(kept(1, 0));
+    CHECK(kept(0, 1));
+    CHECK(kept(1, 1));
+    CHECK(kept(1, 2));
+    CHECK(kept(2, 2));
+    // A blunder with three neighbours is rejected.
+    CHECK(!kept(0, 2));
+    // (3, 1) has the far-off (3, 2) among its three neighbours and is kept on
+    // the other two.
+    CHECK(kept(3, 1));
+    // Untested (one neighbour), however good its ZNSSD: not kept.
+    CHECK(!kept(3, 0));
+    // Untested (two neighbours) and only a loose vertex: the PMMA case.
+    CHECK(!kept(3, 2));
+    // Never converged.
+    CHECK(!kept(2, 0));
+    CHECK(!kept(2, 1));
 }
 
 // ---------------------------------------------------------------------------

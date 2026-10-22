@@ -119,6 +119,54 @@ AnchorLattice plan_anchor_lattice(int gridW, int gridH) {
     return out;
 }
 
+void mark_kept_anchors(std::vector<AnchorResult>& anchors, int LW, int LH,
+                       const std::vector<float>& res_u, const std::vector<float>& res_v) {
+    for (int lj = 0; lj < LH; ++lj) {
+        for (int li = 0; li < LW; ++li) {
+            const size_t idx = (size_t)lj * LW + li;
+            AnchorResult& a = anchors[idx];
+            a.kept = false;
+            if (!a.vertex) continue;
+
+            std::array<float, 8> nu{}, nv{};
+            int nn = 0;
+            for (int dj = -1; dj <= 1; ++dj) {
+                for (int di = -1; di <= 1; ++di) {
+                    if (di == 0 && dj == 0) continue;
+                    const int nj = lj + dj, ni = li + di;
+                    if (ni < 0 || ni >= LW || nj < 0 || nj >= LH) continue;
+                    const AnchorResult& nb = anchors[(size_t)nj * LW + ni];
+                    if (!nb.vertex) continue;
+                    nu[nn] = res_u[(size_t)nj * LW + ni];
+                    nv[nn] = res_v[(size_t)nj * LW + ni];
+                    ++nn;
+                }
+            }
+            // Fewer than three neighbours converged: there is no median to test
+            // against, and nothing else vouches for the node. It used to be kept
+            // on its ZNSSD alone, and ZNSSD does not tell a blunder apart where
+            // the lattice is failing: under a 3-point bend's load nose the
+            // translation lattice's few survivors matched speckle ~20 px off
+            // at ZNSSD 0.17-0.30, and the triangles on them sent Path A to the
+            // same wrong speckle (real_data_pmma_bending, frames 24-29); at the
+            // stretched edge of SeedBench.StretchSeedsWithoutBlunders such
+            // anchors are 25-50 px off at 0.095-0.36, inside the output gate as
+            // well as outside it. Path A or B solves the node instead.
+            if (nn < 3) continue;
+            const float mu = util::median_inplace(nu.data(), (size_t)nn);
+            const float mv = util::median_inplace(nv.data(), (size_t)nn);
+            if (std::abs(res_u[idx] - mu) > tuning::kAnchorMedianTol ||
+                std::abs(res_v[idx] - mv) > tuning::kAnchorMedianTol) {
+                // Withhold `kept` only. `vertex` stays set, so a rejected node
+                // still votes in its neighbours' medians -- dropping it from the
+                // sample would let one blunder cascade along a row.
+                continue;
+            }
+            a.kept = true;
+        }
+    }
+}
+
 namespace {
 
 // The L0 global model: the AKAZE homography, its translation at the ROI
@@ -401,19 +449,13 @@ MeshSeedResult solve_anchor_seeds(
 
         r.attempted = attempted.load(std::memory_order_relaxed);
 
-        // Universal median test (Westerweel & Scarano) over the lattice. A global
-        // affine or homography fit would be the wrong model: under a real strain
-        // field the displacements are not affine, so a global fit rejects signal.
-        // The 8-neighbourhood median assumes no field shape, and the lattice makes
-        // the lookup O(1).
-        //
-        // Under the model the test runs on the residual from it. Rotation is a
-        // smooth field, but at 15 deg lattice neighbours 20 px apart differ by
-        // 5 px, and on the lattice edge -- where every neighbour sits on one side
-        // -- the raw median lands that far off and each edge anchor fails a 1 px
-        // tolerance however good it is. Subtracting the model removes exactly
-        // that. Translation-only, the residual is the displacement itself and
-        // this is the original test.
+        // The universal median test (mark_kept_anchors). Under the model it runs
+        // on the residual from it. Rotation is a smooth field, but at 15 deg
+        // lattice neighbours 20 px apart differ by 5 px, and on the lattice edge
+        // -- where every neighbour sits on one side -- the raw median lands that
+        // far off and each edge anchor fails a 1 px tolerance however good it
+        // is. Subtracting the model removes exactly that. Translation-only, the
+        // residual is the displacement itself and this is the original test.
         std::vector<float> res_u((size_t)n_anchor, 0.0f), res_v((size_t)n_anchor, 0.0f);
         for (size_t i = 0; i < anchors.size(); ++i) {
             const AnchorResult& a = anchors[i];
@@ -423,51 +465,20 @@ MeshSeedResult solve_anchor_seeds(
             res_u[i] = a.u - g[0];
             res_v[i] = a.v - g[1];
         }
+        mark_kept_anchors(anchors, LW, LH, res_u, res_v);
 
         std::vector<float> us, vs;
         us.reserve((size_t)n_anchor);
         vs.reserve((size_t)n_anchor);
         r.ref_pts.reserve((size_t)n_anchor);
         r.def_pts.reserve((size_t)n_anchor);
-        for (int lj = 0; lj < LH; ++lj) {
-            for (int li = 0; li < LW; ++li) {
-                const size_t idx = (size_t)lj * LW + li;
-                AnchorResult& a = anchors[idx];
-                if (!a.vertex) continue;
-
-                std::array<float, 8> nu{}, nv{};
-                int nn = 0;
-                for (int dj = -1; dj <= 1; ++dj) {
-                    for (int di = -1; di <= 1; ++di) {
-                        if (di == 0 && dj == 0) continue;
-                        const int nj = lj + dj, ni = li + di;
-                        if (ni < 0 || ni >= LW || nj < 0 || nj >= LH) continue;
-                        const AnchorResult& nb = anchors[(size_t)nj * LW + ni];
-                        if (!nb.vertex) continue;
-                        nu[nn] = res_u[(size_t)nj * LW + ni];
-                        nv[nn] = res_v[(size_t)nj * LW + ni];
-                        ++nn;
-                    }
-                }
-                if (nn >= 3) {
-                    const float mu = util::median_inplace(nu.data(), (size_t)nn);
-                    const float mv = util::median_inplace(nv.data(), (size_t)nn);
-                    if (std::abs(res_u[idx] - mu) > tuning::kAnchorMedianTol ||
-                        std::abs(res_v[idx] - mv) > tuning::kAnchorMedianTol) {
-                        // Withhold `kept` only. `vertex` stays set, so a rejected
-                        // node still votes in its neighbours' medians -- dropping
-                        // it from the sample would let one blunder cascade along
-                        // a row.
-                        continue;
-                    }
-                }
-                a.kept = true;
-                r.ref_pts.emplace_back(a.rx, a.ry);
-                r.def_pts.emplace_back(a.rx + a.u, a.ry + a.v);
-                us.push_back(a.u);
-                vs.push_back(a.v);
-                if (a.output) r.solved++;
-            }
+        for (const AnchorResult& a : anchors) {
+            if (!a.kept) continue;
+            r.ref_pts.emplace_back(a.rx, a.ry);
+            r.def_pts.emplace_back(a.rx + a.u, a.ry + a.v);
+            us.push_back(a.u);
+            vs.push_back(a.v);
+            if (a.output) r.solved++;
         }
         r.accepted = (int)r.ref_pts.size();
 
