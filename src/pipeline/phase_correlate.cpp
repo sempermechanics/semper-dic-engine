@@ -226,9 +226,9 @@ void phase_correlate_similarity(const PhaseCorrRef &ref, const cv::Mat &def,
     // the pixels that rotated out of its rectangle.
     const double sc = s * std::cos(theta), ss = s * std::sin(theta);
     const double x0 = r.x - out.cx, y0 = r.y - out.cy;
-    const cv::Mat M = (cv::Mat_<double>(2, 3) <<
+    const cv::Mat M(cv::Matx23d(
             sc, -ss, out.cx + sc * x0 - ss * y0,
-            ss,  sc, out.cy + ss * x0 + sc * y0);
+            ss,  sc, out.cy + ss * x0 + sc * y0));
     cv::Mat undone;
     cv::warpAffine(def, undone, M, r.size(), cv::INTER_LINEAR | cv::WARP_INVERSE_MAP,
                    cv::BORDER_REPLICATE);
