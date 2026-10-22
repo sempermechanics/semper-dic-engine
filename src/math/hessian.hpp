@@ -6,22 +6,15 @@
 
 #include <semper/tuning.hpp>
 #include <semper/types.hpp>
-
-#include <cstdint>
-#include <cstring>
+#include "util/finite.hpp"
 
 namespace Semper {
 namespace hessian {
 
 using Matrix6f = Eigen::Matrix<float, 6, 6>;
 
-// True unless f is Inf or NaN, read from the bits. The engine is built with
-// -ffast-math, under which std::isfinite may be folded to true.
-inline bool finite_bits(float f) {
-    uint32_t u;
-    std::memcpy(&u, &f, sizeof u);
-    return (u & 0x7f800000u) != 0x7f800000u;
-}
+// True unless f is Inf or NaN, read from the bits (see util/finite.hpp).
+using util::finite_bits;
 
 template <typename Derived>
 bool all_finite_bits(const Eigen::MatrixBase<Derived> &m) {

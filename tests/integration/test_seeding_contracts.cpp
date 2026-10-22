@@ -515,6 +515,51 @@ TEST_CASE(SeedBench, MetricsIdentityHoldsOnPathCRoute) {
 }
 
 // ---------------------------------------------------------------------------
+// Path C used to stake the whole solve on one node. The scene above, at a
+// 15 px step, with the deformed frame blank where the centre node lands (the
+// stretch is centred there, so it does not move): that node's search has
+// nothing to match, and with no AKAZE lock the solve returned kSeedFailed
+// though every other node of the row is fine. The next nearest are tried now.
+// ---------------------------------------------------------------------------
+TEST_CASE(SeedBench, PathCTriesNextNodeWhenCentreFails) {
+    const int w = 384, h = 256;
+    const dictest::SmoothSpeckleField field(101, w, h);
+    const cv::Mat ref = dictest::render_frame(field, w, h, dictest::identity_motion(), 0.0f, 7919u);
+    const dictest::Motion m =
+            dictest::stretch_rotate(0.45, 0.3, 0.0, dictest::Vec2{}, dictest::Vec2{192, 128});
+    cv::Mat def = dictest::render_frame(field, w, h, m, 0.0f, 7919u + 150u);
+
+    FullFieldParams p;
+    p.rect_x = 132;
+    p.rect_y = 128;
+    p.rect_w = 8 * 15;
+    p.rect_h = 15;
+    p.step = 15;
+    p.subset_size = 21;
+    p.strain_window = 31;
+    p.use_6x6_interpolator = false;
+    // Path C's first candidate is grid node (4, 0): (192, 128).
+    def(cv::Rect(182, 118, 21, 21)).setTo(128);
+
+    ReferenceCache cache;
+    cache.set_from_gray(ref, cv::Mat());
+    std::vector<float> out(8 * 8, 0.0f);
+    float metrics[Semper::pipeline::kMetricsLen];
+    for (float &v : metrics) v = -1.0f;
+    const int n = Semper::pipeline::run_full_field(cache, def, cv::Mat(), p, out.data(),
+                                                   (int)out.size(), metrics,
+                                                   Semper::pipeline::kMetricsLen, nullptr);
+    std::printf("    rc %d  seeding %g lock %g  path B %g\n", n, metrics[16], metrics[21],
+                metrics[4]);
+    // The route under test: no lock, no anchors, so a Path C failure is final.
+    REQUIRE(metrics[21] == 0.0f);
+    CHECK(n != Semper::pipeline::kSeedFailed);
+    CHECK(n >= 0);
+    CHECK(metrics[16] == 0.0f);
+    CHECK(metrics[4] > 0.0f);
+}
+
+// ---------------------------------------------------------------------------
 // The publish gate. solve_anchor_seeds records outcomes and publishes nothing;
 // publish_anchor_results applies them once the universal median test has run.
 // Nothing in the fixtures below produces a blunder that clears kCorrAccept and

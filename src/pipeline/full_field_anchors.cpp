@@ -36,8 +36,8 @@
 #include <semper/tuning.hpp>
 #include "util/log.hpp"
 #include "util/median.hpp"
+#include "util/omp.hpp"
 
-#include <omp.h>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
 
@@ -372,7 +372,7 @@ MeshSeedResult solve_anchor_seeds(
 
 #pragma omp parallel num_threads(safe_cores)
         {
-            const int tid = omp_get_thread_num();
+            const int tid = util::omp_thread();
             OptimizationEngine engine = make_engine(params.use_6x6_interpolator);
             Semper::SubsetData subset;
             double local_hessian = 0.0, local_wait = 0.0;

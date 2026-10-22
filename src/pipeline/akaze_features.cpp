@@ -10,6 +10,7 @@
 
 #include <semper/seeding.hpp>
 #include <semper/tuning.hpp>
+#include "util/finite.hpp"
 
 #include <opencv2/calib3d.hpp>
 #include <opencv2/features2d.hpp>
@@ -161,15 +162,16 @@ bool homography_at(const cv::Mat& H, double px, double py, double& X, double& Y,
     if (H.rows != 3 || H.cols != 3 || H.type() != CV_64F) return false;
     const double* h = H.ptr<double>(0);
     const double w = h[6] * px + h[7] * py + h[8];
-    if (!std::isfinite(w) || std::abs(w) < 1e-12) return false;
+    // finite_bits, not std::isfinite: -ffast-math may fold the latter to true.
+    if (!util::finite_bits(w) || std::abs(w) < 1e-12) return false;
     X = (h[0] * px + h[1] * py + h[2]) / w;
     Y = (h[3] * px + h[4] * py + h[5]) / w;
     J[0] = (h[0] - X * h[6]) / w;
     J[1] = (h[1] - X * h[7]) / w;
     J[2] = (h[3] - Y * h[6]) / w;
     J[3] = (h[4] - Y * h[7]) / w;
-    return std::isfinite(X) && std::isfinite(Y) && std::isfinite(J[0]) && std::isfinite(J[1]) &&
-           std::isfinite(J[2]) && std::isfinite(J[3]);
+    return util::finite_bits(X) && util::finite_bits(Y) && util::finite_bits(J[0]) &&
+           util::finite_bits(J[1]) && util::finite_bits(J[2]) && util::finite_bits(J[3]);
 }
 
 } // namespace seeding

@@ -8,6 +8,7 @@
 #include <semper/io.hpp>
 
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 #if defined(DIC_HAVE_OPENCV)
@@ -172,6 +173,11 @@ TEST_CASE(ImageCodec, FloatAndSigned_ScaledToGray8) {
     // A flat image has no range to stretch: mid-grey, not a division by zero.
     cv::Mat flat(3, 3, CV_64FC1, cv::Scalar(0.25));
     CHECK(cv::countNonZero(Semper::io::to_gray8(flat) != 128) == 0);
+    // An Inf has no range to stretch either. It used to make the scale 0 and
+    // the frame all black (255 / Inf), and -ffast-math may drop a NaN check.
+    cv::Mat with_inf = f.clone();
+    with_inf.at<float>(1, 3) = std::numeric_limits<float>::infinity();
+    CHECK(cv::countNonZero(Semper::io::to_gray8(with_inf) != 128) == 0);
     // 8-bit grey passes through untouched; colour collapses to one channel.
     cv::Mat g8 = make_gray(5, 4);
     CHECK(cv::countNonZero(Semper::io::to_gray8(g8) != g8) == 0);

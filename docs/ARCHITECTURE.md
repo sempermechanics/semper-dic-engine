@@ -530,10 +530,13 @@ configure.
   architecture-conditional code left in the engine (`#if __aarch64__` was
   removed — do not reintroduce it; extend the kernels instead).
 - Production flags: `-O3 -ffast-math`, plus OpenMP on host when CMake finds
-  it (the pipeline sources call `omp_get_thread_num()` unconditionally, so in
-  practice it is required); Android also uses
+  it. Without it (MSVC, Apple Clang without libomp) the `#pragma omp` regions
+  run on the calling thread: thread indices go through `util::omp_thread()`
+  (`src/util/omp.hpp`), never `omp.h` directly. Android also uses
   `-flto` on the pipeline/JNI targets. Note `-ffast-math` disables NaN
-  semantics; the code uses explicit sentinels (`-1.0f`, `-1000.0f`) instead of
+  semantics: Inf/NaN checks read the bits (`util::finite_bits`,
+  `src/util/finite.hpp`), never `std::isfinite` or `!(x > eps)`, and the
+  code uses explicit sentinels (`-1.0f`, `-1000.0f`) instead of
   `std::isnan`. Preserve this convention. Host shared-lib builds intentionally
   omit `-flto` (MinGW LTO + DLL is unstable).
 - 16 KB page alignment: `-Wl,-z,max-page-size=16384` on the Android shared lib for

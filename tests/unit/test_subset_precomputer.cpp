@@ -14,11 +14,13 @@
 #include "framework/test_framework.h"
 #include "framework/synthetic.h"
 #include <semper/subset.hpp>
+#include "util/finite.hpp"
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 using Semper::Image;
@@ -209,6 +211,26 @@ TEST_CASE(SubsetPrecomputer, LargeSubset_HinvFinite) {
     for (int r = 0; r < 6; ++r)
         for (int c = 0; c < 6; ++c)
             CHECK_NEAR(prod(r, c), (r == c) ? 1.0f : 0.0f, 5e-2);
+}
+
+// finite_bits reads the exponent bits, so -ffast-math (which may fold
+// std::isfinite to true) cannot remove the check. Both widths: the homography
+// and mesh guards are double, the solver's are float.
+TEST_CASE(Finite, FiniteBitsCatchesInfAndNan) {
+    using Semper::util::finite_bits;
+    CHECK(finite_bits(0.0f));
+    CHECK(finite_bits(-1e30f));
+    CHECK(finite_bits(std::numeric_limits<float>::max()));
+    CHECK(finite_bits(std::numeric_limits<float>::denorm_min()));
+    CHECK(!finite_bits(std::numeric_limits<float>::infinity()));
+    CHECK(!finite_bits(-std::numeric_limits<float>::infinity()));
+    CHECK(!finite_bits(std::numeric_limits<float>::quiet_NaN()));
+    CHECK(finite_bits(0.0));
+    CHECK(finite_bits(std::numeric_limits<double>::max()));
+    CHECK(finite_bits(std::numeric_limits<double>::denorm_min()));
+    CHECK(!finite_bits(std::numeric_limits<double>::infinity()));
+    CHECK(!finite_bits(-std::numeric_limits<double>::infinity()));
+    CHECK(!finite_bits(std::numeric_limits<double>::quiet_NaN()));
 }
 
 TEST_CASE(SubsetPrecomputer, IllConditioned_Rejected) {
