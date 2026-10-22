@@ -71,7 +71,7 @@ little interpolation bias; see
 
 ### Host tests
 
-Host correctness (+ sanitizers + C SDK smoke) runs in this repo's GitHub Actions
+Host correctness (+ sanitizers, C SDK smoke, Python bindings, Android NDK build) runs in this repo's GitHub Actions
 (`.github/workflows/ci.yml`). Locally:
 
 ```bash
