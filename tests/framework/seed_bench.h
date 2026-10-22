@@ -108,10 +108,7 @@ inline std::vector<Scenario> scenarios() {
     return s;
 }
 
-// Sorts v in place; every caller is done with the sample's order. Taking it by
-// value made GCC 15 report the inlined copy's delete as -Wfree-nonheap-object
-// (a false positive), which -Werror turned into a failed build.
-inline double percentile(std::vector<double> &v, double p) {
+inline double percentile(std::vector<double> v, double p) {
     if (v.empty()) return -1.0;
     std::sort(v.begin(), v.end());
     size_t i = (size_t)std::llround(p * (double)(v.size() - 1));
