@@ -28,6 +28,13 @@ if (NOT MSVC)
         # SIMD residual tails (reports absurd iteration counts). Keep it as a
         # warning so real -Wall/-Wextra issues still fail the build.
         add_compile_options(-Werror -Wno-error=aggressive-loop-optimizations)
+        # GCC 15 reports copying a std::vector<double> and letting the copy go
+        # out of scope as deleting a pointer it did not allocate
+        # (-Wfree-nonheap-object), inlined from libstdc++ into test bodies.
+        # Same treatment; GCC only, as Clang has no such warning.
+        if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+            add_compile_options(-Wno-error=free-nonheap-object)
+        endif ()
     endif ()
 else ()
     add_compile_options(/O2 /fp:fast /W3)
