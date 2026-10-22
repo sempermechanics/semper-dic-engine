@@ -44,6 +44,22 @@ Both builds ran on the same host, interleaved scenario by scenario: `045a500` (t
 
 The tables below are the new build's. Tables other than S4 also differ in places from this report's first edition, because `045a500` landed in between. It added coasting across gaps, re-anchoring before reporting, and an early reference update when a frame reports 5% fewer points. Those numbers are identical in both builds of this run.
 
+## Update floor: what changed
+
+The reference no longer moves, early or on schedule, to a frame that reports less than half the points of the first frame on the current reference (`kIncUpdateMinReported`). Before that first frame, and always with N = 1, the comparison is with what the reference itself reported. Such a frame is a failed solve. The reference stays, and an update that was due falls to the next frame.
+
+`045a500` made this matter. Its early update fires on any frame that reports 5% fewer points, so a frame whose solve collapsed always became the reference, kept only the one or two points it had (20–40 px off), and lost every other node for good. Before it, only a collapse that happened to land on a scheduled update did that.
+
+- **S4, 2°/f, σ = 2 (10° and 20° steps):**
+  - N = 5 ends at 0.194 px / 94%, where it was 12.7 px / 0% (a wrong lock).
+  - N = 10 ends at 0.146 px / 94%, where it lost the chain from frame 8.
+  - The solves still collapse on 1–2 frames per run (seeding a 110 px ROI at σ = 2 turned 6–10°), and those frames still count as failed. The chain survives them.
+- **S4, 5°/f, σ = 2, N = 10:** 0.070 / 60 → 0.107 / 89. One seed used to adopt a collapsed frame 13.
+- **S3, 5 and 20 px/f, N ≥ 5:** the frame due for update is out of seeding range and reports nothing in either build. Accuracy is identical, and these runs still fail.
+- **Every other run is bit-identical,** frame by frame, in all of S1–S10. Only these 19 runs (scenario, mode, σ, seed) contain a frame below the floor. No run here has a failed first frame on a moved reference, or a failed frame at N = 1. No test covers those two cases of the floor either: since 0.5.0 the unrelated frames in `Incremental.FailedSolve_FirstOnReferenceAndIntervalOne` return `kSeedFailed`, which leaves the session as it was, instead of reporting a few points.
+
+The first edition's 0.133 / 63 for S4 2°/f N = 5 was most likely one seed short as well. With the early update switched off, this build reads 0.137 / 63: seed 1 loses the chain at a scheduled update onto a collapsed frame 15, which the floor now defers.
+
 ## Running it
 
 ```bash
@@ -158,11 +174,11 @@ Values are rms px / coverage % at the last frame.
 
 The fixed reference fails, and stays failed, once the total displacement passes the seeding capture range of about 48 px (half the 96 px phase-correlation window). Incremental mode carries the reference along and tracks the full 200 px.
 
-The same limit applies to the step between references: N × (motion per frame) must stay under ~48 px. That is why N = 10 fails at 5 px/frame and N = 5 fails at 20 px/frame.
+The same limit applies to the step between references: N × (motion per frame) must stay under ~48 px. That is why N = 10 fails at 5 px/frame and N = 5 fails at 20 px/frame. The reference no longer moves onto those empty frames, but every later frame is just as far out of range.
 
 ### S4. Rigid rotation to 90°
 
-Values are rms px / coverage % at the listed frame. Where rotation-aware seeding changed a cell, the `045a500` value (translation-only seeding) comes first.
+Values are rms px / coverage % at the listed frame. Where rotation-aware seeding changed a cell, the `045a500` value (translation-only seeding) comes first. Cells marked ¹ changed with the update floor; the value before it comes first.
 
 | case | fixed | N=1 | N=2 | N=5 | N=10 |
 |---|---|---|---|---|---|
@@ -171,9 +187,9 @@ Values are rms px / coverage % at the listed frame. Where rotation-aware seeding
 | 0.45°/f, σ = 2, at 45° (f100) | 0.067 / 82 | 0.688 / 58 | 0.493 / 86 | 0.265 / 97 → 0.264 / 97 | 0.176 / 100 → 0.168 / 100 |
 | 0.45°/f, σ = 2, at 90° (f200) | – → **0.077 / 101** | 1.189 / 23 | 0.847 / 58 | 0.409 / 91 → 0.407 / 91 | 0.295 / 96 → 0.282 / 97 |
 | 2°/f, σ = 0, at 90° (f45) | 0.000 / 62 → **0.001 / 100** | 0.083 / 100 | 0.045 / 100 | 0.020 / 99 → 0.020 / 100 | 0.059 / 100 → **0.013 / 100** |
-| 2°/f, σ = 2, at 90° (f45) | 0.029 / 20 → **0.087 / 99** | 0.406 / 87 → 0.403 / 87 | 0.269 / 92 → 0.264 / 92 | 12.7 / 0 (wrong lock) | – |
+| 2°/f, σ = 2, at 90° (f45) | 0.029 / 20 → **0.087 / 99** | 0.406 / 87 → 0.403 / 87 | 0.269 / 92 → 0.264 / 92 | 12.7 / 0 (wrong lock) → **0.194 / 94** ¹ | – → **0.146 / 94** ¹ |
 | 5°/f, σ = 0, at 90° (f18) | 0.000 / 62 → **0.001 / 100** | 0.045 / 100 → 0.033 / 100 | 0.020 / 99 → 0.020 / 100 | 0.206 / 86 → **0.010 / 100** | 3.406 / 84 → **0.007 / 100** |
-| 5°/f, σ = 2, at 90° (f18) | – → **0.087 / 99** | 0.193 / 62 → **0.279 / 94** | 0.129 / 63 → **0.184 / 95** | 0.194 / 60 → 0.220 / 89 | – → 0.070 / 60 |
+| 5°/f, σ = 2, at 90° (f18) | – → **0.087 / 99** | 0.193 / 62 → **0.279 / 94** | 0.129 / 63 → **0.184 / 95** | 0.194 / 60 → 0.220 / 89 | – → 0.070 / 60 → **0.107 / 89** ¹ |
 
 Axis-aligned subsets stop matching a turning pattern, and translation-only seeding hands them a guess that is wrong by the rotation. The anchor lattice now measures rotation and scale from the log-polar spectrum and seeds the subsets with the turned shape.
 
@@ -197,7 +213,7 @@ Within 4° of the quarter turn the estimate locks in 27 of 30 solves, and the fr
 **Incremental mode** benefits wherever one step between references is a rotation the estimate resolves:
 - Noise-free at 5°/frame, N = 5 and N = 10 (25° and 50° steps) now track every node to 0.010 / 0.007 px. They lost 14–16% of nodes before, and N = 10 ended 3.4 px off.
 - With noise at 5°/frame, N = 1 and N = 2 keep 94–95% coverage at 90°, against 62–63%. Their rms rises because it now includes the roughly 30% of nodes they used to lose. N = 5 no longer drops frames (13 → 0 of 54), and N = 10 drops 6 instead of 23.
-- With noise at 2°/frame, N = 5 (10° steps) locks onto a wrong solution at frame 45 in both builds: 12.7 px rms, no point within 0.5 px. It read 0.133 / 63 in this report's first edition, before `045a500`. N = 10 (20° steps) loses the chain from frame 8 in both builds.
+- With noise at 2°/frame, N = 5 and N = 10 (10° and 20° steps) end at 0.194 / 94 and 0.146 / 94. The solve still collapses on one or two frames per run, where the seed locks onto a wrong solution and reports a point or two 20–40 px off. Before the update floor such a frame became the reference: N = 5 ended locked 12.7 px off with no point within 0.5 px, and N = 10 lost the chain from frame 8.
 
 N = 5–10 still follows the full quarter turn at 0.45°/frame, with or without noise: noise-free it ends at 0.04–0.07 px with every node tracked. N = 1 pays for its 200 updates and ends at 0.8 px.
 
@@ -307,6 +323,8 @@ Only five real frames exist, and the fixed reference correlates through all of t
 
 ![accuracy against cost, every scenario with noise](images/incremental/accuracy_vs_cost.png)
 
+This plot predates the update floor, so its S4 2°/f N = 5 and N = 10 points (σ = 2) still show the failed runs. The S4 re-runs for the floor timed at 0.7–1.4× this run's frame times: one shared the host with other benchmarks, and one ran alone. That spread is host drift (see below), so they were not mixed into this plot.
+
 On frames that keep the reference (N > 1), the per-reference cache (node scan and Hessian pool) is reused, so `hold ms` is at or below `upd ms`.
 
 **Rotation-aware seeding.** On the 110 px ROI here, the log-polar estimate costs about 0.55 ms per solve on top of the 0.25 ms translation correlation (0.8 ms against 0.25 ms; at 200 px it is 0.9 against 0.7 ms, and at 320 px it is cheaper than the translation correlation). The reference half is prepared once per reference. It runs on every solve, in every mode, because only its result decides whether the similarity is used. Its effects:
@@ -338,5 +356,5 @@ The first frame against a reference costs the same as before or a little more, s
    - speckle that changes appearance (reflections, necking, lighting).
 
    Rotation-aware seeding carries the fixed reference through 90° where its log-polar estimate locks: on clean images, or with a ROI of about 200 px or more at σ = 2 GL (SEEDING_BENCHMARK.md §4.5.1). A 110 px ROI on noisy images does not get that far. In the app, losing correlation shows as coverage falling frame after frame.
-3. **Move the reference as seldom as works.** Pick N so that N × (motion per frame) stays under ~40 px. Keep the rotation per step under ~5° on noisy images with a small ROI: 10° steps at σ = 2 locked onto a wrong solution here. On clean images, steps of 25–50° tracked. On video at full frame rate that is N = 5–10; on frames a second or more apart it is N = 1–2.
+3. **Move the reference as seldom as works.** Pick N so that N × (motion per frame) stays under ~40 px. Keep the rotation per step under ~5° on noisy images with a small ROI: 10° steps at σ = 2 track here, but now and then a frame fails to solve. On clean images, steps of 25–50° tracked. On video at full frame rate that is N = 5–10; on frames a second or more apart it is N = 1–2.
 4. **Use the 6×6 interpolator** for incremental runs on clean images. It cuts the per-update bias 2–6×.

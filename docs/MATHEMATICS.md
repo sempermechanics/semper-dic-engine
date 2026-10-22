@@ -962,8 +962,20 @@ when that frame reports `kIncEarlyUpdateDrop` = 5% fewer points than the
 first frame solved against the current reference. That happens when the
 increment has outgrown what the images still correlate over, as with fast
 loading, necking or whitening. On the tensile video it lifts the late-test
-minimum at N = 20 from 337 to 397 points, and changes nothing at N = 5. Its image is already prepared for correlation (intensities
-and gradients), so it is handed over without decoding or preparing it again.
+minimum at N = 20 from 337 to 397 points, and changes nothing at N = 5.
+Neither the early nor the scheduled update moves the reference to a frame that
+reports less than `kIncUpdateMinReported` = half of that first frame (before
+the first frame, and always with N = 1: half of what the reference itself
+reported when it was solved, so a failed first frame is caught too). Such a
+frame is a failed solve, not a grown increment: on a 110 px ROI at σ = 2
+turned 6–10° from its reference, the seed now and then locks onto a wrong
+solution and reports one or two points 20–40 px off. Moving onto it would keep
+only those. The reference stays, the next frame is solved against it, and an
+update that was due falls to that frame. In IncBench S4 (2°/frame, σ = 2) this
+keeps N = 5 at 0.19 px and 94% coverage at 90°, where adopting the failed
+frames ended 12.7 px off. The new reference's image is already prepared for
+correlation (intensities and gradients), so it is handed over without decoding
+or preparing it again.
 The ROI mask has to follow the material, so the frame-0 mask is warped
 forward. Every material pixel of the frame-0 window (the grid widened by
 `kIncMaskExtrapCells` = 3 cells plus half a subset) is sampled on a sub-pixel

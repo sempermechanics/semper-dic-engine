@@ -44,6 +44,7 @@ using Semper::pipeline::IncrementalSession;
 using Semper::pipeline::ReferenceCache;
 using Semper::pipeline::kBadStrainWindow;
 using Semper::pipeline::kCancelled;
+using Semper::pipeline::kSeedFailed;
 using Semper::pipeline::run_full_field;
 
 namespace {
@@ -705,16 +706,154 @@ TEST_CASE(Incremental, EarlyUpdate_WhenReportedPointsDrop) {
         if (f.info.reference_updated) {
             updates++;
             CHECK(f.rc < 0.95 * first_on_ref);
+            CHECK(f.rc >= 0.5 * first_on_ref);   // never onto a failed solve
             if (t + 1 < T) CHECK(inc[t + 1].info.reference_frame == t + 1);
             first_on_ref = -1;
         } else {
-            CHECK(f.rc >= 0.95 * first_on_ref);
+            CHECK(f.rc >= 0.95 * first_on_ref || f.rc < 0.5 * first_on_ref);
         }
     }
     std::printf("  [early update N=100 T=%d] %d early updates\n", T, updates);
     CHECK(updates > 0);
     // A fixed reference never updates, early or not.
     for (const Frame &f : run_session(s, cv::Mat(), p, 0)) CHECK(!f.info.reference_updated);
+}
+
+TEST_CASE(Incremental, FailedSolve_NeverBecomesTheReference) {
+    // 1 px/frame drift, N = 5, with two frames replaced by a different speckle
+    // that nothing correlates with: frame 3, mid-interval, and frame 10.
+    // Nothing seeds on either, so each returns kSeedFailed and, as every error
+    // does, leaves the session as it was (CONTRACT: the same frame could be
+    // submitted again). It is not counted and writes no info, so the session's
+    // frame indices run one behind the caller's after each: frame 6 is its
+    // fifth and takes the scheduled update as "frame 5", and frame 12 as
+    // "frame 10". The chain carries on across both.
+    const int T = 14;
+    Sequence s = stretch_rotate_sequence(320, 320, T, 0.0, 0.0, 0.3, 1.0f, 31, (double)T, 0.0);
+    const dictest::SmoothSpeckleField other(977, 320, 320);
+    for (int t : {3, 10}) {
+        s.frames[t - 1] = dictest::render_frame(other, 320, 320, dictest::identity_motion(), 1.0f, 5000 + t);
+    }
+    const FullFieldParams p = centred_params(320, 320, 160);
+    const std::vector<Frame> inc = run_session(s, cv::Mat(), p, 5);
+    REQUIRE((int)inc.size() == T);
+    const int first = inc[0].rc;
+    REQUIRE(first > 0);
+    for (int t : {3, 10}) {
+        CHECK(inc[t - 1].rc == kSeedFailed);
+        CHECK(!inc[t - 1].info.reference_updated);
+    }
+    CHECK(inc[3].info.reference_frame == 0);    // frame 4: still on frame 0
+    CHECK(!inc[4].info.reference_updated);      // frame 5: the session's fourth
+    CHECK(inc[5].info.reference_updated);       // frame 6: its fifth, on schedule
+    CHECK(inc[6].info.reference_frame == 5);
+    CHECK(inc[10].info.reference_frame == 5);   // frame 11: still on it ...
+    CHECK(!inc[10].info.reference_updated);
+    CHECK(inc[11].info.reference_updated);      // ... frame 12, its tenth, moves it
+    CHECK(inc[12].info.reference_frame == 10);
+    for (int t = 1; t <= T; ++t) {
+        if (t == 3 || t == 10) continue;
+        const Accuracy a = evaluate(inc[t - 1], s.motion[t - 1], 0.2);
+        CHECK(a.points >= (int)(0.95 * first));
+        CHECK(a.within >= (int)(0.95 * a.points));
+    }
+}
+
+TEST_CASE(Incremental, FailedSolve_FirstOnReferenceAndIntervalOne) {
+    // The same drift with unrelated frames where the count the floor compares
+    // with is not yet set. N = 5: frame 6, the first after the reference moved
+    // to frame 5, and frame 10. N = 1: frame 4. Each returns kSeedFailed and
+    // leaves the session as it was, so it neither sets that count nor is
+    // counted itself: with N = 5 the next frame (7) is the first on frame 5,
+    // and the scheduled update falls on frame 12; with N = 1 frame 5 is
+    // solved against frame 3 and becomes the reference as the session's
+    // fourth frame.
+    const int T = 14;
+    const dictest::SmoothSpeckleField other(977, 320, 320);
+    auto with_failures = [&](std::initializer_list<int> bad) {
+        Sequence s = stretch_rotate_sequence(320, 320, T, 0.0, 0.0, 0.3, 1.0f, 31, (double)T, 0.0);
+        for (int t : bad) {
+            s.frames[t - 1] = dictest::render_frame(other, 320, 320, dictest::identity_motion(), 1.0f, 5000 + t);
+        }
+        return s;
+    };
+    const FullFieldParams p = centred_params(320, 320, 160);
+    auto accurate_except = [&](const Sequence &s, const std::vector<Frame> &inc, std::initializer_list<int> bad) {
+        const int first = inc[0].rc;
+        for (int t = 1; t <= T; ++t) {
+            if (std::find(bad.begin(), bad.end(), t) != bad.end()) {
+                CHECK(inc[t - 1].rc == kSeedFailed);
+                CHECK(!inc[t - 1].info.reference_updated);
+                continue;
+            }
+            const Accuracy a = evaluate(inc[t - 1], s.motion[t - 1], 0.2);
+            CHECK(a.points >= (int)(0.95 * first));
+            CHECK(a.within >= (int)(0.95 * a.points));
+        }
+    };
+
+    const Sequence s5 = with_failures({6, 10});
+    const std::vector<Frame> n5 = run_session(s5, cv::Mat(), p, 5);
+    REQUIRE((int)n5.size() == T);
+    accurate_except(s5, n5, {6, 10});
+    CHECK(n5[4].info.reference_updated);       // frame 5: on schedule
+    CHECK(n5[6].info.reference_frame == 5);    // frame 7: first on frame 5
+    CHECK(n5[10].info.reference_frame == 5);   // frame 11: still on frame 5 ...
+    CHECK(!n5[10].info.reference_updated);
+    CHECK(n5[11].info.reference_updated);      // ... frame 12 takes the update
+    CHECK(n5[12].info.reference_frame == 10);
+
+    const Sequence s1 = with_failures({4});
+    const std::vector<Frame> n1 = run_session(s1, cv::Mat(), p, 1);
+    REQUIRE((int)n1.size() == T);
+    accurate_except(s1, n1, {4});
+    CHECK(n1[2].info.reference_updated);       // frame 3 is the reference ...
+    CHECK(n1[4].info.reference_frame == 3);    // ... frame 5 is solved against it
+    CHECK(n1[4].info.reference_updated);       // ... and becomes the reference
+    CHECK(n1[5].info.reference_frame == 4);    // the session's fourth frame
+}
+
+TEST_CASE(Incremental, Rotation2DegNoisy_N5_KeepsTheChainThroughFailedSolves) {
+    // IncBench S4 "rotate 2 deg/f", sigma 2, N = 5 (10 deg between references),
+    // noise seeds 0 and 1, as rendered there. A 110 px noisy ROI turned 6-10
+    // deg now and then fails to seed and reports a point or two, 20-40 px off:
+    // seed 0 at frame 36 (8 deg from its reference, which the early update had
+    // moved off the 5-frame grid), seed 1 at frame 15 (a scheduled update).
+    // Both used to become the reference, and every later frame was lost or
+    // locked 38 px off. Now the next frame takes the update.
+    const int W = 256, T = 45;
+    const dictest::SmoothSpeckleField field(101, W, W);
+    FullFieldParams p;
+    p.rect_x = p.rect_y = (W - 110) / 2;
+    p.rect_w = p.rect_h = 110;
+    p.step = 5;
+    p.subset_size = 21;
+    p.strain_window = 15;
+    for (int seed : {0, 1}) {
+        const unsigned nseed = 7919u * (unsigned)(seed + 1);
+        Sequence s;
+        s.w = s.h = W;
+        s.ref = dictest::render_frame(field, W, W, dictest::identity_motion(), 2.0f, nseed);
+        for (int t = 1; t <= T; ++t) {
+            dictest::Motion m = dictest::stretch_rotate(0.0, 0.0, 2.0 * t * kPi / 180.0, dictest::Vec2{},
+                                                        dictest::Vec2{128, 128});
+            s.frames.push_back(dictest::render_frame(field, W, W, m, 2.0f, nseed + (unsigned)t));
+            s.motion.push_back(std::move(m));
+        }
+        const std::vector<Frame> inc = run_session(s, cv::Mat(), p, 5);
+        REQUIRE((int)inc.size() == T);
+        int failed = 0;
+        for (const Frame &f : inc) failed += (f.rc < inc[0].rc / 2) ? 1 : 0;
+        const Accuracy last = evaluate(inc[T - 1], s.motion[T - 1], 0.5);
+        std::printf("  [rotate 2 deg/f sigma 2 N=5 seed %d] %d failed solves; f45: %d points, %d within 0.5 px, "
+                    "rms %.3f px\n", seed, failed, last.points, last.within, last.rms_u);
+        // Measured: seed 0 1 failed solve, f45 370 points, 364 within 0.5 px,
+        // 0.162 px; seed 1 2, 400, 388, 0.195 px. Before: 10 failed solves and
+        // 1 point at 38 px (seed 0); 31 and nothing (seed 1).
+        CHECK(last.points >= (int)(0.9 * inc[0].rc));
+        CHECK(last.within >= (int)(0.9 * last.points));
+        CHECK(last.rms_u < 0.4);
+    }
 }
 
 #else
