@@ -540,12 +540,20 @@ MeshSeedResult solve_anchor_seeds(
     // Refit the global homography to the kept anchors: they are good to ~0.01 px
     // where the keypoints were good to the RANSAC tolerance at the detection
     // scale, and this is what the nodes outside the mesh start from. Without
-    // enough anchors the AKAZE fit stands (or nothing, without a model).
+    // enough anchors the AKAZE fit stands (or nothing, without a model) --
+    // unless its own lattice just rejected it: the mesh would then seed every
+    // node outside it from the model found wrong, which is how a wrong-speckle
+    // cluster gets in, so those nodes are left to the flood fill instead.
+    bool refitted = false;
     if (out.accepted >= tuning::kAnchorRefitMinPoints) {
         cv::Mat H = cv::findHomography(out.ref_pts, out.def_pts, cv::RANSAC,
                                        tuning::kAnchorRefitRansacPx);
-        if (H.rows == 3 && H.cols == 3 && cv::checkRange(H)) out.homography = H;
+        if (H.rows == 3 && H.cols == 3 && cv::checkRange(H)) {
+            out.homography = H;
+            refitted = true;
+        }
     }
+    if (out.model_rejected && !refitted) out.homography.release();
     out.def_features = std::move(gm.def_side);
 
     LOGD("ROUTING: anchor lattice %d/%d kept (%d as output, cov %.2f, AKAZE %s "

@@ -4,7 +4,7 @@
 // Named constants for the DIC pipeline / strain paths.
 // Values match the pre-centralization literals exactly (rename-only). Do not
 // change a number here without re-baselining throughput and field quality
-// against docs/engine/PERF_BASELINE_bd44af0.md.
+// against docs/PERF_BASELINE_bd44af0.md.
 
 namespace Semper {
 namespace tuning {

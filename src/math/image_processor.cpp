@@ -1,9 +1,19 @@
 #include <semper/image.hpp>
 #include <cmath>
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
 
 namespace Semper {
 
     Image::Image(int_t w, int_t h, const uint8_t *raw_pixels) : width(w), height(h) {
+        // Every pixel index below and in the solver is an int: a w * h that
+        // wraps would size the planes small and the row loops would then
+        // write past them.
+        if (w < 0 || h < 0 ||
+            (int64_t)w * (int64_t)h > (int64_t)std::numeric_limits<int>::max()) {
+            throw std::length_error("Image: width * height does not fit in an int");
+        }
         intensities.resize(w * h);
         for (int i = 0; i < w * h; ++i) {
             intensities[i] = static_cast<scalar_t>(raw_pixels[i]);

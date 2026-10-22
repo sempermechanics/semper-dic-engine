@@ -3,6 +3,8 @@
 #include "full_field_internal.hpp"
 #include "util/log.hpp"
 #include <opencv2/imgproc.hpp>
+#include <cstdint>
+#include <limits>
 
 namespace Semper {
 namespace pipeline {
@@ -52,6 +54,10 @@ void ReferenceCache::set_from_gray(const cv::Mat& gray_in, const cv::Mat& roi_ma
     // io::to_gray8 converts.
     if (gray_in.empty() || gray_in.type() != CV_8UC1) return;
     if (!roi_mask.empty() && roi_mask.type() != CV_8UC1) return;
+    // Every pixel index in the engine is an int (validate_params); refuse a
+    // larger image before copying it rather than when the solve starts.
+    if ((int64_t)gray_in.cols * (int64_t)gray_in.rows >
+        (int64_t)std::numeric_limits<int>::max()) return;
     gray = gray_in.clone();
     width = gray.cols;
     height = gray.rows;

@@ -79,7 +79,6 @@ using ReliabilityQueue = std::priority_queue<SeedNode, std::vector<SeedNode>, Re
 struct CellTask {
     int x = 0, y = 0;
     float gu = 0, gv = 0, gux = 0, guy = 0, gvx = 0, gvy = 0;
-    bool counts_as_path_b = true; // seeds (lattice vertices, Path C) are not counted
 
     bool initialized = false;     // subset fit inside the image
     bool needed_rescue = false;   // Simplex ran
@@ -132,7 +131,7 @@ void commit_cell(const SolveContext& ctx, const CellTask& t, ResultGrid& resultG
               res.correlation_score, true, t.tid, order, gp.mesh_assignment_type,
               t.needed_rescue, res.iters};
         ctx.global_points_solved.fetch_add(1, std::memory_order_relaxed);
-        if (t.counts_as_path_b) bucket.points_solved++;
+        bucket.points_solved++;
         q.push(SeedNode(t.x, t.y, res.u, res.v, res.ux, res.uy, res.vx, res.vy, res.correlation_score));
     } else {
         gp.corr = CORR_INVALID;
@@ -246,7 +245,9 @@ void run_path_b(
 
     // Seeds (only when Path A left no boundary): solved serially, in their
     // sorted order, before the flood starts — all of them, as the threaded
-    // version did on any device with at least as many cores as seeds.
+    // version did on any device with at least as many cores as seeds. They
+    // count as Path B (slot 4): no other path published them, and left out of
+    // every slot they broke the metrics identity on the Path C route.
     for (const auto& seed : global_seeds) {
         if (ctx.cancel.requested()) return;
         const int flat = seed.y_idx * gridW + seed.x_idx;
@@ -255,7 +256,6 @@ void run_path_b(
         CellTask t;
         t.x = seed.x_idx; t.y = seed.y_idx;
         t.gu = seed.u; t.gv = seed.v;
-        t.counts_as_path_b = false;
         solve_cell(ctx, engines[0], subsets[0], t);
         commit_cell(ctx, t, resultGrid, stats_pathB, q);
     }
@@ -316,6 +316,7 @@ void run_path_b(
     while (rounds.size() < 2 && claim_round()) {}
     advance(); // commits any round that claimed nothing; may finish outright
 
+    RegionErrors errors;
     std::vector<std::thread> workers;
     struct WorkerGuard { std::vector<std::thread> &ws; ~WorkerGuard() { for (auto &w : ws) if (w.joinable()) w.join(); } } wg{workers};
 
@@ -357,18 +358,20 @@ void run_path_b(
                         cv.notify_all();
                     }
                 }
-            } catch (const std::exception &e) {
-                // A worker that throws mid-task leaves its round unfinished,
-                // so the flood can never commit past it. Log it and stop the
-                // flood so the solve ends with a partial field, not a hang.
-                LOGE("Path B worker %d aborted: %s", w, e.what());
-                std::lock_guard<std::mutex> lg(mtx); done = true; cv.notify_all();
             } catch (...) {
-                LOGE("Path B worker %d aborted: unknown exception", w);
+                // A worker that throws mid-task leaves its round unfinished,
+                // so the flood can never commit past it. Stop the flood so the
+                // others return rather than hang, and rethrow once all are
+                // joined, as the OpenMP regions do: the partial field this
+                // used to return reported success.
+                LOGE("Path B worker %d aborted", w);
+                errors.capture();
                 std::lock_guard<std::mutex> lg(mtx); done = true; cv.notify_all();
             }
         });
     }
+    for (auto &w : workers) if (w.joinable()) w.join();
+    errors.rethrow_if_any();
 }
 
 } // namespace internal

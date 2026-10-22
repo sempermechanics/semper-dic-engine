@@ -161,3 +161,74 @@ def test_rect_larger_than_image_is_clipped():
     with pytest.raises(semper.DicError) as excinfo:
         eng.run(ref, rect=(300, 0, 64, 64), step=20, subset=31, strain_window=41)
     assert excinfo.value.code == semper.ERR_ROI
+
+
+def test_undecodable_mask_raises_not_ignored():
+    # Mask bytes that do not decode used to mean "no mask": the solve ran over
+    # the regions the caller excluded and reported success.
+    ref = _speckle()
+    junk = bytes([0xAB]) * 37
+    eng = semper.Engine()
+    with pytest.raises(ValueError):
+        eng.set_reference(ref, mask=junk)
+    eng.set_reference(ref)
+    with pytest.raises(ValueError):
+        eng.run(ref, rect=(40, 40, 176, 176), step=20, subset=31, strain_window=41, mask=junk)
+    with pytest.raises(ValueError):
+        semper.IncrementalSession(ref, (40, 40, 176, 176), step=20, subset=31,
+                                  strain_window=41, mask=junk)
+
+
+def test_non_positive_step_is_roi_error():
+    # A zero-sized output buffer used to be reported as ERR_INIT ("was
+    # set_reference called?") before the step was ever validated.
+    ref = _speckle()
+    eng = semper.Engine()
+    eng.set_reference(ref)
+    for step in (0, -5):
+        res = eng.run(ref, rect=(40, 40, 176, 176), step=step, subset=31, strain_window=41,
+                      raise_on_error=False)
+        assert res.count == semper.ERR_ROI
+
+
+def test_progress_callback_ends_at_100():
+    ref = _speckle()
+    seen = []
+    eng = semper.Engine()
+    eng.set_reference(ref)
+    res = eng.run(np.roll(ref, 2, axis=1), rect=(40, 40, 176, 176), step=10, subset=31,
+                  strain_window=41, progress=seen.append)
+    assert res.count > 0
+    assert seen and seen[-1] == 100
+    assert seen == sorted(seen)
+
+
+def test_calls_on_one_engine_are_serialised():
+    # run() releases the GIL; a set_reference() from another thread used to
+    # free the reference under the solve. Calls on one engine now wait for
+    # each other, and cancel() still never waits.
+    import threading
+
+    ref = _speckle()
+    other = _speckle(seed=1)
+    eng = semper.Engine()
+    eng.set_reference(ref)
+    started = threading.Event()
+    results = []
+
+    def solve():
+        results.append(eng.run(np.roll(ref, 2, axis=1), rect=(20, 20, 216, 216), step=5,
+                               subset=31, strain_window=41,
+                               progress=lambda pct: started.set(), raise_on_error=False))
+
+    t = threading.Thread(target=solve)
+    t.start()
+    started.wait(timeout=30)
+    for _ in range(5):
+        eng.set_reference(other)
+        eng.set_reference(ref)
+    eng.cancel()   # must not deadlock against the solve holding the lock
+    t.join(timeout=60)
+    assert not t.is_alive()
+    assert len(results) == 1
+    assert results[0].count > 0 or results[0].count == semper.ERR_CANCELLED

@@ -433,6 +433,88 @@ TEST_CASE(SeedBench, AnchorSeedingQualityGate) {
 }
 
 // ---------------------------------------------------------------------------
+// A model its own lattice rejects must not seed the nodes outside the mesh.
+// AnchorSeedingRotationGate's 15 deg turn, with the centre of the ROI blank in
+// both frames: AKAZE locks on the speckle, the full model is tried, and its
+// lattice keeps the textured three quarters -- under kSimilarityKeepFraction,
+// so the model is rejected. Started from the translation alone, the anchors
+// left on texture sit 20 px and more from where they start and none is kept.
+// With no anchors there is nothing to refit, and the AKAZE homography the
+// lattice had just rejected used to go on to build_mesh_guess_field, which
+// seeds every node outside the mesh from it.
+// ---------------------------------------------------------------------------
+TEST_CASE(SeedBench, RejectedModelDoesNotSeedOutsideMesh) {
+    dictest::SpeckleField field(/*seed=*/11, W, H, BLOBS);
+    cv::Mat ref_gray = dictest::gray8(dictest::make_reference_image(field, W, H), 0.0f, 101);
+    cv::Mat def_gray = dictest::gray8(dictest::make_deformed_image(field, W, H, rotation(15.0)),
+                                      0.0f, 202);
+    // A 160 px blank square at the centre; in the deformed frame it also
+    // covers where the turn takes the square's corners.
+    ref_gray(cv::Rect(240, 240, 160, 160)).setTo(128);
+    def_gray(cv::Rect(222, 222, 196, 196)).setTo(128);
+
+    Row row;
+    row.scenario = "blank_centre_rot_15deg";
+    measure_seed(row, affine_truth(rotation(15.0)), ref_gray, def_gray, big_motion_params());
+    std::printf("    lock=%s model=%d rejected=%d kept %d/%d q=%d homography=%d\n",
+                row.locked ? "yes" : "NO", row.model ? 1 : 0, row.model_rejected ? 1 : 0,
+                row.anchors_accepted, row.anchors_attempted, row.quality,
+                row.homography ? 1 : 0);
+
+    // The scenario, so the check below cannot pass vacuously.
+    REQUIRE(row.locked);
+    REQUIRE(row.model_rejected);
+    REQUIRE(row.anchors_accepted < Semper::tuning::kAnchorRefitMinPoints);
+    CHECK(!row.homography);
+}
+
+// ---------------------------------------------------------------------------
+// The metrics identity (CONTRACT.md, slots 19, 20, 23) on the Path C route.
+// StretchSeedsWithoutBlunders' 45% stretch leaves AKAZE no model, and a
+// one-row grid has no anchor lattice, so nothing is published, the mesh is
+// NONE, Path C finds the seed and Path B solves the row from it. Path B
+// solved its seeds without counting them in any slot, so slot 1 came out
+// ahead of 3 + 4 + 19 by the number of seeds.
+// ---------------------------------------------------------------------------
+TEST_CASE(SeedBench, MetricsIdentityHoldsOnPathCRoute) {
+    const int w = 384, h = 256;
+    const dictest::SmoothSpeckleField field(101, w, h);
+    const cv::Mat ref = dictest::render_frame(field, w, h, dictest::identity_motion(), 0.0f, 7919u);
+    const dictest::Motion m =
+            dictest::stretch_rotate(0.45, 0.3, 0.0, dictest::Vec2{}, dictest::Vec2{192, 128});
+    const cv::Mat def = dictest::render_frame(field, w, h, m, 0.0f, 7919u + 150u);
+
+    FullFieldParams p;
+    p.rect_x = 172;
+    p.rect_y = 128;
+    p.rect_w = 8 * 5;
+    p.rect_h = 5;
+    p.step = 5;
+    p.subset_size = 21;
+    p.strain_window = 11;
+    p.use_6x6_interpolator = false;
+
+    ReferenceCache cache;
+    cache.set_from_gray(ref, cv::Mat());
+    std::vector<float> out(8 * 8, 0.0f);
+    float metrics[Semper::pipeline::kMetricsLen];
+    for (float &v : metrics) v = -1.0f;
+    const int n = Semper::pipeline::run_full_field(cache, def, cv::Mat(), p, out.data(),
+                                                   (int)out.size(), metrics,
+                                                   Semper::pipeline::kMetricsLen, nullptr);
+    std::printf("    rc %d  seeding %g lock %g  3:%g + 4:%g + 19:%g  vs  1:%g + 20:%g + 23:%g\n",
+                n, metrics[16], metrics[21], metrics[3], metrics[4], metrics[19], metrics[1],
+                metrics[20], metrics[23]);
+    REQUIRE(n >= 0);
+    // The route under test: no lock, no anchors, Path C seeded Path B.
+    REQUIRE(metrics[21] == 0.0f);
+    REQUIRE(metrics[16] == 0.0f);
+    CHECK(metrics[19] == 0.0f);
+    CHECK(metrics[4] > 0.0f);
+    CHECK(metrics[3] + metrics[4] + metrics[19] == metrics[1] + metrics[20] + metrics[23]);
+}
+
+// ---------------------------------------------------------------------------
 // The publish gate. solve_anchor_seeds records outcomes and publishes nothing;
 // publish_anchor_results applies them once the universal median test has run.
 // Nothing in the fixtures below produces a blunder that clears kCorrAccept and

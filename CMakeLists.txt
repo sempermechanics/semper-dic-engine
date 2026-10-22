@@ -61,6 +61,7 @@ target_include_directories(semper_math SYSTEM PUBLIC
 target_compile_definitions(semper_math PRIVATE
         $<$<BOOL:${SEMPER_ANDROID}>:SEMPER_ANDROID_LOG=1>
         $<$<NOT:$<BOOL:${SEMPER_ANDROID}>>:SEMPER_HOST_LOG=1>
+        $<$<BOOL:${SEMPER_VERBOSE_LOG}>:SEMPER_HOST_VERBOSE=1>
 )
 if(NOT MSVC)
     target_compile_options(semper_math PRIVATE -O3 -ffast-math -fPIC -fvisibility=hidden -Wall -Wextra)
@@ -114,6 +115,7 @@ target_link_libraries(semper_pipeline
 target_compile_definitions(semper_pipeline PRIVATE
         $<$<BOOL:${SEMPER_ANDROID}>:SEMPER_ANDROID_LOG=1>
         $<$<NOT:$<BOOL:${SEMPER_ANDROID}>>:SEMPER_HOST_LOG=1>
+        $<$<BOOL:${SEMPER_VERBOSE_LOG}>:SEMPER_HOST_VERBOSE=1>
 )
 if(NOT MSVC)
     # Apply aggressive flags only to our TUs, not OpenCV (added after add_subdirectory).

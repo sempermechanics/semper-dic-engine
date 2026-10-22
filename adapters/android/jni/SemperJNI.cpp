@@ -99,7 +99,9 @@ struct ProgressBridge {
 };
 
 // Decode an optional byte array (encoded image, or raw pixels at w x h).
-// Returns false only when the array exists but its elements cannot be read.
+// Returns false when the array exists but its elements cannot be read or do
+// not decode: a mask that failed to decode used to mean "no mask", and the
+// solve then reported a field over the regions the caller excluded.
 bool decode_optional(JNIEnv* env, jbyteArray bytes, int w, int h, cv::Mat& out) {
     out.release();
     if (bytes == nullptr || env->GetArrayLength(bytes) <= 0) return true;
@@ -112,7 +114,7 @@ bool decode_optional(JNIEnv* env, jbyteArray bytes, int w, int h, cv::Mat& out) 
         ~Release() { env->ReleaseByteArrayElements(bytes, buf, JNI_ABORT); }
     } release{env, bytes, buf};
     out = Semper::io::decode_gray(reinterpret_cast<uint8_t*>(buf), (size_t)len, w, h);
-    return true;
+    return !out.empty();
 }
 
 // Metrics slots handed to the solver: all of them (CONTRACT.md "Metrics buffer").

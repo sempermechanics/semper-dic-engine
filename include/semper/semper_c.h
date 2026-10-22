@@ -83,7 +83,8 @@ SEMPER_C_API void           semper_destroy(semper_engine* eng);
  * Cache the reference image (call once before a batch of runs against it).
  * `img`/`mask` are encoded bytes (PNG/JPEG) or, when expected_w/expected_h > 0, a
  * raw RGBA/ALPHA_8 buffer. `mask`/`mask_len` may be NULL/0 for no ROI mask.
- * Returns 0 on success, SEMPER_ERR_INIT on decode failure.
+ * Returns 0 on success, SEMPER_ERR_INIT on decode failure -- of the mask too:
+ * mask bytes that do not decode are never treated as "no mask".
  */
 SEMPER_C_API int semper_set_reference(semper_engine* eng,
                          const uint8_t* img, size_t img_len,
@@ -94,7 +95,11 @@ SEMPER_C_API int semper_set_reference(semper_engine* eng,
  * Run the full-field solve for one deformed image against the cached reference.
  * `out` receives up to `out_capacity` floats (8 per point; excess points dropped).
  * `metrics` (may be NULL) receives up to `metrics_len` telemetry floats.
- * `cb` (may be NULL) is invoked with progress on the calling thread.
+ * `cb` (may be NULL) receives progress percentages. Intermediate ticks come
+ * from a thread the solver owns, not the calling thread; only the final 100,
+ * sent when the solve succeeds, is delivered on the calling thread before
+ * semper_run returns. Calls never overlap. A mask that does not decode
+ * returns SEMPER_ERR_INIT.
  * Returns the point count (>= 0) or a SEMPER_ERR_* code.
  */
 SEMPER_C_API int semper_run(semper_engine* eng,
@@ -162,7 +167,8 @@ SEMPER_C_API int semper_incremental_init(semper_incremental* inc,
 /*
  * Solve the next frame. `out` holds up to `out_capacity` floats; the most a
  * frame can return is (rect_w / step) * (rect_h / step) points. `metrics`,
- * `info` and `cb` may be NULL. Returns the point count (>= 0) or a
+ * `info` and `cb` may be NULL; `cb` is called as for semper_run, from a
+ * solver thread except for the final 100. Returns the point count (>= 0) or a
  * SEMPER_ERR_* code (SEMPER_ERR_INIT also before a successful init).
  */
 SEMPER_C_API int semper_incremental_process(semper_incremental* inc,

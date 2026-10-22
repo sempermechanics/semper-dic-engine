@@ -15,12 +15,13 @@ Downstream Android app (private)
        |
        v  adapters/android (JNI marshalling only)
 this repository
-  src/io + seeding + pipeline   (decode, anchors/mesh/RGDIC, OpenMP)
+  src/io + pipeline   (decode, AKAZE seeding/anchors/mesh/RGDIC, OpenMP)
        |
        v
   src/math + strain
   Image -> SubsetPrecomputer -> OptimizationEngine -> StrainCalculator
-  Public API: include/semper/*.hpp  (no jni.h / android/* in src/)
+  Public API: include/semper/*.hpp  (no jni.h in src/; android/log.h only
+  in src/util/log.hpp, behind SEMPER_ANDROID_LOG)
 ```
 
 **Data flow for one analysis:** decode images → `Image` (float intensities +
@@ -29,7 +30,8 @@ homography for the global motion, then IC-GN on a lattice of grid nodes seeded
 from it) → Delaunay mesh →
 for each remaining grid point: `SubsetPrecomputer` builds a `SubsetData` →
 `OptimizationEngine.calculate_deformation` solves the 6-DOF warp →
-displacement field → `StrainCalculator` → results buffer back through JNI.
+displacement field → `StrainCalculator` → results buffer back through the
+caller's adapter (JNI, C ABI or Python).
 
 Seeding runs **after** the Hessian pre-pass on purpose: the anchors sit on grid
 nodes, so they reuse the pooled Hessians and a node that converges well enough
@@ -229,13 +231,15 @@ Synthetic test data must be generated with this exact convention
   bits, since `-ffast-math` folds `isfinite`), ends the solve as a failure on
   the last good warp.
 - **Levenberg-Marquardt option** (`lm_enabled`, `lm_alpha`): adds `α` to
-  `H(0,0)`/`H(1,1)` only (translation DOFs), DICe-compatible. Off by default.
+  `H(0,0)`/`H(1,1)` only (translation DOFs), DICe-compatible. Off in a bare
+  `OptimizationEngine`, but `make_engine` turns it on for every pipeline
+  solve (anchors, Paths A, B and C, incremental re-anchoring).
 - **Simplex** (Nelder-Mead on ZNSSD): derivative-free rescue for bad seeds;
   2-DOF or 6-DOF.
 
 ---
 
-## Module: `core/SimdKernels.h`
+## Module: `include/semper/simd.hpp`
 
 Portable SIMD hot loops via **OpenCV universal intrinsics** — one codepath
 compiled to NEON on ARM and SSE on x86, scalar fallback elsewhere. Header-only;
@@ -304,7 +308,8 @@ Multi-frame DIC that can move its reference forward. The maths is in
 the surface is in [CONTRACT.md](CONTRACT.md).
 
 ```
-init(frame 0)        -> ReferenceCache::set_from_gray, frame-0 grid scan
+init(frame 0)        -> validate params, ReferenceCache::set_from_gray (the
+                        frame-0 grid scan runs with the first solve)
 process_frame(t):
   k == 0             -> run_full_field_impl into the caller's buffer (bit-identical)
   k  > 0             -> run_full_field_impl on reference k's grid into scratch
@@ -346,15 +351,17 @@ Tunables: `tuning::kIncTaylorMaxCells`, `kIncMaskMaxSamplesPerPx`,
 
 ---
 
-## Module: `bridge/SemperJNI.cpp`
+## Module: `adapters/android/jni/SemperJNI.cpp`
 
 JNI surface (see `SemperNativeLib.kt` for the Kotlin declarations).
 Key behaviors:
 
 - `initializeReference(...)` caches the decoded reference image in
-  `g_refImg` (guarded by `jni_engine_mutex`) so batch runs decode once.
-- `computeFullFieldDirect(...)` runs the full pipeline with OpenMP
-  (`schedule(dynamic, 32)`), reliability-guided seed propagation, and
+  `g_cache` (guarded by `g_cache.mutex`) so batch runs decode once. A mask
+  that does not decode clears the cache rather than being ignored.
+- `computeFullFieldDirect(...)` runs the full pipeline (OpenMP for the
+  pre-pass, `static`; the anchor lattice, `dynamic, 4`; Path A,
+  `dynamic, 32`; Path B on its own `std::thread` workers), reliability-guided seed propagation, and
   progress callbacks marshalled through a `NewGlobalRef` + `AttachCurrentThread`.
 - Results are written into a direct `ByteBuffer` (no copy back through JNI).
 - `initializeIncremental(...)` / `computeIncrementalFrame(...)` /
@@ -424,7 +431,7 @@ starts — a pending edit can never reach the engine uncommitted.
 
 | Path | Role |
 |---|---|
-| `include/semper/` | Public headers (`types`, `image`, `subset`, `solver`, `strain`, `simd`, `pipeline`, `incremental`, `io`, `seeding`, `semper_c.h`) |
+| `include/semper/` | Public headers (`types`, `image`, `subset`, `solver`, `strain`, `simd`, `pipeline`, `incremental`, `io`, `seeding`, `cancel`, `metrics`, `version`, `tuning`, `assert`, `guarded_call`, `semper_c.h`; tiers in CONTRACT.md) |
 | `src/math/` | Image / SubsetPrecomputer / OptimizationEngine |
 | `src/strain/` | StrainCalculator |
 | `src/io/` | Platform-agnostic OpenCV decode |
@@ -434,7 +441,7 @@ starts — a pending edit can never reach the engine uncommitted.
 | `bindings/python/` | pybind11 module |
 | `tests/` | Host unit / integration / DICe / perf + C smoke |
 
-CMake targets: `semper_math`, `semper_pipeline`, `semper_android` (`OUTPUT_NAME semper_core`), `semper_c`.
+CMake targets: `semper_math`, `semper_pipeline`, `semper` (interface), `semper_android` (`OUTPUT_NAME semper_core`), `semper_c`, `_semper` (Python).
 
 ---
 
@@ -522,7 +529,9 @@ configure.
 - SIMD portability comes from `include/semper/simd.hpp`; there is **no**
   architecture-conditional code left in the engine (`#if __aarch64__` was
   removed — do not reintroduce it; extend the kernels instead).
-- Production flags: `-O3 -ffast-math -fopenmp` on host; Android also uses
+- Production flags: `-O3 -ffast-math`, plus OpenMP on host when CMake finds
+  it (the pipeline sources call `omp_get_thread_num()` unconditionally, so in
+  practice it is required); Android also uses
   `-flto` on the pipeline/JNI targets. Note `-ffast-math` disables NaN
   semantics; the code uses explicit sentinels (`-1.0f`, `-1000.0f`) instead of
   `std::isnan`. Preserve this convention. Host shared-lib builds intentionally

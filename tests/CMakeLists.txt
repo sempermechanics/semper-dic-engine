@@ -156,6 +156,7 @@ target_compile_definitions(dic_tests PRIVATE
         DICE_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/dice"
         NATIVE_TESTS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
         SEMPER_HOST_LOG=1
+        SEMPER_HOST_VERBOSE=1
 )
 
 option(DIC_REQUIRE_OPENCV "Fail configure if OpenCV is missing (CI sets this)" OFF)

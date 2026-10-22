@@ -351,6 +351,27 @@ static void test_incremental_guards(uint8_t* ref, uint8_t* def) {
     semper_incremental_destroy(inc);
 }
 
+/* Mask bytes that do not decode are SEMPER_ERR_INIT on every entry point, not
+ * "no mask": the solve used to run unmasked and report success. 37 bytes are
+ * neither W*H nor W*H*4 raw pixels, nor an image file. */
+static void test_undecodable_mask(uint8_t* ref, uint8_t* def) {
+    uint8_t junk[37];
+    memset(junk, 0xAB, sizeof(junk));
+    semper_params p = valid_params();
+    float out[8 * 64];
+
+    semper_engine* eng = semper_create();
+    CHECK(semper_set_reference(eng, ref, (size_t)W * H, junk, sizeof(junk), W, H) == SEMPER_ERR_INIT);
+    CHECK(semper_set_reference(eng, ref, (size_t)W * H, NULL, 0, W, H) == 0);
+    CHECK(semper_run(eng, def, (size_t)W * H, junk, sizeof(junk), &p, out, 8 * 64,
+                     NULL, 0, NULL, NULL) == SEMPER_ERR_INIT);
+    semper_destroy(eng);
+
+    semper_incremental* inc = semper_incremental_create();
+    CHECK(semper_incremental_init(inc, ref, (size_t)W * H, junk, sizeof(junk), W, H, &p, 1) == SEMPER_ERR_INIT);
+    semper_incremental_destroy(inc);
+}
+
 int main(void) {
     printf("semper_c contract — version %s\n", semper_version());
 
@@ -370,6 +391,7 @@ int main(void) {
     test_cancel_independence(ref, def);
     test_version_format();
     test_incremental_guards(ref, def);
+    test_undecodable_mask(ref, def);
 
     free(ref);
     free(def);

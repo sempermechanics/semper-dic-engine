@@ -24,6 +24,7 @@
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 #include <thread>
@@ -581,6 +582,45 @@ TEST_CASE(FullField, MetricsIdentityHoldsWithOutliers) {
                 metrics[19], metrics[1], metrics[20], metrics[23]);
     CHECK(metrics[23] > 0.0f);
     CHECK(metrics[3] + metrics[4] + metrics[19] == metrics[1] + metrics[20] + metrics[23]);
+}
+
+// Which thread the progress callback runs on (CONTRACT.md, ProgressCallback):
+// ticks from the solve's own thread, the final 100 on the caller's, after the
+// ticker has stopped. semper_c.h used to promise the caller's thread for all.
+TEST_CASE(FullField, ProgressFinalTickOnCallingThread) {
+    cv::Mat ref_gray, def_gray;
+    make_pair(ref_gray, def_gray);
+    FullFieldParams params = params_for(W, H);
+    params.step = 5;
+    params.strain_window = 31;
+    const int cap = (W / 5) * (H / 5) * 8;
+    ReferenceCache cache;
+    cache.set_from_gray(ref_gray, cv::Mat());
+    std::vector<float> out((size_t)cap, 0.0f);
+
+    struct Call { int pct; std::thread::id tid; };
+    std::vector<Call> calls;
+    std::mutex calls_mutex;
+    std::atomic<int> in_callback(0);
+    bool overlapped = false;
+    const int n = run_full_field(cache, def_gray, cv::Mat(), params, out.data(), cap,
+                                 nullptr, 0, [&](int pct) {
+        if (in_callback.fetch_add(1) != 0) overlapped = true;
+        {
+            std::lock_guard<std::mutex> lk(calls_mutex);
+            calls.push_back({pct, std::this_thread::get_id()});
+        }
+        in_callback.fetch_sub(1);
+    });
+    REQUIRE(n > 0);
+    REQUIRE(!calls.empty());
+    CHECK(!overlapped);
+    CHECK(calls.back().pct == 100);
+    CHECK(calls.back().tid == std::this_thread::get_id());
+    for (size_t i = 0; i + 1 < calls.size(); ++i) {
+        CHECK(calls[i].tid != std::this_thread::get_id());
+        CHECK(calls[i].pct <= calls[i + 1].pct);
+    }
 }
 
 // Path C is the last resort when the anchor lattice found nothing and phase

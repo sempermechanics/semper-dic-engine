@@ -194,6 +194,7 @@ struct Row {
     bool locked = false;          // AKAZE found a global model
     bool model = false;           // ... and the anchors were seeded with the full homography
     bool model_rejected = false;  // tried, weak, translation re-solve kept more
+    bool homography = false;      // a global homography reached the mesh (nodes outside it)
     double model_rot_deg = 0.0, model_scale = 1.0;  // the model at the ROI centre, used or not
     int anchors_accepted = 0;
     int anchors_attempted = 0;
@@ -284,6 +285,7 @@ inline void measure_seed(Row &row, const TruthFn &truth,
     row.locked = seeds.locked;
     row.model = seeds.model;
     row.model_rejected = seeds.model_rejected;
+    row.homography = !seeds.homography.empty();
     row.model_rot_deg = seeds.rotation_deg;
     row.model_scale = seeds.scale;
     row.anchors_accepted = seeds.accepted;

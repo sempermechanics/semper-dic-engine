@@ -16,6 +16,8 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -63,16 +65,34 @@ cv::Mat to_gray(const py::object& img, int expected_w, int expected_h) {
     return Semper::io::to_gray8(wrapped);
 }
 
+// None is no mask; a mask that does not decode raises. Solving without it
+// would report a field over the regions the caller excluded.
+cv::Mat to_mask(const py::object& mask, int expected_w, int expected_h) {
+    if (mask.is_none()) return cv::Mat();
+    cv::Mat roi = to_gray(mask, expected_w, expected_h);
+    if (roi.empty()) throw std::invalid_argument("failed to decode mask");
+    return roi;
+}
+
+// Serialises the calls on one object, cancel() aside: a solve releases the
+// GIL, and another thread's set_reference() would free the reference under
+// it. Taken with the GIL released, because the solve holding it re-enters
+// Python for progress -- waiting for it under the GIL would deadlock.
+std::unique_lock<std::mutex> lock_without_gil(std::mutex& m) {
+    py::gil_scoped_release rel;
+    return std::unique_lock<std::mutex>(m);
+}
+
 class Engine {
 public:
     Engine() = default;
 
     void set_reference(const py::object& img, const py::object& mask,
                        int expected_w, int expected_h) {
+        auto lock = lock_without_gil(mutex_);
         cv::Mat ref = to_gray(img, expected_w, expected_h);
         if (ref.empty()) throw std::runtime_error("failed to decode reference image");
-        cv::Mat roi;
-        if (!mask.is_none()) roi = to_gray(mask, ref.cols, ref.rows);
+        cv::Mat roi = to_mask(mask, ref.cols, ref.rows);
         cache_.set_from_gray(ref, roi);
     }
 
@@ -81,10 +101,10 @@ public:
     py::tuple run(const py::object& deformed, const py::object& mask,
                   std::array<int, 4> rect, int step, int subset, int strain_window,
                   bool use_6x6, const py::object& progress) {
+        auto lock = lock_without_gil(mutex_);
         cv::Mat def = to_gray(deformed, cache_.width, cache_.height);
         if (def.empty()) throw std::runtime_error("failed to decode deformed image");
-        cv::Mat roi;
-        if (!mask.is_none()) roi = to_gray(mask, cache_.width, cache_.height);
+        cv::Mat roi = to_mask(mask, cache_.width, cache_.height);
 
         FullFieldParams p;
         p.rect_x = rect[0];
@@ -105,7 +125,9 @@ public:
         const size_t cols = step > 0 ? static_cast<size_t>(std::max(0, span_w / step + 1)) : 0;
         const size_t rows = step > 0 ? static_cast<size_t>(std::max(0, span_h / step + 1)) : 0;
         const size_t max_pts = cols * rows;
-        std::vector<float> out(max_pts * 8, 0.0f);
+        // At least one point: a zero-sized buffer has no data() and the solve
+        // would report it as -3 before validating the step or rect (-2).
+        std::vector<float> out(std::max<size_t>(max_pts, 1) * 8, 0.0f);
         float metrics[Semper::pipeline::kMetricsLen] = {0};
 
         ProgressCallback cb = to_callback(progress);
@@ -131,6 +153,7 @@ public:
     void cancel() { cancel_.request(); }
 
 private:
+    std::mutex mutex_;
     ReferenceCache cache_;
     CancelToken cancel_;
 };
@@ -138,10 +161,19 @@ private:
 ProgressCallback to_callback(const py::object& progress) {
     ProgressCallback cb;
     if (!progress.is_none()) {
-        py::function fn = py::reinterpret_borrow<py::function>(progress);
+        // The solve copies and destroys the std::function with the GIL
+        // released, so it must not hold a py::function by value: its
+        // refcount would change without the GIL. A shared_ptr counts
+        // atomically, and the last owner takes the GIL to release it.
+        std::shared_ptr<py::function> fn(
+                new py::function(py::reinterpret_borrow<py::function>(progress)),
+                [](py::function* f) {
+                    py::gil_scoped_acquire gil;
+                    delete f;
+                });
         cb = [fn](int pct) {
             py::gil_scoped_acquire gil;  // re-enter Python to call back
-            fn(pct);
+            (*fn)(pct);
         };
     }
     return cb;
@@ -157,10 +189,10 @@ public:
     int init(const py::object& img, const py::object& mask, std::array<int, 4> rect,
              int step, int subset, int strain_window, bool use_6x6, int update_interval,
              int expected_w, int expected_h) {
+        auto lock = lock_without_gil(mutex_);
         cv::Mat ref = to_gray(img, expected_w, expected_h);
         if (ref.empty()) throw std::runtime_error("failed to decode reference image");
-        cv::Mat roi;
-        if (!mask.is_none()) roi = to_gray(mask, ref.cols, ref.rows);
+        cv::Mat roi = to_mask(mask, ref.cols, ref.rows);
         Semper::pipeline::IncrementalParams ip;
         ip.field.rect_x = rect[0];
         ip.field.rect_y = rect[1];
@@ -179,6 +211,7 @@ public:
 
     // Returns (code, points|None, metrics, info dict).
     py::tuple process(const py::object& deformed, const py::object& progress) {
+        auto lock = lock_without_gil(mutex_);
         cv::Mat def = to_gray(deformed, width_, height_);
         if (def.empty()) throw std::runtime_error("failed to decode deformed image");
         std::vector<float> out(static_cast<size_t>(std::max(session_.max_points(), 1)) * 8, 0.0f);
@@ -209,9 +242,13 @@ public:
     }
 
     void cancel() { cancel_.request(); }
-    int frames_processed() const { return session_.frames_processed(); }
+    int frames_processed() {
+        auto lock = lock_without_gil(mutex_);
+        return session_.frames_processed();
+    }
 
 private:
+    std::mutex mutex_;
     Semper::pipeline::IncrementalSession session_;
     CancelToken cancel_;
     int width_ = 0, height_ = 0;

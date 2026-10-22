@@ -159,7 +159,10 @@ grid: the node validity scan, the Hessian pool and the reference's AKAZE
 keypoints (v0.6.0; the reference side of phase correlation before). That cache
 is **Internal**. It is reused while `rect`, `step`,
 `subset_size` and the ROI mask are unchanged, and dropped by `reset`,
-`set_from_gray` and `adopt`. Outputs are bit-identical with or without it.
+`set_from_gray` and `adopt` -- except that `adopt` carries over the AKAZE
+detection scale the outgoing reference settled on, so incremental DIC does
+not climb the scale pyramid again at every update. Outputs are bit-identical
+with or without it.
 `adopt(...)` (added v0.4.0) hands an already-prepared image to the cache; it
 exists for `IncrementalSession` and is **Internal** despite living in a Stable
 header.
@@ -243,6 +246,12 @@ New tunables must be **appended** with a default that reproduces current behavio
 using ProgressCallback = std::function<void(int percentage)>;   // 0..100
 ```
 
+Intermediate ticks are sent from a thread the solve owns, not the caller's;
+the final `100`, sent only when the solve succeeds, comes on the calling
+thread after that ticker has been joined, so calls never overlap. The same
+holds for the C ABI's `semper_progress_cb`. A callback that throws is logged
+and ignored.
+
 ### Cancellation — `include/semper/cancel.hpp` · *Stable*
 
 ```cpp
@@ -311,7 +320,8 @@ stays Frozen. These eleven functions are the **only** exported symbols; the
 golden list in §A.6 fails CI if that set changes.
 
 Every entry point is annotated `SEMPER_C_API`. The shared library is built with
-`-fvisibility=hidden` (and `/W…` on MSVC), so only the annotated symbols are
+`-fvisibility=hidden` (on Windows a DLL exports only what is marked
+`__declspec(dllexport)`, which `SEMPER_C_API` expands to), so only the annotated symbols are
 exported — a symbol that loses its annotation silently vanishes from the ABI.
 
 - **Consumers must NOT define `SEMPER_C_BUILD`.** It is set `PRIVATE` while

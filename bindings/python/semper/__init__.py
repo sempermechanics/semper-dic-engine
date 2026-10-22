@@ -75,7 +75,13 @@ class Result:
 
 
 class Engine:
-    """A single DIC engine instance. Not thread-safe except for :meth:`cancel`."""
+    """A single DIC engine instance.
+
+    Calls on one instance are serialised: a second thread's ``set_reference``
+    or ``run`` waits for the solve in flight. :meth:`cancel` never waits, and
+    may be called from any thread, the progress callback included. A mask that
+    does not decode raises ``ValueError`` rather than being ignored.
+    """
 
     def __init__(self) -> None:
         self._engine = _Engine()
@@ -153,7 +159,8 @@ class IncrementalSession:
     not reported; it is reported again once it is measured, after a long coast
     only once its own earlier subset confirms where it is.
 
-    Not thread-safe except for :meth:`cancel`.
+    Calls on one session are serialised, as on :class:`Engine`; :meth:`cancel`
+    never waits and is safe from any thread.
 
     >>> s = semper.IncrementalSession(ref_u8, rect=(0, 0, 512, 512), step=10,
     ...                               subset=21, strain_window=21, update_interval=1)

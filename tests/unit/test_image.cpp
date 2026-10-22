@@ -19,6 +19,7 @@
 #include "framework/synthetic.h"
 #include <semper/image.hpp>
 
+#include <stdexcept>
 #include <vector>
 
 using Semper::Image;
@@ -87,6 +88,17 @@ TEST_CASE(Image, BlurPreservesConstantImage) {
     for (int y = 4; y < h - 4; ++y)
         for (int x = 4; x < w - 4; ++x)
             CHECK_NEAR(img.intensities[(size_t) y * w + x], 100.0f, 0.05f);
+}
+
+TEST_CASE(Image, PixelCountOverIntThrowsBeforeReading) {
+    // Both products wrap an int (to 65536 and to a negative); neither may
+    // reach the pixel loop, so a null buffer is safe here.
+    bool threw = false;
+    try { Image img(65536, 65537, nullptr); } catch (const std::length_error&) { threw = true; }
+    CHECK(threw);
+    threw = false;
+    try { Image img(46341, 46341, nullptr); } catch (const std::length_error&) { threw = true; }
+    CHECK(threw);
 }
 
 TEST_CASE(Image, BilinearOutOfBoundsReturnsZero) {

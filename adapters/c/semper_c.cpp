@@ -45,6 +45,14 @@ FullFieldParams to_params(const semper_params* params) {
     return p;
 }
 
+// No mask bytes is no mask; mask bytes that do not decode are an error. Solving
+// without them would report a field over the regions the caller excluded.
+bool decode_mask(const uint8_t* mask, size_t mask_len, int w, int h, cv::Mat& roi) {
+    if (mask == nullptr || mask_len == 0) return true;
+    roi = Semper::io::decode_gray(mask, mask_len, w, h);
+    return !roi.empty();
+}
+
 Semper::pipeline::ProgressCallback to_progress(semper_progress_cb cb, void* user) {
     Semper::pipeline::ProgressCallback progress;
     if (cb != nullptr) {
@@ -78,9 +86,7 @@ SEMPER_C_API int semper_set_reference(semper_engine* eng,
         cv::Mat ref = Semper::io::decode_gray(img, img_len, expected_w, expected_h);
         if (ref.empty()) return SEMPER_ERR_INIT;
         cv::Mat roi;
-        if (mask != nullptr && mask_len > 0) {
-            roi = Semper::io::decode_gray(mask, mask_len, ref.cols, ref.rows);
-        }
+        if (!decode_mask(mask, mask_len, ref.cols, ref.rows, roi)) return SEMPER_ERR_INIT;
         eng->cache.set_from_gray(ref, roi);
         return 0;
     });
@@ -100,9 +106,8 @@ SEMPER_C_API int semper_run(semper_engine* eng,
         cv::Mat def_gray = Semper::io::decode_gray(def, def_len, eng->cache.width, eng->cache.height);
         if (def_gray.empty()) return SEMPER_ERR_INIT;
         cv::Mat roi;
-        if (mask != nullptr && mask_len > 0) {
-            roi = Semper::io::decode_gray(mask, mask_len, eng->cache.width, eng->cache.height);
-        }
+        if (!decode_mask(mask, mask_len, eng->cache.width, eng->cache.height, roi))
+            return SEMPER_ERR_INIT;
 
         return Semper::pipeline::run_full_field(
             eng->cache, def_gray, roi, to_params(params), out, out_capacity,
@@ -135,9 +140,7 @@ SEMPER_C_API int semper_incremental_init(semper_incremental* inc,
         cv::Mat ref_gray = Semper::io::decode_gray(ref, ref_len, expected_w, expected_h);
         if (ref_gray.empty()) return SEMPER_ERR_INIT;
         cv::Mat roi;
-        if (mask != nullptr && mask_len > 0) {
-            roi = Semper::io::decode_gray(mask, mask_len, ref_gray.cols, ref_gray.rows);
-        }
+        if (!decode_mask(mask, mask_len, ref_gray.cols, ref_gray.rows, roi)) return SEMPER_ERR_INIT;
         IncrementalParams ip;
         ip.field = to_params(params);
         ip.update_interval = update_interval;
