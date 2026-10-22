@@ -457,8 +457,15 @@ with `git submodule status` rather than trusting this table.
 | **OpenCV** | `third_party/opencv` | `0654a42e` | 4.14.0 | **compiled from source** in the engine build |
 
 **OpenCV modules compiled:** `core,imgproc,imgcodecs,features2d,calib3d,flann`
-(`SEMPER_OPENCV_BUILD_LIST` in `cmake/SemperOpenCV.cmake`, overridable from the
-cache). `features2d`, `flann` and `calib3d` were dropped in v0.2.2 along with the
+(`SEMPER_OPENCV_REQUIRED_MODULES` in `cmake/SemperOpenCV.cmake`, the modules
+`semper_pipeline` links). OpenCV's `BUILD_LIST` is always that set plus
+`SEMPER_OPENCV_BUILD_LIST`, a comma-separated cache option (empty by default)
+for extra modules; it cannot remove a required one. Through v0.5.x
+`SEMPER_OPENCV_BUILD_LIST` was the whole list, so build trees configured then
+cache `core,imgproc,imgcodecs`; the merge keeps such a cache from dropping the
+AKAZE modules. Configure also fails if a required module ends up without a
+target (e.g. a cached `BUILD_opencv_calib3d=OFF`), instead of failing at link
+time. `features2d`, `flann` and `calib3d` were dropped in v0.2.2 along with the
 descriptor seeding front-end that used them (~29% of the aarch64
 `libsemper_c.so`), and came back in v0.6.0 for the AKAZE global model: the
 stripped x86-64 Python extension grows from 12.30 MB to 14.32 MB (+16%). Only
@@ -481,8 +488,8 @@ those trees from the worktree (~100+ MB). CMake only needs `modules/`,
 **OpenCV from-source integration** (`CMakeLists.txt`):
 
 - `add_subdirectory(third_party/opencv …)` builds OpenCV as part of this
-  CMake project. A curated `BUILD_LIST` compiles only the modules the engine
-  uses — `core, imgproc, imgcodecs, features2d, calib3d, flann` — which keeps the
+  CMake project. A curated `BUILD_LIST` (see above) compiles only the modules
+  the engine uses — `core, imgproc, imgcodecs, features2d, calib3d, flann` — which keeps the
   build to a few minutes per ABI instead of tens.
 - `BUILD_SHARED_LIBS OFF` → OpenCV is **statically linked** into
   `libsemper_core.so` / `libsemper_c` (which is why the Android `.so` is

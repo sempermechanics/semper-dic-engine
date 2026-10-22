@@ -3,6 +3,17 @@
 Versions follow [docs/CONTRACT.md](docs/CONTRACT.md) §A.1. Entries before
 0.5.0 live in the git history (`git log --grep Version`).
 
+## Unreleased
+
+### Build
+- The OpenCV modules the engine links (`core,imgproc,imgcodecs,features2d,
+  calib3d,flann`) are always compiled. `SEMPER_OPENCV_BUILD_LIST` now names
+  extra modules only (empty by default) and is merged in. A build tree
+  configured by v0.3.0–v0.5.x caches it as `core,imgproc,imgcodecs`, and
+  with v0.6.0 that dropped `features2d`/`calib3d`/`flann` and failed the link
+  (`-lopencv_features2d`). A required module that still has no target now
+  fails at configure time.
+
 ## 0.6.0
 
 Minor: a new capability, no surface change. Every signature, Frozen value,
