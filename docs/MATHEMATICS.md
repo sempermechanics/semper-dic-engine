@@ -740,6 +740,17 @@ the test is unchanged.
 
 A rejected anchor is neither a mesh vertex nor an output point.
 
+The test needs $|\mathcal{N}(i)| \ge 3$ converged neighbours. An anchor with
+fewer cannot be tested, and it is rejected (until v0.6.0 it was kept on its
+ZNSSD alone). Such anchors appear where the lattice is failing locally, and
+there the ZNSSD does not separate a blunder from a measurement. On a real PMMA
+3-point bend the translation-only lattice (§8.1.2's fallback) lost most anchors
+under the load nose. The few that converged there matched speckle about 20 px
+off at ZNSSD 0.17–0.30, and the mesh built on them guided Path A to the same
+wrong speckle. At the edge of a 45% stretch with no global model, untested
+blunders sit at ZNSSD 0.095–0.36, inside the output gate as well as outside
+it. The node is solved by Path A or B instead.
+
 The median over an even number of neighbours is the mean of the middle pair
 (`util::median_inplace`, shared with §9.4). Until v0.5.0 the lattice took the
 upper of the two, which leans the test towards the larger displacements.
