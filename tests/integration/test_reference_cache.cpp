@@ -136,6 +136,23 @@ TEST_CASE(ReferenceCache, EmptyInput_LeavesCacheCleared) {
     CHECK(cache.gray.empty());
 }
 
+TEST_CASE(ReferenceCache, PixelCountOverInt_LeavesCacheCleared) {
+    ReferenceCache cache;
+    cache.set_from_gray(ramp_gray(24, 16), cv::Mat());
+    REQUIRE(cache.ref_img != nullptr);
+
+    // 65537 x 65536 = 2^32 + 65536 wraps an int to 65536: Image used to size
+    // its planes from that and write past them. A header over one byte is
+    // enough, because the guard must refuse before a single pixel is read.
+    uint8_t one = 0;
+    cv::Mat huge(65537, 65536, CV_8UC1, &one);
+    cache.set_from_gray(huge, cv::Mat());
+    CHECK(cache.ref_img == nullptr);
+    CHECK(cache.width == 0);
+    CHECK(cache.height == 0);
+    CHECK(cache.gray.empty());
+}
+
 TEST_CASE(ReferenceCache, Reset_ClearsEverything) {
     ReferenceCache cache;
     cache.set_from_gray(ramp_gray(24, 16), cv::Mat());

@@ -19,6 +19,7 @@
 // it so the new reference's grid covers the same material.
 
 #include <semper/incremental.hpp>
+#include <semper/metrics.hpp>
 #include <semper/strain.hpp>
 #include <semper/tuning.hpp>
 
@@ -274,11 +275,21 @@ int IncrementalSession::Impl::process(const cv::Mat& def_gray, float* output, in
     const GridGeom& g0 = s.grid0;
     const size_t n0 = (size_t)g0.gridW * g0.gridH;
 
-    // Nothing left to follow on a moved reference: no solve, no points.
+    // Nothing left to follow on a moved reference: no solve, no points. The
+    // caller's buffers still describe this frame -- zeroed metrics, not the
+    // previous frame's -- and progress still ends at 100.
     if (s.ref_index > 0 && s.alive_count() == 0) {
         s.frame_count++;
         fi.frame0_points = std::max(s.frame0_points, 0);
         if (info) *info = fi;
+        if (metrics != nullptr) {
+            std::fill_n(metrics, metrics_prefix_len(metrics_len), 0.0f);
+        }
+        if (on_progress) {
+            try { on_progress(100); } catch (...) {
+                LOGE("on_progress(100) callback threw; ignoring");
+            }
+        }
         return 0;
     }
 
