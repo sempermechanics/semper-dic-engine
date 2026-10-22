@@ -80,6 +80,7 @@ add_library(semper_pipeline STATIC
         src/pipeline/full_field_solver.cpp
         src/pipeline/full_field_akaze.cpp
         src/pipeline/full_field_mesh.cpp
+        src/pipeline/full_field_vertices.cpp
         src/pipeline/full_field_path_a.cpp
         src/pipeline/full_field_path_b.cpp
         src/pipeline/full_field_path_c.cpp

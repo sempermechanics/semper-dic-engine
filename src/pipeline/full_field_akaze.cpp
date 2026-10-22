@@ -72,8 +72,9 @@ MeshSeedResult detect_mesh_seeds(
                     }
 
                     double iter_akaze = 0, iter_ransac = 0;
+                    cv::Mat H_scaled;
                     // 🚀 FIX: Pass padded_roi.x and padded_roi.y into the function!
-                    bool success = seeding::extract_akaze_features(refROI, defROI, roiMask, current_scale, out.ref_pts, out.def_pts, inlier_bb_area_ratio, iter_akaze, iter_ransac, cache.akaze_kp, cache.akaze_desc, padded_roi.x, padded_roi.y, local_debug_dir);
+                    bool success = seeding::extract_akaze_features(refROI, defROI, roiMask, current_scale, out.ref_pts, out.def_pts, inlier_bb_area_ratio, iter_akaze, iter_ransac, cache.akaze_kp, cache.akaze_desc, padded_roi.x, padded_roi.y, local_debug_dir, &H_scaled);
                     out.time_akaze_ms += iter_akaze;
                     out.time_ransac_ms += iter_ransac;
 
@@ -82,6 +83,14 @@ MeshSeedResult detect_mesh_seeds(
                         // We found enough features! Zooming in further won't change the physical coverage area.
                         has_good_akaze = true;
                         winning_padded_roi = padded_roi; // 🚀 SAVE OFFSETS
+                        // The fit ran on q = s (P - o); in image coordinates
+                        // P_def = o + H(q) / s, i.e. T^-1 H T.
+                        if (H_scaled.rows == 3 && H_scaled.cols == 3 && cv::checkRange(H_scaled)) {
+                            const double sc = current_scale;
+                            cv::Mat T = (cv::Mat_<double>(3, 3) << sc, 0, -sc * padded_roi.x, 0, sc, -sc * padded_roi.y, 0, 0, 1);
+                            cv::Mat Ti = (cv::Mat_<double>(3, 3) << 1.0 / sc, 0, padded_roi.x, 0, 1.0 / sc, padded_roi.y, 0, 0, 1);
+                            out.homography = Ti * H_scaled * T;
+                        }
 
                         // Now, evaluate the structural integrity of the mesh
                         if (inlier_bb_area_ratio >= 0.30f) {

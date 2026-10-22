@@ -94,6 +94,7 @@ set(DIC_PIPELINE_SOURCES
         ${NATIVE_ROOT}/src/pipeline/full_field_solver.cpp
         ${NATIVE_ROOT}/src/pipeline/full_field_akaze.cpp
         ${NATIVE_ROOT}/src/pipeline/full_field_mesh.cpp
+        ${NATIVE_ROOT}/src/pipeline/full_field_vertices.cpp
         ${NATIVE_ROOT}/src/pipeline/full_field_path_a.cpp
         ${NATIVE_ROOT}/src/pipeline/full_field_path_b.cpp
         ${NATIVE_ROOT}/src/pipeline/full_field_path_c.cpp
