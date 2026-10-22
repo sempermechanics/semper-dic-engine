@@ -44,6 +44,7 @@ using Semper::pipeline::IncrementalSession;
 using Semper::pipeline::ReferenceCache;
 using Semper::pipeline::kBadStrainWindow;
 using Semper::pipeline::kCancelled;
+using Semper::pipeline::kSeedFailed;
 using Semper::pipeline::run_full_field;
 
 namespace {
@@ -720,11 +721,13 @@ TEST_CASE(Incremental, EarlyUpdate_WhenReportedPointsDrop) {
 
 TEST_CASE(Incremental, FailedSolve_NeverBecomesTheReference) {
     // 1 px/frame drift, N = 5, with two frames replaced by a different speckle
-    // that nothing correlates with: frame 3, mid-interval, where the drop in
-    // points would trigger the early update, and frame 10, where the scheduled
-    // update falls. Moving onto either keeps only what that frame measured,
-    // which is next to nothing, and the chain is lost for good. The reference
-    // stays instead, and frame 11 takes the deferred update.
+    // that nothing correlates with: frame 3, mid-interval, and frame 10.
+    // Nothing seeds on either, so each returns kSeedFailed and, as every error
+    // does, leaves the session as it was (CONTRACT: the same frame could be
+    // submitted again). It is not counted and writes no info, so the session's
+    // frame indices run one behind the caller's after each: frame 6 is its
+    // fifth and takes the scheduled update as "frame 5", and frame 12 as
+    // "frame 10". The chain carries on across both.
     const int T = 14;
     Sequence s = stretch_rotate_sequence(320, 320, T, 0.0, 0.0, 0.3, 1.0f, 31, (double)T, 0.0);
     const dictest::SmoothSpeckleField other(977, 320, 320);
@@ -737,14 +740,17 @@ TEST_CASE(Incremental, FailedSolve_NeverBecomesTheReference) {
     const int first = inc[0].rc;
     REQUIRE(first > 0);
     for (int t : {3, 10}) {
-        CHECK(inc[t - 1].rc < first / 2);
+        CHECK(inc[t - 1].rc == kSeedFailed);
         CHECK(!inc[t - 1].info.reference_updated);
     }
     CHECK(inc[3].info.reference_frame == 0);    // frame 4: still on frame 0
-    CHECK(inc[4].info.reference_updated);       // frame 5: on schedule
-    CHECK(inc[10].info.reference_frame == 5);   // frame 11: still on frame 5 ...
-    CHECK(inc[10].info.reference_updated);      // ... and becomes the reference
-    CHECK(inc[11].info.reference_frame == 11);
+    CHECK(!inc[4].info.reference_updated);      // frame 5: the session's fourth
+    CHECK(inc[5].info.reference_updated);       // frame 6: its fifth, on schedule
+    CHECK(inc[6].info.reference_frame == 5);
+    CHECK(inc[10].info.reference_frame == 5);   // frame 11: still on it ...
+    CHECK(!inc[10].info.reference_updated);
+    CHECK(inc[11].info.reference_updated);      // ... frame 12, its tenth, moves it
+    CHECK(inc[12].info.reference_frame == 10);
     for (int t = 1; t <= T; ++t) {
         if (t == 3 || t == 10) continue;
         const Accuracy a = evaluate(inc[t - 1], s.motion[t - 1], 0.2);
@@ -755,11 +761,13 @@ TEST_CASE(Incremental, FailedSolve_NeverBecomesTheReference) {
 
 TEST_CASE(Incremental, FailedSolve_FirstOnReferenceAndIntervalOne) {
     // The same drift with unrelated frames where the count the floor compares
-    // with is not yet set. N = 5: frame 6, the first on the reference frame 5,
-    // and frame 10, the scheduled update. A failed frame 6 must not become
-    // that count, or frame 10 (as empty) would pass and become the reference.
-    // N = 1: frame 4, compared with what frame 3 reported; frame 5 is then
-    // solved against frame 3 and becomes the reference.
+    // with is not yet set. N = 5: frame 6, the first after the reference moved
+    // to frame 5, and frame 10. N = 1: frame 4. Each returns kSeedFailed and
+    // leaves the session as it was, so it neither sets that count nor is
+    // counted itself: with N = 5 the next frame (7) is the first on frame 5,
+    // and the scheduled update falls on frame 12; with N = 1 frame 5 is
+    // solved against frame 3 and becomes the reference as the session's
+    // fourth frame.
     const int T = 14;
     const dictest::SmoothSpeckleField other(977, 320, 320);
     auto with_failures = [&](std::initializer_list<int> bad) {
@@ -774,7 +782,7 @@ TEST_CASE(Incremental, FailedSolve_FirstOnReferenceAndIntervalOne) {
         const int first = inc[0].rc;
         for (int t = 1; t <= T; ++t) {
             if (std::find(bad.begin(), bad.end(), t) != bad.end()) {
-                CHECK(inc[t - 1].rc < first / 2);
+                CHECK(inc[t - 1].rc == kSeedFailed);
                 CHECK(!inc[t - 1].info.reference_updated);
                 continue;
             }
@@ -788,17 +796,21 @@ TEST_CASE(Incremental, FailedSolve_FirstOnReferenceAndIntervalOne) {
     const std::vector<Frame> n5 = run_session(s5, cv::Mat(), p, 5);
     REQUIRE((int)n5.size() == T);
     accurate_except(s5, n5, {6, 10});
+    CHECK(n5[4].info.reference_updated);       // frame 5: on schedule
+    CHECK(n5[6].info.reference_frame == 5);    // frame 7: first on frame 5
     CHECK(n5[10].info.reference_frame == 5);   // frame 11: still on frame 5 ...
-    CHECK(n5[10].info.reference_updated);      // ... and takes the update
+    CHECK(!n5[10].info.reference_updated);
+    CHECK(n5[11].info.reference_updated);      // ... frame 12 takes the update
+    CHECK(n5[12].info.reference_frame == 10);
 
     const Sequence s1 = with_failures({4});
     const std::vector<Frame> n1 = run_session(s1, cv::Mat(), p, 1);
     REQUIRE((int)n1.size() == T);
     accurate_except(s1, n1, {4});
-    CHECK(n1[3].info.reference_frame == 3);    // frame 4 against frame 3
-    CHECK(n1[4].info.reference_frame == 3);    // frame 5 too ...
-    CHECK(n1[4].info.reference_updated);       // ... and it becomes the reference
-    CHECK(n1[5].info.reference_frame == 5);
+    CHECK(n1[2].info.reference_updated);       // frame 3 is the reference ...
+    CHECK(n1[4].info.reference_frame == 3);    // ... frame 5 is solved against it
+    CHECK(n1[4].info.reference_updated);       // ... and becomes the reference
+    CHECK(n1[5].info.reference_frame == 4);    // the session's fourth frame
 }
 
 TEST_CASE(Incremental, Rotation2DegNoisy_N5_KeepsTheChainThroughFailedSolves) {

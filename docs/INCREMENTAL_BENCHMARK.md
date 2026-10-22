@@ -56,7 +56,7 @@ The reference no longer moves, early or on schedule, to a frame that reports les
   - The solves still collapse on 1–2 frames per run (seeding a 110 px ROI at σ = 2 turned 6–10°), and those frames still count as failed. The chain survives them.
 - **S4, 5°/f, σ = 2, N = 10:** 0.070 / 60 → 0.107 / 89. One seed used to adopt a collapsed frame 13.
 - **S3, 5 and 20 px/f, N ≥ 5:** the frame due for update is out of seeding range and reports nothing in either build. Accuracy is identical, and these runs still fail.
-- **Every other run is bit-identical,** frame by frame, in all of S1–S10. Only these 19 runs (scenario, mode, σ, seed) contain a frame below the floor. No run here has a failed first frame on a moved reference, or a failed frame at N = 1. Those cases are guarded by `Incremental.FailedSolve_FirstOnReferenceAndIntervalOne`.
+- **Every other run is bit-identical,** frame by frame, in all of S1–S10. Only these 19 runs (scenario, mode, σ, seed) contain a frame below the floor. No run here has a failed first frame on a moved reference, or a failed frame at N = 1. No test covers those two cases of the floor either: since 0.5.0 the unrelated frames in `Incremental.FailedSolve_FirstOnReferenceAndIntervalOne` return `kSeedFailed`, which leaves the session as it was, instead of reporting a few points.
 
 The first edition's 0.133 / 63 for S4 2°/f N = 5 was most likely one seed short as well. With the early update switched off, this build reads 0.137 / 63: seed 1 loses the chain at a scheduled update onto a collapsed frame 15, which the floor now defers.
 
