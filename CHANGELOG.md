@@ -3,6 +3,25 @@
 Versions follow [docs/CONTRACT.md](docs/CONTRACT.md) §A.1. Entries before
 0.5.0 live in the git history (`git log --grep Version`).
 
+## Unreleased
+
+### Fixed — incremental
+- The reference never moves, early or on schedule, to a frame that reports
+  fewer than half the points of the first frame on the current reference
+  (`tuning::kIncUpdateMinReported`), or, before that frame and always with
+  N = 1, of what the reference itself reported. Such a frame is a failed
+  solve: the reference stays and an update that was due falls to the next
+  frame. The early update moved the reference onto any frame that reported
+  5% fewer points, so a collapsed solve (1–2 points, 20–40 px off) became the
+  reference and every other node was lost for good. IncBench S4, 2°/frame,
+  σ = 2: N = 5 ends at 0.194 px / 94% where it locked onto a wrong solution
+  (12.7 px / 0%), and N = 10 at 0.146 px / 94% where it lost the chain.
+  Every run without such a frame is bit-identical. These figures were
+  measured before the 0.6.x seeding and not re-run since.
+- A frame that returns `kSeedFailed` leaves the session as it was, as every
+  error does (CONTRACT): it is not counted, so the session's frame indices run
+  one behind the caller's after it. Unchanged behaviour, now pinned by tests.
+
 ## 0.6.1
 
 Patch: no surface change. The field moves only where 0.6.0 kept an anchor
