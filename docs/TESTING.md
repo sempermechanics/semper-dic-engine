@@ -138,6 +138,9 @@ region with `num_threads(safe_cores)`, which overrides `omp_set_num_threads` and
 `OMP_NUM_THREADS`, so a test cannot change it without adding a production hook.
 Cross-thread-count invariance is not a contract this engine makes — Path B's
 reliability-guided propagation is order-dependent by construction.
+The one other thread count CI runs is one: the `serial-build` job builds the
+suite with `-DDIC_OPENMP=OFF`, as on a toolchain without OpenMP, and the
+same tolerances must hold there.
 
 ## Running the tests
 

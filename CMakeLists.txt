@@ -132,6 +132,11 @@ if(NOT MSVC)
         target_compile_options(semper_pipeline PRIVATE ${_semper_pipeline_opts})
         if(OpenMP_CXX_FOUND)
             target_link_libraries(semper_pipeline PUBLIC OpenMP::OpenMP_CXX)
+        else()
+            # Serial build: every parallel region runs on the calling thread
+            # and its #pragma omp is ignored, which -Wall reports.
+            message(STATUS "Semper: OpenMP not found; the pipeline runs serially")
+            target_compile_options(semper_pipeline PRIVATE -Wno-unknown-pragmas)
         endif()
     endif()
 endif()

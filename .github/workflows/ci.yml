@@ -73,6 +73,79 @@ jobs:
         run: ccache --show-stats
 
   # ===================================================================
+  # Serial build — the pipeline without OpenMP (DIC_OPENMP=OFF), as on a
+  # toolchain that has none (MSVC, Apple Clang without libomp). The same
+  # suite must pass, and the build must stay warning-free.
+  # ===================================================================
+  serial-build:
+    name: Host tests (no OpenMP)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 500M
+      CCACHE_COMPILERCHECK: content
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - id: month
+        run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache apt packages
+        uses: actions/cache@v6
+        with:
+          path: ~/apt-cache
+          key: apt-serial-build-${{ runner.os }}-${{ steps.month.outputs.month }}
+          restore-keys: apt-serial-build-${{ runner.os }}-
+
+      - name: Install OpenCV + ccache
+        timeout-minutes: 15
+        run: bash scripts/ci-apt-install.sh libopencv-dev ccache
+
+      - name: Cache ccache objects
+        uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-serial-${{ github.sha }}
+          restore-keys: ccache-serial-
+
+      - name: Configure
+        run: >
+          cmake -S tests -B build/tests
+          -DCMAKE_BUILD_TYPE=Release
+          -DDIC_REQUIRE_OPENCV=ON
+          -DDIC_OPENMP=OFF
+          -DSEMPER_WERROR=ON
+          -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build
+        run: cmake --build build/tests -j"$(nproc)"
+
+      - name: Check OpenMP is really off
+        # No compile line may carry -fopenmp, and dic_tests must not call
+        # into an OpenMP runtime (GOMP_* for libgomp, __kmpc_* for libomp).
+        # Symbols, not ldd: the system OpenCV may pull a runtime in itself.
+        run: |
+          if grep -q -- '-fopenmp' build/tests/compile_commands.json; then
+            echo "::error::a compile command uses -fopenmp"; exit 1
+          fi
+          if nm -D --undefined-only build/tests/dic_tests | grep -E ' (GOMP_|omp_|__kmpc_)'; then
+            echo "::error::dic_tests calls into an OpenMP runtime"; exit 1
+          fi
+          echo "no -fopenmp, no OpenMP runtime calls"
+
+      - name: Run dic_tests
+        run: ./build/tests/dic_tests
+
+      - name: ccache statistics
+        if: always()
+        run: ccache --show-stats
+
+  # ===================================================================
   # Sanitizers — ASan+UBSan and TSan on every change, each split over two
   # runners: shard 1 runs SHARD_1, shard 2 everything else, so every test
   # runs exactly once (a renamed test lands in shard 2). SHARD_1 is the
