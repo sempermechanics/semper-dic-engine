@@ -813,6 +813,77 @@ TEST_CASE(Incremental, FailedSolve_FirstOnReferenceAndIntervalOne) {
     CHECK(n1[5].info.reference_frame == 4);    // the session's fourth frame
 }
 
+TEST_CASE(Incremental, UpdateFloor_PartlyUnrelatedFrameNeverBecomesTheReference) {
+    // The floor itself (kIncUpdateMinReported). An unrelated frame returns
+    // kSeedFailed and never reaches it (the FailedSolve tests above), so here
+    // only the image below row 128 is replaced: the band above still matches,
+    // the solve seeds there and reports its top node rows, about a quarter of
+    // a normal frame -- a solve that succeeded and is under half the count.
+    // Moving the reference onto such a frame would keep only that band.
+    //   N = 5, frames 3 and 10: frame 3 drops > 5% mid-interval, where the
+    //   early update would fire, and frame 10 is a scheduled update; frame 11
+    //   takes it instead.
+    //   N = 5, frames 6 and 10: frame 6, the first on the reference frame 5,
+    //   must not become the count, or frame 10 would pass against it.
+    //   N = 1, frame 4: compared with what frame 3 reported; frame 5 is solved
+    //   against frame 3 and becomes the reference.
+    const int T = 14, keep_rows = 128;
+    const dictest::SmoothSpeckleField other(977, 320, 320);
+    auto with_partial = [&](std::initializer_list<int> bad) {
+        Sequence s = stretch_rotate_sequence(320, 320, T, 0.0, 0.0, 0.3, 1.0f, 31, (double)T, 0.0);
+        for (int t : bad) {
+            const cv::Mat o = dictest::render_frame(other, 320, 320, dictest::identity_motion(), 1.0f, 5000 + t);
+            o.rowRange(keep_rows, 320).copyTo(s.frames[t - 1].rowRange(keep_rows, 320));
+        }
+        return s;
+    };
+    const FullFieldParams p = centred_params(320, 320, 160);
+    auto check_run = [&](const char *label, const Sequence &s, const std::vector<Frame> &inc,
+                         std::initializer_list<int> bad) {
+        REQUIRE((int)inc.size() == T);
+        const int first = inc[0].rc;
+        REQUIRE(first > 0);
+        std::printf("  [%s] reported:", label);
+        for (const Frame &f : inc) std::printf(" %d%s", f.rc, f.info.reference_updated ? "*" : "");
+        std::printf("  (* = became the reference)\n");
+        for (int t = 1; t <= T; ++t) {
+            if (std::find(bad.begin(), bad.end(), t) != bad.end()) {
+                CHECK(inc[t - 1].rc > 0);              // it solved ...
+                CHECK(inc[t - 1].rc < first / 2);      // ... under the floor
+                CHECK(!inc[t - 1].info.reference_updated);
+                continue;
+            }
+            const Accuracy a = evaluate(inc[t - 1], s.motion[t - 1], 0.2);
+            CHECK(a.points >= (int)(0.95 * first));
+            CHECK(a.within >= (int)(0.95 * a.points));
+        }
+    };
+
+    const Sequence a = with_partial({3, 10});
+    const std::vector<Frame> na = run_session(a, cv::Mat(), p, 5);
+    check_run("N=5, frames 3 and 10", a, na, {3, 10});
+    CHECK(na[3].info.reference_frame == 0);     // frame 4: still on frame 0
+    CHECK(na[4].info.reference_updated);        // frame 5: on schedule
+    CHECK(na[10].info.reference_frame == 5);    // frame 11: still on frame 5 ...
+    CHECK(na[10].info.reference_updated);       // ... and takes the deferred update
+    CHECK(na[11].info.reference_frame == 11);
+
+    const Sequence b = with_partial({6, 10});
+    const std::vector<Frame> nb = run_session(b, cv::Mat(), p, 5);
+    check_run("N=5, frames 6 and 10", b, nb, {6, 10});
+    CHECK(nb[4].info.reference_updated);        // frame 5
+    CHECK(nb[10].info.reference_frame == 5);    // frame 11: still on frame 5 ...
+    CHECK(nb[10].info.reference_updated);       // ... and takes the update
+
+    const Sequence c = with_partial({4});
+    const std::vector<Frame> nc = run_session(c, cv::Mat(), p, 1);
+    check_run("N=1, frame 4", c, nc, {4});
+    CHECK(nc[3].info.reference_frame == 3);     // frame 4 against frame 3
+    CHECK(nc[4].info.reference_frame == 3);     // frame 5 too ...
+    CHECK(nc[4].info.reference_updated);        // ... and it becomes the reference
+    CHECK(nc[5].info.reference_frame == 5);
+}
+
 TEST_CASE(Incremental, Rotation2DegNoisy_N5_KeepsTheChainThroughFailedSolves) {
     // IncBench S4 "rotate 2 deg/f", sigma 2, N = 5 (10 deg between references),
     // noise seeds 0 and 1, as rendered there. A 110 px noisy ROI turned 6-10
