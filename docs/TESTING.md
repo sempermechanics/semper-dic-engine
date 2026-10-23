@@ -155,7 +155,13 @@ cmake --build build/tests
 ./build/tests/dic_tests                 # all suites
 ./build/tests/dic_tests Engine          # one suite
 ./build/tests/dic_tests Engine.PureTranslation_Subpixel   # one test
+./build/tests/dic_tests Engine:Strain-Engine.Pure   # Engine or Strain, minus names containing Engine.Pure
 ```
+
+The filter is substrings of `Suite.Name`: `A:B` runs tests matching either,
+and anything after `-` excludes. CI splits the sanitizer and coverage runs over
+two runners with a list and its negation (`SHARD_1` in `.github/workflows/ci.yml`),
+so every test runs exactly once.
 
 Dependencies come from the git submodules (`git submodule update --init`):
 Eigen (`third_party/eigen`) and OpenCV's universal-intrinsics headers

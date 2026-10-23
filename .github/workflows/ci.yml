@@ -30,19 +30,21 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Cache OpenCV packages
+      - id: month
+        run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache apt packages
+        # A new key each month, so the cached .debs follow the archive instead of
+        # staying as first saved; restore-keys starts from last month's.
         uses: actions/cache@v6
         with:
           path: ~/apt-cache
-          key: apt-libopencv-dev-${{ runner.os }}-v1
+          key: apt-host-tests-${{ runner.os }}-${{ steps.month.outputs.month }}
+          restore-keys: apt-host-tests-${{ runner.os }}-
 
       - name: Install OpenCV + ccache
-        run: |
-          mkdir -p ~/apt-cache/partial
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends \
-            -o Dir::Cache::archives="$HOME/apt-cache" libopencv-dev ccache
-          sudo chown -R "$(id -u):$(id -g)" ~/apt-cache
+        timeout-minutes: 15
+        run: bash scripts/ci-apt-install.sh libopencv-dev ccache
 
       - name: Cache ccache objects
         uses: actions/cache@v6
@@ -71,45 +73,63 @@ jobs:
         run: ccache --show-stats
 
   # ===================================================================
-  # Sanitizers — ASan+UBSan and TSan on every change
+  # Sanitizers — ASan+UBSan and TSan on every change, each split over two
+  # runners: shard 1 runs SHARD_1, shard 2 everything else, so every test
+  # runs exactly once (a renamed test lands in shard 2). SHARD_1 is the
+  # three longest incremental tests, about half the suite under either
+  # sanitizer (ASan 293 s of 576 s, TSan 279 s of 534 s on fbfaae3).
   # ===================================================================
   sanitizers:
-    name: Sanitized (${{ matrix.id }})
+    name: Sanitized (${{ matrix.id }}, ${{ matrix.shard }}/2)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
+        id: [asan-ubsan, tsan]
+        shard: [1, 2]
         include:
-          - sanitizer: "address,undefined"
-            id: asan-ubsan
+          - id: asan-ubsan
+            sanitizer: "address,undefined"
             cmake_extra: ""
             omp_tool: ""
-          - sanitizer: "thread"
-            id: tsan
+            packages: "ccache libopencv-dev"
+          - id: tsan
+            sanitizer: "thread"
             cmake_extra: "-DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18"
             omp_tool: "/usr/lib/llvm-18/lib/libarcher.so"
+            packages: "ccache libopencv-dev clang-18 libomp-18-dev libclang-rt-18-dev"
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 500M
       CCACHE_COMPILERCHECK: content
+      SHARD_1: "Incremental.EarlyUpdate_WhenReportedPointsDrop:Incremental.Rotation90_200Frames_TracksTheTurningRoi:Incremental.LongHorizon_160Frames"
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
 
+      - id: month
+        run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache apt packages
+        uses: actions/cache@v6
+        with:
+          path: ~/apt-cache
+          key: apt-san-${{ matrix.id }}-${{ runner.os }}-${{ steps.month.outputs.month }}
+          restore-keys: apt-san-${{ matrix.id }}-${{ runner.os }}-
+
       - name: Install toolchain
         # libopencv-dev is required or _SEMPER_OPENCV_READY stays false and the
         # whole full-field pipeline is silently excluded from the build — the
         # sanitizers would then only ever see the math suite.
-        # clang/libomp/compiler-rt are required for the TSan job: GCC's libgomp
-        # carries no ThreadSanitizer instrumentation, so it reports hundreds of
-        # false races on reused OpenMP stack frames. LLVM's libomp plus the
-        # Archer OMPT tool gives TSan the fork/join edges and reports none.
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ccache libopencv-dev \
-            clang-18 libomp-18-dev libclang-rt-18-dev
+        # clang/libomp/compiler-rt are required for the TSan job only (ASan
+        # builds with GCC): GCC's libgomp carries no ThreadSanitizer
+        # instrumentation, so it reports hundreds of false races on reused
+        # OpenMP stack frames. LLVM's libomp plus the Archer OMPT tool gives
+        # TSan the fork/join edges and reports none.
+        timeout-minutes: 15
+        run: bash scripts/ci-apt-install.sh ${{ matrix.packages }}
 
       - name: Cache ccache objects
         uses: actions/cache@v6
@@ -137,7 +157,9 @@ jobs:
           # libomp's own lazy lock-pool init races with itself, entirely inside
           # the uninstrumented runtime with no engine frames on either stack.
           TSAN_OPTIONS: ignore_noninstrumented_modules=1
-        run: ./build/tests/dic_tests
+        run: |
+          if [ "${{ matrix.shard }}" = 1 ]; then F="$SHARD_1"; else F="-$SHARD_1"; fi
+          ./build/tests/dic_tests "$F"
 
       - name: ccache statistics
         if: always()
@@ -150,6 +172,11 @@ jobs:
     name: C SDK smoke
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    env:
+      # Most of this job is compiling the vendored OpenCV (280-360 s cold).
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 500M
+      CCACHE_COMPILERCHECK: content
     steps:
       - uses: actions/checkout@v7
         with:
@@ -158,13 +185,36 @@ jobs:
       - name: Sparse OpenCV checkout
         run: bash scripts/sparse-opencv.sh
 
+      - id: month
+        run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache apt packages
+        uses: actions/cache@v6
+        with:
+          path: ~/apt-cache
+          key: apt-ccache-${{ runner.os }}-${{ steps.month.outputs.month }}
+          restore-keys: apt-ccache-${{ runner.os }}-
+
+      - name: Install ccache
+        timeout-minutes: 15
+        run: bash scripts/ci-apt-install.sh ccache
+
+      - name: Cache ccache objects
+        uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-c-sdk-${{ github.sha }}
+          restore-keys: ccache-c-sdk-
+
       - name: Configure C SDK
         run: |
           cmake -S . -B build/sdk \
             -DCMAKE_BUILD_TYPE=Release \
             -DSEMPER_BUILD_C_SDK=ON \
             -DSEMPER_BUILD_TESTS=OFF \
-            -DSEMPER_ANDROID=OFF
+            -DSEMPER_ANDROID=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build semper_c + smoke + contract
         run: cmake --build build/sdk --target semper_c semper_c_smoke semper_c_contract -j"$(nproc)"
@@ -220,6 +270,14 @@ jobs:
     name: Python bindings
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 500M
+      CCACHE_COMPILERCHECK: content
+      # CMake (>= 3.17) reads these from the environment, so they reach the
+      # configure that pip runs through scikit-build-core.
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
     steps:
       - uses: actions/checkout@v7
         with:
@@ -232,10 +290,34 @@ jobs:
         with:
           python-version: "3.12"
 
+      - id: month
+        run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache apt packages
+        uses: actions/cache@v6
+        with:
+          path: ~/apt-cache
+          key: apt-ccache-${{ runner.os }}-${{ steps.month.outputs.month }}
+          restore-keys: apt-ccache-${{ runner.os }}-
+
+      - name: Install ccache
+        timeout-minutes: 15
+        run: bash scripts/ci-apt-install.sh ccache
+
+      - name: Cache ccache objects
+        uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-python-${{ github.sha }}
+          restore-keys: ccache-python-
+
       - name: Build and install semper-dic
+        # A fixed build dir: pip's default is a fresh temporary directory per
+        # build, and objects that include OpenCV's generated headers from it
+        # would never hit the cache.
         run: |
           export CMAKE_BUILD_PARALLEL_LEVEL="$(nproc)"
-          python -m pip install -v ./bindings/python pytest
+          python -m pip install -v -C build-dir="$GITHUB_WORKSPACE/build/py" ./bindings/python pytest
 
       - name: Run binding tests
         # Outside the checkout, so `import semper` can only resolve to the
@@ -251,6 +333,12 @@ jobs:
     name: Android NDK (arm64-v8a)
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 500M
+      # A runner image with a newer NDK changes the compiler: content, not
+      # mtime, decides whether old objects still apply.
+      CCACHE_COMPILERCHECK: content
     steps:
       - uses: actions/checkout@v7
         with:
@@ -258,6 +346,27 @@ jobs:
 
       - name: Sparse OpenCV checkout
         run: bash scripts/sparse-opencv.sh
+
+      - id: month
+        run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache apt packages
+        uses: actions/cache@v6
+        with:
+          path: ~/apt-cache
+          key: apt-ccache-${{ runner.os }}-${{ steps.month.outputs.month }}
+          restore-keys: apt-ccache-${{ runner.os }}-
+
+      - name: Install ccache
+        timeout-minutes: 15
+        run: bash scripts/ci-apt-install.sh ccache
+
+      - name: Cache ccache objects
+        uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-android-${{ github.sha }}
+          restore-keys: ccache-android-
 
       - name: Configure
         run: |
@@ -267,7 +376,9 @@ jobs:
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-24 \
             -DCMAKE_BUILD_TYPE=Release \
-            -DSEMPER_ANDROID=ON
+            -DSEMPER_ANDROID=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build semper_android
         run: cmake --build build/android --target semper_android -j"$(nproc)"
@@ -284,22 +395,41 @@ jobs:
   # ===================================================================
   # Coverage — report-only, no gate (SEMPER_COVERAGE). Surfaces which src/
   # files the host suite exercises so future boundary gaps are visible.
+  # Split over two runners like the sanitizers (Debug + gcov ran the suite
+  # in 935 s on fbfaae3, 373 s of it one test); each exports gcovr JSON and
+  # coverage-report merges them.
   # ===================================================================
   coverage:
-    name: Coverage (report-only)
+    name: Coverage (${{ matrix.shard }}/2)
     runs-on: ubuntu-latest
     # Debug + gcov runs the incremental and DICe suites several times slower
     # than Release; 30 min cut the run off mid-suite.
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    env:
+      # 466 s of the 935 s on fbfaae3; shard 2 runs the rest.
+      SHARD_1: "Incremental.EarlyUpdate_WhenReportedPointsDrop:Incremental.LongHorizon_160Frames:DiceIncremental.OhtCfrp_LadderTotalsAgreeWithDice"
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
 
+      - id: month
+        run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache apt packages
+        uses: actions/cache@v6
+        with:
+          path: ~/apt-cache
+          key: apt-coverage-${{ runner.os }}-${{ steps.month.outputs.month }}
+          restore-keys: apt-coverage-${{ runner.os }}-
+
       - name: Install OpenCV + gcovr
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends libopencv-dev gcovr
+        timeout-minutes: 15
+        run: bash scripts/ci-apt-install.sh libopencv-dev gcovr
 
       - name: Configure (coverage)
         run: >
@@ -312,15 +442,57 @@ jobs:
         run: cmake --build build/cov -j"$(nproc)"
 
       - name: Run dic_tests
-        run: ./build/cov/dic_tests
+        run: |
+          if [ "${{ matrix.shard }}" = 1 ]; then F="$SHARD_1"; else F="-$SHARD_1"; fi
+          ./build/cov/dic_tests "$F"
+
+      - name: gcovr JSON (src/ only)
+        run: gcovr --root . build/cov --filter 'src/' --json -o coverage-${{ matrix.shard }}.json
+
+      - name: Upload coverage JSON
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-json-${{ matrix.shard }}
+          path: coverage-${{ matrix.shard }}.json
+
+  coverage-report:
+    name: Coverage (report-only)
+    needs: coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # The tracefiles name sources relative to the repo root.
+      - uses: actions/checkout@v7
+
+      - id: month
+        run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache apt packages
+        uses: actions/cache@v6
+        with:
+          path: ~/apt-cache
+          key: apt-coverage-report-${{ runner.os }}-${{ steps.month.outputs.month }}
+          restore-keys: apt-coverage-report-${{ runner.os }}-
+
+      - name: Install gcovr
+        timeout-minutes: 15
+        # The same gcovr as the shards (same runner image), so it reads
+        # their JSON.
+        run: bash scripts/ci-apt-install.sh gcovr
+
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: coverage-json-*
+          merge-multiple: true
+          path: cov
 
       - name: gcovr report (src/ only)
         run: |
           # Report-only: no --fail-under, no threshold. Text summary to the log,
           # machine-readable XML as an artifact.
-          gcovr --root . build/cov --filter 'src/' --print-summary --xml-pretty -o coverage.xml
+          gcovr --root . --add-tracefile 'cov/coverage-*.json' --print-summary --xml-pretty -o coverage.xml
           echo "----- src/ line coverage -----"
-          gcovr --root . build/cov --filter 'src/' --txt
+          gcovr --root . --add-tracefile 'cov/coverage-*.json' --txt
 
       - name: Upload coverage.xml
         if: always()

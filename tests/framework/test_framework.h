@@ -20,8 +20,13 @@
 //   dic_tests            run everything
 //   dic_tests Suite      run one suite
 //   dic_tests Suite.Name run one test
+//   dic_tests A:B-C:D    run tests matching A or B, except those matching
+//                        C or D (substrings of Suite.Name, as gtest's
+//                        --gtest_filter but without wildcards; CI splits
+//                        the suite with a list and its negation)
 // =====================================================================
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -68,6 +73,34 @@ namespace dictest {
         return std::fabs(a - b) / scale <= rel;
     }
 
+    // Filter `pos1:pos2-neg1:neg2`: a test runs if its "Suite.Name" contains
+    // one of the positive patterns (or there are none) and none of the
+    // negative ones. Names never contain ':' or '-', so a plain substring
+    // filters as it always did.
+    inline std::vector<std::string> split_patterns(const std::string &s) {
+        std::vector<std::string> out;
+        size_t start = 0;
+        while (start <= s.size()) {
+            const size_t end = std::min(s.find(':', start), s.size());
+            if (end > start) out.push_back(s.substr(start, end - start));
+            start = end + 1;
+        }
+        return out;
+    }
+
+    inline bool filter_matches(const std::string &full, const char *filter) {
+        if (!filter) return true;
+        const std::string f(filter);
+        const size_t dash = f.find('-');
+        const std::vector<std::string> pos = split_patterns(f.substr(0, dash));
+        const std::vector<std::string> neg =
+                dash == std::string::npos ? std::vector<std::string>() : split_patterns(f.substr(dash + 1));
+        bool in = pos.empty();
+        for (const std::string &p : pos) in = in || full.find(p) != std::string::npos;
+        for (const std::string &n : neg) in = in && full.find(n) == std::string::npos;
+        return in;
+    }
+
     // Runner: returns process exit code
     inline int run_all(int argc, char **argv) {
         const char *filter = (argc > 1) ? argv[1] : nullptr;
@@ -75,7 +108,7 @@ namespace dictest {
 
         for (auto &tc : registry()) {
             std::string full = std::string(tc.suite) + "." + tc.name;
-            if (filter && full.find(filter) == std::string::npos) continue;
+            if (!filter_matches(full, filter)) continue;
             total++;
 
             std::printf("[ RUN      ] %s\n", full.c_str());
