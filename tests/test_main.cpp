@@ -5,6 +5,7 @@
 //   dic_tests                 run all suites
 //   dic_tests SimdKernels     run one suite
 //   dic_tests Engine.PureTranslation_Subpixel   run a single test
+//   dic_tests A:B-C        tests matching A or B, except those matching C
 // =====================================================================
 #include "framework/test_framework.h"
 
