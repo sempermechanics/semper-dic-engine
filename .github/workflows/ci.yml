@@ -30,19 +30,21 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Cache OpenCV packages
+      - id: month
+        run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache apt packages
+        # A new key each month, so the cached .debs follow the archive instead of
+        # staying as first saved; restore-keys starts from last month's.
         uses: actions/cache@v6
         with:
           path: ~/apt-cache
-          key: apt-libopencv-dev-${{ runner.os }}-v1
+          key: apt-host-tests-${{ runner.os }}-${{ steps.month.outputs.month }}
+          restore-keys: apt-host-tests-${{ runner.os }}-
 
       - name: Install OpenCV + ccache
-        run: |
-          mkdir -p ~/apt-cache/partial
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends \
-            -o Dir::Cache::archives="$HOME/apt-cache" libopencv-dev ccache
-          sudo chown -R "$(id -u):$(id -g)" ~/apt-cache
+        timeout-minutes: 15
+        run: bash scripts/ci-apt-install.sh libopencv-dev ccache
 
       - name: Cache ccache objects
         uses: actions/cache@v6
@@ -85,10 +87,12 @@ jobs:
             id: asan-ubsan
             cmake_extra: ""
             omp_tool: ""
+            packages: "ccache libopencv-dev"
           - sanitizer: "thread"
             id: tsan
             cmake_extra: "-DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18"
             omp_tool: "/usr/lib/llvm-18/lib/libarcher.so"
+            packages: "ccache libopencv-dev clang-18 libomp-18-dev libclang-rt-18-dev"
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 500M
@@ -98,18 +102,27 @@ jobs:
         with:
           submodules: recursive
 
+      - id: month
+        run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache apt packages
+        uses: actions/cache@v6
+        with:
+          path: ~/apt-cache
+          key: apt-san-${{ matrix.id }}-${{ runner.os }}-${{ steps.month.outputs.month }}
+          restore-keys: apt-san-${{ matrix.id }}-${{ runner.os }}-
+
       - name: Install toolchain
         # libopencv-dev is required or _SEMPER_OPENCV_READY stays false and the
         # whole full-field pipeline is silently excluded from the build — the
         # sanitizers would then only ever see the math suite.
-        # clang/libomp/compiler-rt are required for the TSan job: GCC's libgomp
-        # carries no ThreadSanitizer instrumentation, so it reports hundreds of
-        # false races on reused OpenMP stack frames. LLVM's libomp plus the
-        # Archer OMPT tool gives TSan the fork/join edges and reports none.
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ccache libopencv-dev \
-            clang-18 libomp-18-dev libclang-rt-18-dev
+        # clang/libomp/compiler-rt are required for the TSan job only (ASan
+        # builds with GCC): GCC's libgomp carries no ThreadSanitizer
+        # instrumentation, so it reports hundreds of false races on reused
+        # OpenMP stack frames. LLVM's libomp plus the Archer OMPT tool gives
+        # TSan the fork/join edges and reports none.
+        timeout-minutes: 15
+        run: bash scripts/ci-apt-install.sh ${{ matrix.packages }}
 
       - name: Cache ccache objects
         uses: actions/cache@v6
@@ -296,10 +309,19 @@ jobs:
         with:
           submodules: recursive
 
+      - id: month
+        run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache apt packages
+        uses: actions/cache@v6
+        with:
+          path: ~/apt-cache
+          key: apt-coverage-${{ runner.os }}-${{ steps.month.outputs.month }}
+          restore-keys: apt-coverage-${{ runner.os }}-
+
       - name: Install OpenCV + gcovr
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends libopencv-dev gcovr
+        timeout-minutes: 15
+        run: bash scripts/ci-apt-install.sh libopencv-dev gcovr
 
       - name: Configure (coverage)
         run: >
