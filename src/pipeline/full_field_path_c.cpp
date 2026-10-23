@@ -31,7 +31,8 @@ int run_path_c(
         int& path_c_seed_x,
         int& path_c_seed_y,
         float& globalU,
-        float& globalV) {
+        float& globalV,
+        ThreadStats& stats) {
 
     const FullFieldParams& params = ctx.params;
     const int gridW = ctx.gridW;
@@ -114,6 +115,15 @@ int run_path_c(
     // the rest of the ROI was fine. The next nearest are tried in turn.
     Semper::SubsetData seed_subset;
     OptimizationEngine seed_engine = make_engine(params.use_6x6_interpolator);
+    // Its IC-GN and Simplex time go into metrics slots 18 and 17 ("all
+    // paths") on every exit, cancel and failure included.
+    struct StatsFlush {
+        OptimizationEngine& engine; ThreadStats& stats;
+        ~StatsFlush() {
+            stats.icgn_time_ms += engine.time_icgn_ms;
+            stats.simplex_time_ms += engine.time_simplex_ms;
+        }
+    } flush{seed_engine, stats};
     const float guess[6] = {globalU, globalV, 0.0f, 0.0f, 0.0f, 0.0f};
     for (const int flat_idx : candidates) {
         if (ctx.cancel.requested()) return kCancelled;

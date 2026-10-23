@@ -161,6 +161,9 @@ void log_profiling_summary(
         LOGD("      ↳ %d Calls (%d Crashes, %d Timeouts) -> %d Saved, %d Dead",
              s.b_simp_calls, s.b_simp_crash, s.b_simp_timeout, s.b_simp_saved, s.b_simp_dead);
     }
+    if (s.c_icgn > 0 || s.c_simp > 0) {
+        LOGD("Path C seed search ICGN Math: %.2f ms | Simplex: %.2f ms", s.c_icgn, s.c_simp);
+    }
 
     LOGD("Strain Calculation:   %.2f ms", t.strain);
     LOGD("Total JNI Execution:  %.2f ms", t.total);
@@ -172,7 +175,7 @@ void log_profiling_summary(
     int tot_simp_calls = s.a_simp_calls + s.b_simp_calls + s.n_simp_calls;
     int tot_simp_saved = s.a_simp_saved + s.b_simp_saved + s.n_simp_saved;
     int tot_simp_dead = s.a_simp_dead + s.b_simp_dead + s.n_simp_dead;
-    LOGD("Total Simplex Rescue: %.2f ms (%d calls -> %d saved, %d dead)", (s.a_simp + s.b_simp + s.n_simp), tot_simp_calls, tot_simp_saved, tot_simp_dead);
+    LOGD("Total Simplex Rescue: %.2f ms (%d calls -> %d saved, %d dead)", (s.a_simp + s.b_simp + s.n_simp + s.c_simp), tot_simp_calls, tot_simp_saved, tot_simp_dead);
     LOGD("=======================================");
 }
 
@@ -239,8 +242,9 @@ void fill_engine_metrics(
             // the same s.a_simp+s.b_simp / s.a_icgn+s.b_icgn via LOGD) but never
             // reached the app before this — these two slots are the only change,
             // no solve behaviour is touched.
-            metrics_data[17] = (float)(s.a_simp + s.b_simp + s.n_simp);  // Total simplex-rescue time (ms)
-            metrics_data[18] = (float)(s.a_icgn + s.b_icgn + s.n_icgn);  // Total ICGN time (ms) — the main solve
+            // Path C's seed search (c_*) counts too: "all paths" in CONTRACT.
+            metrics_data[17] = (float)(s.a_simp + s.b_simp + s.n_simp + s.c_simp);  // Total simplex-rescue time (ms)
+            metrics_data[18] = (float)(s.a_icgn + s.b_icgn + s.n_icgn + s.c_icgn);  // Total ICGN time (ms) — the main solve
 
             // 19: points the anchor lattice solved outright. Slots 3 and 4 are
             // Frozen as "via mesh" (Path A) and "via flood fill" (Path B), and

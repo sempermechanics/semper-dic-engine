@@ -167,6 +167,9 @@ target_compile_definitions(dic_tests PRIVATE
         NATIVE_TESTS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
         SEMPER_HOST_LOG=1
         SEMPER_HOST_VERBOSE=1
+        # Compiles in the fault-injection points in src/pipeline
+        # (internal::test_hooks); the libraries are built without them.
+        SEMPER_TEST_HOOKS=1
 )
 
 option(DIC_REQUIRE_OPENCV "Fail configure if OpenCV is missing (CI sets this)" OFF)

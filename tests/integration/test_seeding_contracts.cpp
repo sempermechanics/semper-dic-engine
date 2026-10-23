@@ -16,6 +16,9 @@
 
 #include "framework/seed_bench.h"
 
+#include <atomic>
+#include <stdexcept>
+
 using namespace dictest::seedbench;
 
 // ---------------------------------------------------------------------------
@@ -557,6 +560,109 @@ TEST_CASE(SeedBench, PathCTriesNextNodeWhenCentreFails) {
     CHECK(n >= 0);
     CHECK(metrics[16] == 0.0f);
     CHECK(metrics[4] > 0.0f);
+}
+
+// ---------------------------------------------------------------------------
+// A Path B worker that throws fails the solve. Path B's std::thread workers
+// used to log the exception and return the partial field as a success; they
+// now rethrow it once all are joined, as the OpenMP regions do, and the C and
+// JNI entry points turn it into -3. Nothing a caller can pass makes a cell
+// solve throw, so the test build's hook (internal::test_hooks) makes the
+// first worker cell do it, on the Path C route scene, where Path B floods the
+// row with its workers. The same cache then solves as a fresh one does.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct PathCRouteScene {
+    cv::Mat ref, def;
+    FullFieldParams p;
+    PathCRouteScene() {
+        const int w = 384, h = 256;
+        const dictest::SmoothSpeckleField field(101, w, h);
+        ref = dictest::render_frame(field, w, h, dictest::identity_motion(), 0.0f, 7919u);
+        const dictest::Motion m =
+                dictest::stretch_rotate(0.45, 0.3, 0.0, dictest::Vec2{}, dictest::Vec2{192, 128});
+        def = dictest::render_frame(field, w, h, m, 0.0f, 7919u + 150u);
+        p.rect_x = 172;
+        p.rect_y = 128;
+        p.rect_w = 8 * 5;
+        p.rect_h = 5;
+        p.step = 5;
+        p.subset_size = 21;
+        p.strain_window = 11;
+        p.use_6x6_interpolator = false;
+    }
+};
+
+// Clears the hook however the test leaves, a failed REQUIRE included.
+struct PathBHook {
+    explicit PathBHook(std::function<void(int)> f) {
+        Semper::pipeline::internal::test_hooks::path_b_worker_cell() = std::move(f);
+    }
+    ~PathBHook() { Semper::pipeline::internal::test_hooks::path_b_worker_cell() = nullptr; }
+};
+
+} // namespace
+
+TEST_CASE(PathB, WorkerExceptionFailsTheSolve) {
+    const PathCRouteScene sc;
+    ReferenceCache cache;
+    cache.set_from_gray(sc.ref, cv::Mat());
+    std::vector<float> out(8 * 8, 0.0f);
+    float metrics[Semper::pipeline::kMetricsLen];
+
+    std::atomic<int> cells(0);
+    bool threw = false;
+    std::string what;
+    {
+        PathBHook hook([&](int) {
+            if (cells.fetch_add(1) == 0) throw std::runtime_error("injected Path B fault");
+        });
+        try {
+            Semper::pipeline::run_full_field(cache, sc.def, cv::Mat(), sc.p, out.data(),
+                                             (int)out.size(), metrics,
+                                             Semper::pipeline::kMetricsLen, nullptr);
+        } catch (const std::runtime_error &e) {
+            threw = true;
+            what = e.what();
+        }
+    }
+    std::printf("    worker cells reached %d, threw %d (%s)\n", cells.load(), (int)threw,
+                what.c_str());
+    REQUIRE(cells.load() >= 1);   // the flood ran on workers
+    CHECK(threw);
+    CHECK(what == "injected Path B fault");
+
+    const int n = Semper::pipeline::run_full_field(cache, sc.def, cv::Mat(), sc.p, out.data(),
+                                                   (int)out.size(), metrics,
+                                                   Semper::pipeline::kMetricsLen, nullptr);
+    ReferenceCache fresh;
+    fresh.set_from_gray(sc.ref, cv::Mat());
+    std::vector<float> out_fresh(8 * 8, 0.0f);
+    const int n_fresh = Semper::pipeline::run_full_field(fresh, sc.def, cv::Mat(), sc.p,
+                                                         out_fresh.data(), (int)out_fresh.size(),
+                                                         metrics, Semper::pipeline::kMetricsLen,
+                                                         nullptr);
+    REQUIRE(n >= 0);
+    CHECK(n == n_fresh);
+    CHECK(std::memcmp(out.data(), out_fresh.data(), (size_t)std::max(n, 0) * 8 * sizeof(float)) == 0);
+}
+
+// ---------------------------------------------------------------------------
+// Slots 17 and 18 are Simplex and IC-GN time over all paths (CONTRACT.md).
+// Path C's seed search runs IC-GN of its own, which neither slot counted.
+// ---------------------------------------------------------------------------
+TEST_CASE(Telemetry, PathCTimeCountsInSlots17And18) {
+    using namespace Semper::pipeline::internal;
+    SolveSummary s;
+    s.a_icgn = 1; s.b_icgn = 2; s.n_icgn = 4; s.c_icgn = 8;
+    s.a_simp = 16; s.b_simp = 32; s.n_simp = 64; s.c_simp = 128;
+    float m[Semper::pipeline::kMetricsLen];
+    for (float &v : m) v = -1.0f;
+    fill_engine_metrics(m, Semper::pipeline::kMetricsLen, PhaseTimings{}, s, 0, 0, 0, 0,
+                        MeshSeedResult{}, MeshQuality::NONE);
+    CHECK(m[18] == 15.0f);
+    CHECK(m[17] == 240.0f);
 }
 
 // ---------------------------------------------------------------------------

@@ -316,6 +316,7 @@ int run_full_field_impl(
 
         std::vector<ThreadStats> stats_pathA(safe_cores);
         std::vector<ThreadStats> stats_pathB(safe_cores);
+        ThreadStats stats_pathC;   // one engine, on this thread
 
         std::mutex progress_cv_mutex;
         std::condition_variable progress_cv;
@@ -469,7 +470,8 @@ int run_full_field_impl(
             // When AKAZE locked, fall through instead -- Path B still has the
             // global shift and the grid-centre seed. Without a lock there is
             // nothing left to try, so the abort stands.
-            int rc = run_path_c(ctx, anchor_ref_pts, resultGrid, path_c_seed_x, path_c_seed_y, globalU, globalV);
+            int rc = run_path_c(ctx, anchor_ref_pts, resultGrid, path_c_seed_x, path_c_seed_y, globalU, globalV,
+                                stats_pathC);
             if (rc != 0) {
                 if (!seeds.locked) return rc;
                 LOGE("Path C failed (%d); AKAZE locked, continuing to Path B with the global shift", rc);
@@ -532,6 +534,8 @@ int run_full_field_impl(
         // ⏱️ AGGREGATE PROFILING METRICS
         // ==========================================
         SolveSummary summary = aggregate_thread_stats(stats_pathA, stats_pathB, stats_anchors, safe_cores);
+        summary.c_icgn = stats_pathC.icgn_time_ms;
+        summary.c_simp = stats_pathC.simplex_time_ms;
         timings.total = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_total_start).count();
         log_profiling_summary(timings, summary, seeds, valid_count);
 
