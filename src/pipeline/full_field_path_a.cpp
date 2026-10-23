@@ -34,7 +34,7 @@ void run_path_a(
     const FullFieldParams& params = ctx.params;
     const int gridW = ctx.gridW;
     const int gridH = ctx.gridH;
-    const int safe_cores = ctx.safe_cores;
+    [[maybe_unused]] const int safe_cores = ctx.safe_cores;   // only read by num_threads()
 
     RegionErrors errors;
 #pragma omp parallel num_threads(safe_cores)

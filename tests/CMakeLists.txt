@@ -20,6 +20,9 @@ set(NATIVE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/..)
 # Treat any first-party warning as an error under -DSEMPER_WERROR=ON.
 # Off by default for local builds; CI host job enables it (-DSEMPER_WERROR=ON).
 option(SEMPER_WERROR "Fail the build on compiler warnings in first-party code" OFF)
+# OFF builds the pipeline without OpenMP, as on a toolchain that has none
+# (CI's serial-build job). The whole suite must pass either way.
+option(DIC_OPENMP "Build the pipeline sources with OpenMP" ON)
 
 if (NOT MSVC)
     add_compile_options(-O2 -ffast-math -Wall -Wextra)
@@ -217,13 +220,22 @@ if (_SEMPER_OPENCV_READY)
             ${DIC_PIPELINE_SOURCES}
             ${DIC_PIPELINE_TESTS})
     target_include_directories(dic_tests PRIVATE ${NATIVE_ROOT}/src)
-    find_package(OpenMP)
-    if (OpenMP_CXX_FOUND)
-        target_link_libraries(dic_tests PRIVATE OpenMP::OpenMP_CXX)
-    elseif (NOT MSVC)
-        # Match production pipeline flags when CMake's OpenMP package is absent.
-        target_compile_options(dic_tests PRIVATE -fopenmp)
-        target_link_options(dic_tests PRIVATE -fopenmp)
+    if (NOT DIC_OPENMP)
+        # The engine as built where OpenMP is missing: every parallel region
+        # runs on the calling thread and its #pragma omp is ignored.
+        message(STATUS "dic_tests: OpenMP off (DIC_OPENMP=OFF), pipeline runs serially")
+        if (NOT MSVC)
+            target_compile_options(dic_tests PRIVATE -Wno-unknown-pragmas)
+        endif ()
+    else ()
+        find_package(OpenMP)
+        if (OpenMP_CXX_FOUND)
+            target_link_libraries(dic_tests PRIVATE OpenMP::OpenMP_CXX)
+        elseif (NOT MSVC)
+            # Match production pipeline flags when CMake's OpenMP package is absent.
+            target_compile_options(dic_tests PRIVATE -fopenmp)
+            target_link_options(dic_tests PRIVATE -fopenmp)
+        endif ()
     endif ()
 elseif (DIC_REQUIRE_OPENCV)
     message(FATAL_ERROR

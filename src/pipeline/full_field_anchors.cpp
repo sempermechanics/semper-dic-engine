@@ -284,7 +284,7 @@ MeshSeedResult solve_anchor_seeds(
         const FullFieldParams& params,
         int gridW,
         int gridH,
-        int safe_cores,
+        [[maybe_unused]] int safe_cores,   // only read by num_threads()
         const HessianPool& hessian_pool,
         const ResultGrid& resultGrid,
         std::vector<ThreadStats>& stats,

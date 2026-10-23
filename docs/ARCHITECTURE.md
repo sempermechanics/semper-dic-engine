@@ -532,7 +532,9 @@ configure.
 - Production flags: `-O3 -ffast-math`, plus OpenMP on host when CMake finds
   it. Without it (MSVC, Apple Clang without libomp) the `#pragma omp` regions
   run on the calling thread: thread indices go through `util::omp_thread()`
-  (`src/util/omp.hpp`), never `omp.h` directly. Android also uses
+  (`src/util/omp.hpp`), never `omp.h` directly. CI's `serial-build` job
+  builds the suite that way (`DIC_OPENMP=OFF`, warnings fatal) and runs it.
+  Android also uses
   `-flto` on the pipeline/JNI targets. Note `-ffast-math` disables NaN
   semantics: Inf/NaN checks read the bits (`util::finite_bits`,
   `src/util/finite.hpp`), never `std::isfinite` or `!(x > eps)`, and the
