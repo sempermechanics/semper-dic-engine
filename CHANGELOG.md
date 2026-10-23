@@ -5,6 +5,11 @@ Versions follow [docs/CONTRACT.md](docs/CONTRACT.md) §A.1. Entries before
 
 ## Unreleased
 
+### Fixed — telemetry
+- Metrics slots 17 and 18 (Simplex and IC-GN time, "all paths") now include
+  Path C's seed search. A solve that fell back to Path C reported less time
+  than it spent, by up to `tuning::kPathCMaxCandidates` IC-GN runs.
+
 ### Fixed — incremental
 - The reference never moves, early or on schedule, to a frame that reports
   fewer than half the points of the first frame on the current reference

@@ -349,6 +349,9 @@ void run_path_b(
                     CellTask& task = round->tasks[round->next++];
                     lk.unlock();
                     task.tid = w;
+#if defined(SEMPER_TEST_HOOKS)
+                    if (test_hooks::path_b_worker_cell()) test_hooks::path_b_worker_cell()(w);
+#endif
                     solve_cell(ctx, engines[w], subsets[w], task);
                     lk.lock();
                     // `round` is still valid: a round leaves the deque only

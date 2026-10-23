@@ -33,7 +33,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 using Semper::pipeline::CancelToken;
@@ -381,6 +383,59 @@ TEST_CASE(Incremental, LostNodesNeverReturn) {
         CHECK(inc[t].info.lost_this_frame >= 0);
     }
     CHECK(inc.back().info.tracked_points < inc.front().info.frame0_points);
+}
+
+TEST_CASE(Incremental, EveryNodeLost_ZeroedMetricsAndFinalProgress) {
+    // Frame 1 is frame 0 under heavy noise (sigma 40): AKAZE, which detects
+    // at 0.25x and 0.5x where the noise averages out, still locks, but no
+    // 21 px subset clears kCorrAccept. The solve succeeds measuring no node,
+    // and with N = 1 the reference moves onto it with none alive (sigma 25
+    // to 90 all do this here). Frame 2 then has nothing to follow and runs no
+    // solve. It used to return 0 with the caller's metrics untouched -- the
+    // previous frame's numbers, or garbage -- and no final progress tick.
+    const int w = 320, h = 320;
+    const dictest::SmoothSpeckleField field(31, w, h);
+    const cv::Mat ref = dictest::render_frame(field, w, h, dictest::identity_motion(), 0.0f, 1000);
+    const cv::Mat noisy = dictest::render_frame(field, w, h, dictest::identity_motion(), 40.0f, 1001);
+    const FullFieldParams p = centred_params(w, h, 160);
+
+    IncrementalSession session;
+    IncrementalParams ip;
+    ip.field = p;
+    ip.update_interval = 1;
+    REQUIRE(session.init(ref, cv::Mat(), ip) == 0);
+    const int cap = capacity_for(p);
+    std::vector<float> out((size_t)cap, 0.0f);
+    float metrics[Semper::pipeline::kMetricsLen];
+    IncrementalFrameInfo info1;
+    const int rc1 = session.process_frame(noisy, out.data(), cap, metrics,
+                                          Semper::pipeline::kMetricsLen, nullptr, &info1);
+    std::printf("    frame 1: rc %d  tracked %d  updated %d  lock %g\n", rc1, info1.tracked_points,
+                (int)info1.reference_updated, metrics[21]);
+    // The route under test: a successful, locked frame that leaves nothing alive.
+    REQUIRE(rc1 >= 0);
+    REQUIRE(metrics[21] == 1.0f);
+    REQUIRE(info1.reference_updated);
+    REQUIRE(info1.tracked_points == 0);
+
+    for (float &v : metrics) v = -1.0f;
+    struct Call { int pct; std::thread::id tid; };
+    std::vector<Call> calls;
+    std::mutex calls_mutex;
+    IncrementalFrameInfo info2;
+    const int rc2 = session.process_frame(ref, out.data(), cap, metrics,
+                                          Semper::pipeline::kMetricsLen, [&](int pct) {
+        std::lock_guard<std::mutex> lk(calls_mutex);
+        calls.push_back({pct, std::this_thread::get_id()});
+    }, &info2);
+    CHECK(rc2 == 0);
+    for (int i = 0; i < Semper::pipeline::kMetricsLen; ++i) CHECK(metrics[i] == 0.0f);
+    REQUIRE(calls.size() == 1);
+    CHECK(calls[0].pct == 100);
+    CHECK(calls[0].tid == std::this_thread::get_id());
+    CHECK(info2.reference_frame == 1);
+    CHECK(info2.tracked_points == 0);
+    CHECK(!info2.reference_updated);
 }
 
 TEST_CASE(Incremental, RepeatRun_BitIdentical) {

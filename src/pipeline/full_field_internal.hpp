@@ -24,6 +24,7 @@
 #include <chrono>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -105,6 +106,20 @@ private:
     std::mutex mutex_;
     std::exception_ptr first_;
 };
+
+#if defined(SEMPER_TEST_HOOKS)
+// Test build only: tests/CMakeLists.txt defines SEMPER_TEST_HOOKS for
+// dic_tests, and no library target does. Lets a test make code throw that
+// never does on its own input, to drive the error paths above.
+namespace test_hooks {
+// Called by a Path B worker, with its index, before each cell it solves. Set
+// it before the solve and clear it after: workers only read it.
+inline std::function<void(int worker)> &path_b_worker_cell() {
+    static std::function<void(int)> hook;
+    return hook;
+}
+} // namespace test_hooks
+#endif
 
 // Sentinel for "no valid correlation here" (skipped or failed point).
 // ZNSSD is >= 0 for every real solve, so a negative value can never be
@@ -529,7 +544,8 @@ int run_path_c(
         int &path_c_seed_x,
         int &path_c_seed_y,
         float &globalU,
-        float &globalV);
+        float &globalV,
+        ThreadStats &stats);   // IC-GN / Simplex time of the seed search
 
 // ---------------------------------------------------------------------------
 // Output packing, telemetry aggregation and logging
@@ -561,6 +577,9 @@ struct SolveSummary {
     // out understates every "total" below, and silently, because the points it
     // solves still count towards valid_count.
     double n_icgn = 0, n_simp = 0;
+    // Path C's seed search: IC-GN runs of its own, none of them published
+    // (Path B solves the seed again), so only its time is counted.
+    double c_icgn = 0, c_simp = 0;
     int total_icgn_iters = 0;
 
     int a_simp_calls = 0, a_simp_saved = 0, a_simp_dead = 0, a_simp_crash = 0, a_simp_timeout = 0;
