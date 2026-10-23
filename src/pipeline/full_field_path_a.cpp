@@ -7,8 +7,8 @@
 #include <semper/subset.hpp>
 #include <semper/tuning.hpp>
 #include "util/log.hpp"
+#include "util/omp.hpp"
 
-#include <omp.h>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
 
@@ -39,7 +39,7 @@ void run_path_a(
     RegionErrors errors;
 #pragma omp parallel num_threads(safe_cores)
     {
-        int tid = omp_get_thread_num();
+        int tid = util::omp_thread();
         OptimizationEngine local_engine = make_engine(params.use_6x6_interpolator);
         Semper::SubsetData local_subset;
         double local_hessian = 0.0, local_wait = 0.0; int local_pts = 0;

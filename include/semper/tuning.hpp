@@ -139,6 +139,13 @@ inline constexpr float kStrainUninitSentinel = -1000.0f;
 /** Strain drop-filter threshold in run_full_field (accepts the write sentinel). */
 inline constexpr float kStrainFailSentinel = -999.0f;
 
+/**
+ * Path C: grid nodes tried, nearest the grid centre first, before the solve
+ * gives up with kSeedFailed. Each try is one INIT_AUTO_SEARCH solve; the first
+ * is the node a single-shot Path C used, so fields it seeded do not change.
+ */
+inline constexpr int kPathCMaxCandidates = 9;
+
 /** Path B queue wait cancel-poll interval (ms). */
 inline constexpr int kCancelPollMs = 20;
 

@@ -1,6 +1,7 @@
 #include <semper/io.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
+#include "util/finite.hpp"
 
 #include <cstdint>
 #include <cstring>
@@ -55,7 +56,9 @@ cv::Mat to_gray8(const cv::Mat& img) {
     double lo = 0.0, hi = 0.0;
     cv::minMaxLoc(gray, &lo, &hi);
     cv::Mat out;
-    if (!(hi > lo)) {   // flat, or NaN in a float image
+    // Flat, or a non-finite extreme in a float image. On the bits: this file
+    // is built with -ffast-math, which may drop the NaN case of `!(hi > lo)`.
+    if (!util::finite_bits(lo) || !util::finite_bits(hi) || !(hi > lo)) {
         out = cv::Mat(gray.size(), CV_8UC1, cv::Scalar(128));
         return out;
     }

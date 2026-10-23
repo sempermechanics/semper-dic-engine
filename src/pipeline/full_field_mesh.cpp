@@ -6,9 +6,9 @@
 #include <semper/solver.hpp>
 #include <semper/subset.hpp>
 #include <semper/tuning.hpp>
+#include "util/finite.hpp"
 #include "util/log.hpp"
 
-#include <omp.h>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
 
@@ -114,9 +114,11 @@ MeshGuessField build_mesh_guess_field(
             double M12 = warp_mat.at<double>(1, 2);
 
             // A collapsed triangle (collinear seeds, or one folded flat by a
-            // bad vertex) has no affine map worth guessing from.
+            // bad vertex) has no affine map worth guessing from. A NaN from
+            // getAffineTransform must be caught on its bits: under -ffast-math
+            // `!(|detF| > eps)` may be compiled as `|detF| <= eps`, false for NaN.
             const double detF = M00 * M11 - M01 * M10;
-            if (!(std::abs(detF) > 1e-3)) continue;
+            if (!util::finite_bits(detF) || std::abs(detF) <= 1e-3) continue;
 
             // Strain/Shear derivatives (Ux = du/dx)
             at.ux = M00 - 1.0;
