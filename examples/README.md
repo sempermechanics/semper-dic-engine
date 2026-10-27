@@ -6,7 +6,7 @@ suite already verifies.
 | Sample | Images | Verified result |
 |---|---|---|
 | [samples/translation](samples/translation/) | `ref.tif` / `def.tif` (512²) | DICe custom_app: \|u − 0.4\| ≤ 0.1 px at four subsets |
-| [samples/oht_cfrp](samples/oht_cfrp/) | `ref.tiff` / `def.tiff` | Field agreement vs `DICe_solution_01.txt` (host test) |
+| [samples/oht_cfrp](samples/oht_cfrp/) | `ref.tiff` / `def.tiff` (400×1040) | Field agreement vs `DICe_solution_01.txt` (host test) |
 
 Redistributed under [samples/LICENSE.DICe](samples/LICENSE.DICe) (Sandia / NTESS).
 
