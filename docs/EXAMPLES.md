@@ -22,9 +22,11 @@ goldens in the host suite.
 
 ### OHT CFRP (`examples/samples/oht_cfrp/`)
 
-Real experimental first load step. Host test
+Real experimental first load step, 400×1040 (portrait). Host test
 `DiceFieldAgreement.OhtCfrp_AgreesWithDiceSolution` compares the subset solver
-to `DICe_solution_01.txt`. Suggested full-field params are in `expected.json`.
+to `DICe_solution_01.txt`. Suggested full-field params are in `expected.json`;
+its `rect` is `[x, y, w, h]` as `Engine.run(rect=...)` takes it, and covers
+DICe's grid (x 61–341, y 61–971, step 35).
 
 ## Code entry points
 

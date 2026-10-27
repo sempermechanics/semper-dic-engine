@@ -5,6 +5,14 @@ Versions follow [docs/CONTRACT.md](docs/CONTRACT.md) §A.1. Entries before
 
 ## Unreleased
 
+### Fixed — examples
+- `examples/samples/oht_cfrp/expected.json` gave the image as 512×512 and a
+  suggested `rect` of `[40, 40, 432, 432]`. The pair is 400×1040, so the rect
+  ran 72 px past the right edge and stopped at y 472, short of most of DICe's
+  grid (y 61–971). Now `image_size` `[400, 1040]` and `rect`
+  `[40, 40, 320, 950]` (`[x, y, w, h]`), which lies inside the image and covers
+  DICe's grid.
+
 ### Fixed — telemetry
 - Metrics slots 17 and 18 (Simplex and IC-GN time, "all paths") now include
   Path C's seed search. A solve that fell back to Path C reported less time
