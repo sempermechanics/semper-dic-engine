@@ -5,6 +5,21 @@ Versions follow [docs/CONTRACT.md](docs/CONTRACT.md) §A.1. Entries before
 
 ## Unreleased
 
+### Tests
+- The Android JNI adapter runs under the sanitizers. The `JniAdapter` suite
+  compiles `adapters/android/jni/SemperJNI.cpp` into `dic_tests` against the
+  NDK's own `jni.h` and drives it through a fake `JNIEnv` / `JavaVM`
+  (`tests/jni/`), comparing every result with the engine called directly, so
+  the ASan + UBSan and TSan jobs now cover array pinning, the output-capacity
+  bound, the metrics prefix, progress-thread attach/detach, cancel and
+  exceptions at the boundary. CMake finds the header from `ANDROID_NDK_*` or
+  `-DSEMPER_NDK_JNI_H`; `-DDIC_REQUIRE_JNI=ON` (set in CI) fails configure
+  without one. Clean under ASan + UBSan (GCC 11.4) and TSan (clang 18).
+- `Metamorphic`: five relations between pairs of full-field solves — rigid
+  translation, a whole-pixel shift of the deformed image, swapped images
+  (inverse map), a gain and offset on the deformed image, and a mirror in x.
+- No output changed.
+
 ### Fixed — examples
 - `examples/samples/oht_cfrp/expected.json` gave the image as 512×512 and a
   suggested `rect` of `[40, 40, 432, 432]`. The pair is 400×1040, so the rect

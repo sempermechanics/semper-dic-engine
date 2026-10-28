@@ -135,6 +135,7 @@ set(DIC_PIPELINE_TESTS
         integration/test_seeding_bench.cpp
         integration/test_incremental_bench.cpp
         integration/test_full_field_determinism.cpp
+        integration/test_metamorphic.cpp
         unit/test_image_codec.cpp
         integration/test_reference_cache.cpp
         integration/test_incremental.cpp
@@ -173,6 +174,7 @@ target_compile_definitions(dic_tests PRIVATE
 )
 
 option(DIC_REQUIRE_OPENCV "Fail configure if OpenCV is missing (CI sets this)" OFF)
+option(DIC_REQUIRE_JNI "Fail configure if the JNI adapter harness cannot be built (CI sets this)" OFF)
 
 # Prefer OpenCV targets already built by the parent `native/` package (vendored
 # third_party). Fall back to find_package for the standalone host-tests tree (CI).
@@ -239,6 +241,37 @@ if (_SEMPER_OPENCV_READY)
             target_compile_options(dic_tests PRIVATE -fopenmp)
             target_link_options(dic_tests PRIVATE -fopenmp)
         endif ()
+    endif ()
+    # JNI adapter harness (tests/jni/test_jni_adapter.cpp): the Android
+    # adapter's C++ (adapters/android/jni/SemperJNI.cpp) compiled into
+    # dic_tests and driven through a fake JNIEnv, so the sanitizer jobs cover
+    # it. It needs the NDK's own jni.h (the adapter is written against it; the
+    # JDK's differs in C++), which is copied alone out of the NDK sysroot so
+    # none of Bionic's headers reach the host include path. Set
+    # SEMPER_NDK_JNI_H to a jni.h, or let it be found from ANDROID_NDK_*.
+    find_file(SEMPER_NDK_JNI_H jni.h
+            PATHS $ENV{ANDROID_NDK_LATEST_HOME} $ENV{ANDROID_NDK_HOME}
+                  $ENV{ANDROID_NDK_ROOT} $ENV{ANDROID_NDK}
+            PATH_SUFFIXES toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include
+                          toolchains/llvm/prebuilt/darwin-x86_64/sysroot/usr/include
+                          toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/include
+            NO_DEFAULT_PATH)
+    if (SEMPER_NDK_JNI_H AND NOT MSVC)
+        configure_file(${SEMPER_NDK_JNI_H} ${CMAKE_CURRENT_BINARY_DIR}/jni_include/jni.h COPYONLY)
+        message(STATUS "dic_tests: JNI adapter harness on (${SEMPER_NDK_JNI_H})")
+        target_sources(dic_tests PRIVATE
+                ${NATIVE_ROOT}/adapters/android/jni/SemperJNI.cpp
+                jni/test_jni_adapter.cpp)
+        target_include_directories(dic_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/jni/shim)
+        target_include_directories(dic_tests SYSTEM PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/jni_include)
+        target_compile_definitions(dic_tests PRIVATE SEMPER_JNI_HARNESS=1)
+    elseif (DIC_REQUIRE_JNI)
+        message(FATAL_ERROR
+                "DIC_REQUIRE_JNI=ON but the NDK's jni.h was not found. Set ANDROID_NDK_HOME "
+                "(or ANDROID_NDK_LATEST_HOME / ANDROID_NDK_ROOT) to an NDK, or pass "
+                "-DSEMPER_NDK_JNI_H=<ndk>/toolchains/llvm/prebuilt/<host>/sysroot/usr/include/jni.h.")
+    else ()
+        message(STATUS "dic_tests: no NDK jni.h, JNI adapter harness skipped")
     endif ()
 elseif (DIC_REQUIRE_OPENCV)
     message(FATAL_ERROR

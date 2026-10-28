@@ -54,10 +54,14 @@ jobs:
           restore-keys: ccache-host-tests-
 
       - name: Configure
+        # DIC_REQUIRE_JNI: the JniAdapter suite compiles the Android adapter
+        # against the runner's NDK jni.h (ANDROID_NDK_LATEST_HOME); fail
+        # rather than leave it out if the image ever stops shipping one.
         run: >
           cmake -S tests -B build/tests
           -DCMAKE_BUILD_TYPE=Release
           -DDIC_REQUIRE_OPENCV=ON
+          -DDIC_REQUIRE_JNI=ON
           -DSEMPER_WERROR=ON
           -DCMAKE_C_COMPILER_LAUNCHER=ccache
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
@@ -116,6 +120,7 @@ jobs:
           cmake -S tests -B build/tests
           -DCMAKE_BUILD_TYPE=Release
           -DDIC_REQUIRE_OPENCV=ON
+          -DDIC_REQUIRE_JNI=ON
           -DDIC_OPENMP=OFF
           -DSEMPER_WERROR=ON
           -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
@@ -195,7 +200,9 @@ jobs:
       - name: Install toolchain
         # libopencv-dev is required or _SEMPER_OPENCV_READY stays false and the
         # whole full-field pipeline is silently excluded from the build — the
-        # sanitizers would then only ever see the math suite.
+        # sanitizers would then only ever see the math suite. The JNI adapter
+        # (JniAdapter suite) needs no package: the runner image's NDK supplies
+        # jni.h, and DIC_REQUIRE_JNI fails configure if it is missing.
         # clang/libomp/compiler-rt are required for the TSan job only (ASan
         # builds with GCC): GCC's libgomp carries no ThreadSanitizer
         # instrumentation, so it reports hundreds of false races on reused
@@ -216,6 +223,7 @@ jobs:
           cmake -S tests -B build/tests
           -DCMAKE_BUILD_TYPE=Release
           -DDIC_REQUIRE_OPENCV=ON
+          -DDIC_REQUIRE_JNI=ON
           -DDIC_SANITIZER=${{ matrix.sanitizer }}
           ${{ matrix.cmake_extra }}
           -DCMAKE_C_COMPILER_LAUNCHER=ccache
