@@ -436,11 +436,13 @@ TEST_CASE(FullField, NullMetrics_DoesNotCrash) {
 // It covers all four concurrent regions in one solve — the Hessian pre-pass,
 // the anchor lattice and Path A (OpenMP), plus Path B's std::thread workers.
 //
-// Thread count is deliberately not varied: run_full_field pins every OpenMP
-// region with `num_threads(safe_cores)`, which overrides omp_set_num_threads
-// and OMP_NUM_THREADS, so a test cannot change it without a production hook.
-// Cross-thread-count invariance is therefore not a contract this engine makes;
-// Path B's reliability-guided propagation is order-dependent by construction.
+// Thread count is not varied here. run_full_field sizes every OpenMP region
+// (`num_threads(safe_cores)`, which overrides omp_set_num_threads and
+// OMP_NUM_THREADS) and Path B's pool from hardware_concurrency(); the test
+// build's test_hooks::thread_count() replaces that, and the
+// FullFieldDeterminism *_ThreadCountInvariant cases require the same bytes on
+// 1, 2, 3 and 7 workers. Path B's propagation is order-dependent, but its
+// order is fixed by serial rounds of tuning::kPathBBatchNodes, not by workers.
 // ---------------------------------------------------------------------------
 TEST_CASE(FullField, RepeatSolve_BitIdenticalField) {
     cv::Mat ref_gray, def_gray;

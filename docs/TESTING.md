@@ -133,14 +133,22 @@ So: prepend your toolchain's `mingw64/bin`, and add
 requires the packed output to be bit-identical, which is what a race would
 break. It runs in every build, including the plain host job.
 
-Thread count is deliberately not varied: `run_full_field` pins every OpenMP
-region with `num_threads(safe_cores)`, which overrides `omp_set_num_threads` and
-`OMP_NUM_THREADS`, so a test cannot change it without adding a production hook.
-Cross-thread-count invariance is not a contract this engine makes — Path B's
-reliability-guided propagation is order-dependent by construction.
-The one other thread count CI runs is one: the `serial-build` job builds the
-suite with `-DDIC_OPENMP=OFF`, as on a toolchain without OpenMP, and the
-same tolerances must hold there.
+The field does not depend on the thread count either, and that is tested too.
+`run_full_field` sizes every OpenMP region (`num_threads(safe_cores)`, which
+overrides `omp_set_num_threads` and `OMP_NUM_THREADS`) and Path B's worker
+pool from `hardware_concurrency()`. The test build's
+`internal::test_hooks::thread_count()` (compiled in only under
+`SEMPER_TEST_HOOKS`, like the Path B fault hook) replaces that count, and the
+`*_ThreadCountInvariant` cases of `FullFieldDeterminism` plus
+`Incremental.ThreadCount_BitIdentical` solve on 1, 2, 3 and 7 workers and
+require the host count's bytes. Path B is order-dependent — which neighbour
+reaches a cell decides its guess — but the order is fixed by rounds of
+`tuning::kPathBBatchNodes` claimed serially, never by the workers.
+The `serial-build` job builds the suite with `-DDIC_OPENMP=OFF`, as on a
+toolchain without OpenMP, and the same suite must pass there. That build's
+`FullFieldGolden` field also matched the OpenMP build's byte for byte (both
+0 deviation from the fixture; GCC 11.4, 2026-10-28), but no test compares the
+two binaries, so across builds the cross-build tolerances below still apply.
 
 ## Running the tests
 
@@ -245,7 +253,9 @@ Guarded by `Engine.RepeatSolve_BitIdentical` (one ICGN solve) and
 variation on identical inputs is a defect (threading race, uninitialized
 memory). The field does not depend on the core count either: the Path B flood
 fill claims cells in fixed-size rounds (`tuning::kPathBBatchNodes`), not
-per-thread.
+per-thread. **Same build, same inputs, any thread count → bit-identical**, and
+a difference is a defect of the same kind; guarded by the
+`*_ThreadCountInvariant` cases below and `Incremental.ThreadCount_BitIdentical`.
 
 **Different builds / ABIs / dependency versions → small drift is expected.**
 The engine compiles with `-ffast-math` and uses FMA-based SIMD reductions, so
@@ -662,7 +672,9 @@ Synthetic speckle, because TIFF decoding crashes in the MinGW host build.
 | Test | Proves | Failure would mean |
 |---|---|---|
 | `TwoFrameBatch_BitIdentical` | Two load steps against one cache: every output byte and the Path A / Path B point counts repeat | A parallel phase (pre-pass, Path A, Path B flood) depends on thread timing |
-| `MaskedHole_BitIdentical` | Same under a ROI mask with a hole, where Path B solves most of the field | As above; this case exposed the Path B claim race (app TD-65) |
+| `MaskedHole_BitIdentical` | Same under a ROI mask with a hole. Path B once solved most of this field; the anchor mesh now reaches round the hole (Path A 2260, Path B 2 measured 2026-10-28) | As above; this case exposed the Path B claim race (app TD-65) |
+| `TwoFrameBatch_ThreadCountInvariant`, `MaskedHole_ThreadCountInvariant` | The two scenes above solved on 1, 2, 3 and 7 workers (`test_hooks::thread_count`) give the host count's bytes and every result metrics slot (all but the timings 9–14, 17, 18) | The worker count reaches the field: a phone with another core count gets another answer |
+| `NoLockStretch_ThreadCountInvariant` | The same, on a 45% stretch with no global lock where the anchor lattice, Path A and Path B all solve part of the field, Path B more than one `kPathBBatchNodes` round (271 / 110 / 45 points measured; the test requires > 32 from Path B) | As above, in Path B's claim order |
 
 ## Suite: `Incremental` — `integration/test_incremental.cpp`
 
@@ -690,6 +702,7 @@ error, an error map and a bias fit. OpenCV-gated.
 | `UpdateFloor_PartlyUnrelatedFrameNeverBecomesTheReference` | The same drift, with only the image below row 128 replaced by an unrelated speckle: the frame solves and reports about a quarter of a normal count. N = 5 with frames 3 (mid-interval, where the early update would fire) and 10 (scheduled): neither becomes the reference, frame 11 takes the deferred update. N = 5 with frames 6 and 10: frame 6 does not become the count, so frame 10 is refused too. N = 1 with frame 4: refused against frame 3's count, frame 5 becomes the reference. Every other frame as above | The update floor (`kIncUpdateMinReported`) stops refusing a solve that succeeded under half the count, early, on schedule, as the first frame on a reference, or at N = 1 |
 | `Rotation2DegNoisy_N5_KeepsTheChainThroughFailedSolves` | IncBench S4 at 2°/frame, σ = 2, N = 5, noise seeds 0 and 1: at 90° ≥ 90% of frame 1's points, ≥ 90% of them within 0.5 px, rms < 0.4 px. Measured: 370 / 364 / 0.162 px and 400 / 388 / 0.195 px, after 1 and 2 failed solves | The early update (seed 0, frame 36) or the scheduled one (seed 1, frame 15) moves onto a failed solve: before, 1 point 38 px off and nothing |
 | `RepeatRun_BitIdentical` | The same sequence twice gives the same bytes | Run-to-run nondeterminism in composition or the mask warp |
+| `ThreadCount_BitIdentical` | The same sequence on 1 and 3 workers (`test_hooks::thread_count`) gives the host count's bytes, reference frames and tracked / lost counts | The worker count reaches composition, the mask warp or the update schedule |
 | `Contracts_ErrorCodes` | `-3` before `init`, for a wrong-size frame and for a null buffer; `-2` / `-4` / `-3` from `init`, including an even subset (`-3`), a strain window far beyond the grid (`-3`) and a rect off the image (`-2`) | The documented codes drifted |
 | `Cancel_LeavesSessionUnchanged` | A frame cancelled mid-solve, then resubmitted, gives the same bytes as an uncancelled run | A cancelled frame half-updates the session |
 | `LongHorizon_160Frames` | 256², 160 frames of 0.1% stretch (16% total), noise σ = 1, N = 1 and N = 5: ≥ 95% of nodes tracked, rms U ≤ 0.45 / 0.35 px, rms strain ≤ 3.5e-2, RSS growth < 16 MB. Measured: rms 0.40 (N = 1), 0.19 (N = 5), fixed 0.05 | Error growth over a long horizon got worse, or memory leaks per reference update |
