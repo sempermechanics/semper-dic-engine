@@ -5,6 +5,16 @@ Versions follow [docs/CONTRACT.md](docs/CONTRACT.md) §A.1. Entries before
 
 ## Unreleased
 
+### Tests
+- The field is now tested to be bit-identical on any worker count, as
+  `full_field_path_b.cpp` and TESTING.md's reproducibility contract said and
+  as one TESTING.md paragraph and a test comment denied. The test build's
+  `internal::test_hooks::thread_count()` (compiled in only under
+  `SEMPER_TEST_HOOKS`; libraries are built without it) sets the worker count,
+  and `FullFieldDeterminism.*_ThreadCountInvariant` and
+  `Incremental.ThreadCount_BitIdentical` solve on 1, 2, 3 and 7 workers
+  against the host's count. No output changed.
+
 ### Fixed — examples
 - `examples/samples/oht_cfrp/expected.json` gave the image as 512×512 and a
   suggested `rect` of `[40, 40, 432, 432]`. The pair is 400×1040, so the rect

@@ -110,13 +110,21 @@ private:
 #if defined(SEMPER_TEST_HOOKS)
 // Test build only: tests/CMakeLists.txt defines SEMPER_TEST_HOOKS for
 // dic_tests, and no library target does. Lets a test make code throw that
-// never does on its own input, to drive the error paths above.
+// never does on its own input, to drive the error paths above, or run a solve
+// on a thread count the host does not have.
 namespace test_hooks {
 // Called by a Path B worker, with its index, before each cell it solves. Set
 // it before the solve and clear it after: workers only read it.
 inline std::function<void(int worker)> &path_b_worker_cell() {
     static std::function<void(int)> hook;
     return hook;
+}
+// When positive, the worker count of the next solves in place of
+// hardware_concurrency(): every OpenMP region's num_threads and Path B's
+// worker pool follow it. Set it before a solve and reset it to 0 after.
+inline int &thread_count() {
+    static int count = 0;
+    return count;
 }
 } // namespace test_hooks
 #endif
