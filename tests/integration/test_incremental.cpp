@@ -24,6 +24,7 @@
 #include <semper/cancel.hpp>
 #include <semper/incremental.hpp>
 #include <semper/pipeline.hpp>
+#include "pipeline/full_field_internal.hpp"
 
 #include <opencv2/core.hpp>
 
@@ -445,6 +446,29 @@ TEST_CASE(Incremental, RepeatRun_BitIdentical) {
     const std::vector<Frame> b = run_session(s, cv::Mat(), p, 2);
     REQUIRE(a.size() == b.size());
     for (size_t t = 0; t < a.size(); ++t) CHECK(bit_equal(a[t], b[t]));
+}
+
+// The same sequence on 1 and 3 workers (test_hooks::thread_count) gives the
+// bytes and frame info the host's own core count gives: composition, the mask
+// warp and every reference update follow the field, not the worker count.
+TEST_CASE(Incremental, ThreadCount_BitIdentical) {
+    const Sequence s = stretch_rotate_sequence(320, 320, 6, 0.1, 5.0);
+    const FullFieldParams p = centred_params(320, 320, 160);
+    const std::vector<Frame> base = run_session(s, cv::Mat(), p, 2);
+    REQUIRE(base.size() == s.frames.size());
+    for (int threads : {1, 3}) {
+        Semper::pipeline::internal::test_hooks::thread_count() = threads;
+        const std::vector<Frame> other = run_session(s, cv::Mat(), p, 2);
+        Semper::pipeline::internal::test_hooks::thread_count() = 0;
+        REQUIRE(other.size() == base.size());
+        for (size_t t = 0; t < base.size(); ++t) {
+            CHECK(base[t].rc > 0);
+            CHECK(bit_equal(base[t], other[t]));
+            CHECK(base[t].info.reference_frame == other[t].info.reference_frame);
+            CHECK(base[t].info.tracked_points == other[t].info.tracked_points);
+            CHECK(base[t].info.lost_this_frame == other[t].info.lost_this_frame);
+        }
+    }
 }
 
 TEST_CASE(Incremental, Contracts_ErrorCodes) {

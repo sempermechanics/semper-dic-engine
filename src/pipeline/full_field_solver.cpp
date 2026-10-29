@@ -197,6 +197,9 @@ int run_full_field_impl(
         timings.img_prep = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_prep_start).count();
 
         int safe_cores = std::max(1, (int)std::thread::hardware_concurrency());
+#if defined(SEMPER_TEST_HOOKS)
+        if (test_hooks::thread_count() > 0) safe_cores = test_hooks::thread_count();
+#endif
 
         // validate_params clipped the rect to the image, so the grid holds at
         // most one node per pixel and every count below fits an int.
