@@ -15,6 +15,14 @@ without them `_SEMPER_OPENCV_READY` stays false and `run_full_field`, its three
 OpenMP regions and Path B's `std::thread` workers are silently excluded from the
 build. (They were, until this was fixed.)
 
+They also cover the **Android JNI adapter** (`adapters/android/jni/SemperJNI.cpp`)
+through the `JniAdapter` suite, which compiles it into `dic_tests` against the
+NDK's own `jni.h`. CMake finds that header from `ANDROID_NDK_LATEST_HOME`,
+`ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT` or `ANDROID_NDK` (GitHub's Ubuntu runners
+set the first two), or from `-DSEMPER_NDK_JNI_H=<path to jni.h>`. Without one
+the suite is left out with a configure message; CI passes `-DDIC_REQUIRE_JNI=ON`
+so it cannot be left out silently.
+
 ### ASan + UBSan — GCC
 
 ```bash
@@ -794,6 +802,65 @@ on. It runs in the `c-sdk-smoke` CI job and returns non-zero on any breach:
   `libsemper_c.so` against the documented exports, so an accidental export or
   a dropped `SEMPER_C_API` annotation fails the build.
 
+## Suite: `Metamorphic` — `integration/test_metamorphic.cpp`
+
+Pairs of solves whose inputs are related by a transformation with a known
+effect on the field, so each relation holds whatever the true field is. Every
+image is exact: rendered from one continuous speckle (`framework/sequence.h`),
+moved by whole pixels, or mirrored, never resampled. 256² image, nodes 50–205
+on both axes (symmetric, so a mirror maps nodes onto nodes), subset 21, step 5,
+strain window 15. The speckle is denser than `sequence.h`'s default (2000 blobs
+per 65536 px², about 13 per subset): at the default, a few nearly flat subsets
+came back up to 0.23 px off on a rigid shift with ZNSSD under 0.05, the usual
+behaviour of DIC on missing texture, which would bury the relations. Bounds are
+3–20× the measured values (Ubuntu 22.04, GCC 11.4) noted in the file.
+OpenCV-gated.
+
+| Test | Proves | Failure would mean |
+|---|---|---|
+| `RigidTranslation_EveryPointMovesByTheShift` | A (3.37, −2.18) px shift: rms error ≤ 0.02 px, worst ≤ 0.05, \|strain\| ≤ 3e-3 (measured 7.4e-3, 1.6e-2, 9.4e-4) | Translation is biased somewhere in the field, or a rigid motion produces strain |
+| `DeformedShiftedByWholePixels_AddsTheShift` | Moving the deformed image by (4, −3) px adds exactly that to every displacement; strain and correlation unchanged (measured 1.9e-3 px, 1.0e-4, 5.5e-6) | A guess, seed or search depends on where the speckle sits in the frame, not on the motion |
+| `SwappedImages_InvertTheMap` | Swapping reference and deformed gives the inverse map: the backward field's affine fit undoes each forward point (≤ 0.05 px; 1.9e-2 measured, the solve's own scatter), and the fitted gradients compose to the identity (≤ 5e-5; 2.3e-6 measured) | A sign or convention slip that a one-directional accuracy test absorbs |
+| `DeformedGainAndOffset_SameField` | `0.7·I + 30` on the deformed image (8-bit, so only nearly related) leaves every point within 0.03 px and 2e-3 strain (1.0e-2, 6.9e-4 measured) and keeps every point | Normalisation lost somewhere in seeding, the post-filter or the median test — the full-field counterpart of `Engine.ZnssdInvariantToBrightnessAndContrast` |
+| `MirroredImages_MirrorTheField` | Both images mirrored in x: at the mirrored node u and exy change sign, v, exx, eyy and correlation stay (1.1e-3 px, 7.7e-5, 1.0e-5 measured) | An x/y or sign asymmetry in the shape function, strain or propagation |
+
+## Suite: `JniAdapter` — `jni/test_jni_adapter.cpp`
+
+The Android adapter, `adapters/android/jni/SemperJNI.cpp`, compiled into
+`dic_tests` against the NDK's own `jni.h` (copied alone out of the NDK sysroot
+into the build tree, so no Bionic header reaches the host include path) and
+driven through a fake `JNIEnv` / `JavaVM`. `tests/jni/shim/android/` stands in
+for `<android/log.h>` and `<android/bitmap.h>`; the harness implements them over
+its fake Bitmaps. Built when an NDK `jni.h` is found (see "Sanitizers");
+OpenCV-gated. Its point is that the sanitizer jobs see the adapter, which
+otherwise only ever built with the NDK and ran on a device.
+
+The fake is stricter than a VM where that finds bugs: element pointers are
+fresh heap copies of exactly the array's length, released only by the pointer
+handed out; a direct buffer is exactly its stated capacity; global references,
+thread attaches and UTF strings are counted and must balance after every call;
+an out-of-range array region is recorded; a call the harness does not
+implement is a null function pointer and crashes. Each result is compared with
+the engine called directly. Shrinking the capacity check by 8 floats and
+dropping the byte-array release were both caught (ASan heap-buffer-overflow in
+`pack_full_field_output`; a pinned array left behind).
+
+| Test | Proves | Failure would mean |
+|---|---|---|
+| `OnLoad_ReturnsVersionAndPinsOpenCvToOneThread` | `JNI_OnLoad` returns `JNI_VERSION_1_6` and sets OpenCV to one thread | The library load contract drifted |
+| `FullFieldDirect_MatchesRunFullField` | `initializeReference` (PNG) + `computeFullFieldDirect` (raw pixels), with and without a mask, equal `run_full_field` byte for byte with the same result metrics; progress reaches 100 in order, the solver's progress thread is attached and detached; nothing stays pinned or referenced | The bridge changes the field, or leaks a pin, a global ref or a thread attachment |
+| `FullFieldDirect_RefusesBadInput` | A null, undecodable or unpinnable deformed image, an undecodable mask, a heap (non-direct) buffer, a buffer under one float and a null env return -3; a reference that does not decode empties the cache and the next solve fails | A bad input reaches the solver, or a failure path leaks a pin |
+| `FullFieldDirect_SmallBufferStaysInBounds` | A direct buffer of 83 or 8 floats: the solver writes inside it and returns what the engine returns for that capacity | The capacity bound is lost and the solver overruns Kotlin's buffer |
+| `Metrics_CopiesTheLargestPrefix` | Arrays of 8, 16, 18, 23, 24 and 30 floats get 0, 16, 17, 23, 24 and 24 slots (`metrics_prefix_len`), the rest untouched | The copy-back writes past a short array, or drops slots |
+| `Incremental_MatchesSession` | `initializeIncremental` + `computeIncrementalFrame` equal `IncrementalSession` frame by frame, bytes, metrics and the six info fields; error codes -3 / -2 pass through; an info array under 6 is untouched; after `releaseIncremental` a frame is -3 | The incremental bridge diverges from the session, or a released session is used |
+| `Cancel_StopsTheRunningSolve` | `setCancelRequested(true)` from another thread during the solve returns `kCancelled`; a flag left set before the next solve does not cancel it | Cancel cannot reach a running solve, or a stale cancel kills the next one |
+| `ProgressWithoutMethod_SolvesSilently` | A progress object without `onProgressUpdate(I)V`: the error is cleared and the solve is unchanged | A missing method leaves a pending exception or aborts |
+| `ExceptionInTheSolve_IsMinus3` | A Path B worker that throws (the `test_hooks` fault) returns -3 through `guarded_call`; the next solve is the engine's | An exception crosses the JNI frame and aborts the app |
+| `Preview_ScalesIntoAPaddedBitmap` | `getPreviewFromBytes` writes the resized RGBA image row by row into a Bitmap with padded rows and leaves the padding; a 400×3 image keeps one row; no width, undecodable bytes, a null array and a non-RGBA_8888 Bitmap give null; every lock is released | The preview writes across row padding, or leaks a lock |
+| `ImageDimensions_OrZeros` | `getImageDimensions` gives (64, 40) for a PNG and (0, 0) for garbage, null or an unpinnable array | A failure leaks a pin or returns stale sizes |
+| `DebugOutputDir_ReleasesTheString` | The UTF string is released; null clears | A leaked UTF copy per call |
+| `LegacyPackage_Forwards` | The `com.indicvision.semper` exports give the same field | The forwarders broke before the old package is gone |
+
 ## Coverage (report-only)
 
 The `coverage` CI job configures `-DSEMPER_COVERAGE=ON`, runs `dic_tests`, and
@@ -837,7 +904,10 @@ tests/
                             test_full_field_contracts,
                             test_full_field_golden, test_seeding_contracts,
                             test_seeding_bench, test_full_field_determinism,
-                            test_reference_cache (the last six OpenCV-gated)
+                            test_reference_cache, test_metamorphic
+                            (the last seven OpenCV-gated)
+  jni/                    the Android JNI adapter on the host (JniAdapter;
+                            needs an NDK jni.h) and shim/android/ headers
   dice/                   DICe golden comparisons
   perf/                   throughput gates
 ```
@@ -846,7 +916,9 @@ tests/
 `DIC_INTEGRATION_TESTS` / `DIC_DICE_TESTS` / `DIC_PERF_TESTS`, plus
 `DIC_PIPELINE_TESTS` for the OpenCV-gated suites (`test_full_field_contracts`,
 `test_full_field_golden`, `test_seeding_contracts`, `test_seeding_bench`, `test_full_field_determinism`,
-`test_image_codec`, `test_reference_cache`) — attached only when OpenCV is present.
+`test_metamorphic`, `test_image_codec`, `test_reference_cache`) — attached only when OpenCV is present.
+`jni/test_jni_adapter.cpp` and the adapter source are attached when OpenCV and
+an NDK `jni.h` are both found.
 
 ## Adding a new test
 
@@ -868,9 +940,14 @@ tests/
 - **Host C++ tests** (this suite) own algorithmic correctness: displacement
   accuracy, strain math, SIMD equivalence, determinism, and robustness.
 - **C ABI / Python smokes** own binding marshalling at the public SDK surface.
+- **The `JniAdapter` suite** (this suite, when an NDK `jni.h` is found) owns
+  the adapter's C++ on the host: array pinning and release, the output-capacity
+  bound, the metrics prefix, progress-thread attach/detach, cancel, and
+  exceptions at the boundary, under ASan + UBSan and TSan.
 - **Downstream Android JNI / JVM tests** (private app) own runtime/bridge
-  correctness: `System.loadLibrary`, OpenMP on the Android runtime, and Kotlin
-  orchestration. They do not re-assert displacement accuracy here.
+  correctness: `System.loadLibrary`, the real VM, OpenMP on the Android
+  runtime, and Kotlin orchestration. They do not re-assert displacement
+  accuracy here.
 
 The downstream app's own test map lives in that private repository (see
 ["Downstream app tests"](#downstream-app-tests-informative) above); it is not

@@ -6,14 +6,19 @@ Versions follow [docs/CONTRACT.md](docs/CONTRACT.md) §A.1. Entries before
 ## Unreleased
 
 ### Tests
-- The field is now tested to be bit-identical on any worker count, as
-  `full_field_path_b.cpp` and TESTING.md's reproducibility contract said and
-  as one TESTING.md paragraph and a test comment denied. The test build's
-  `internal::test_hooks::thread_count()` (compiled in only under
-  `SEMPER_TEST_HOOKS`; libraries are built without it) sets the worker count,
-  and `FullFieldDeterminism.*_ThreadCountInvariant` and
-  `Incremental.ThreadCount_BitIdentical` solve on 1, 2, 3 and 7 workers
-  against the host's count. No output changed.
+- The Android JNI adapter runs under the sanitizers. The `JniAdapter` suite
+  compiles `adapters/android/jni/SemperJNI.cpp` into `dic_tests` against the
+  NDK's own `jni.h` and drives it through a fake `JNIEnv` / `JavaVM`
+  (`tests/jni/`), comparing every result with the engine called directly, so
+  the ASan + UBSan and TSan jobs now cover array pinning, the output-capacity
+  bound, the metrics prefix, progress-thread attach/detach, cancel and
+  exceptions at the boundary. CMake finds the header from `ANDROID_NDK_*` or
+  `-DSEMPER_NDK_JNI_H`; `-DDIC_REQUIRE_JNI=ON` (set in CI) fails configure
+  without one. Clean under ASan + UBSan (GCC 11.4) and TSan (clang 18).
+- `Metamorphic`: five relations between pairs of full-field solves — rigid
+  translation, a whole-pixel shift of the deformed image, swapped images
+  (inverse map), a gain and offset on the deformed image, and a mirror in x.
+- No output changed.
 
 ### Fixed — examples
 - `examples/samples/oht_cfrp/expected.json` gave the image as 512×512 and a
