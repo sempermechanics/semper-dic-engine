@@ -9,9 +9,16 @@ on:
   pull_request:
     branches: [main]
 
+# Actions are pinned to commit SHAs (the tag in the comment); the job token
+# can only read the repository.
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # A newer push supersedes a pull request's run; a push to main never cancels
+  # the run of the commit before it, whose failure would otherwise go unseen.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # ===================================================================
@@ -26,7 +33,7 @@ jobs:
       CCACHE_MAXSIZE: 500M
       CCACHE_COMPILERCHECK: content
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
 
@@ -36,7 +43,7 @@ jobs:
       - name: Cache apt packages
         # A new key each month, so the cached .debs follow the archive instead of
         # staying as first saved; restore-keys starts from last month's.
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/apt-cache
           key: apt-host-tests-${{ runner.os }}-${{ steps.month.outputs.month }}
@@ -47,7 +54,7 @@ jobs:
         run: bash scripts/ci-apt-install.sh libopencv-dev ccache
 
       - name: Cache ccache objects
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.ccache
           key: ccache-host-tests-${{ github.sha }}
@@ -70,7 +77,7 @@ jobs:
         run: cmake --build build/tests -j"$(nproc)"
 
       - name: Run dic_tests
-        run: ./build/tests/dic_tests
+        run: ctest --test-dir build/tests --output-on-failure
 
       - name: ccache statistics
         if: always()
@@ -90,7 +97,7 @@ jobs:
       CCACHE_MAXSIZE: 500M
       CCACHE_COMPILERCHECK: content
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
 
@@ -98,7 +105,7 @@ jobs:
         run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
 
       - name: Cache apt packages
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/apt-cache
           key: apt-serial-build-${{ runner.os }}-${{ steps.month.outputs.month }}
@@ -109,7 +116,7 @@ jobs:
         run: bash scripts/ci-apt-install.sh libopencv-dev ccache
 
       - name: Cache ccache objects
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.ccache
           key: ccache-serial-${{ github.sha }}
@@ -134,17 +141,23 @@ jobs:
         # No compile line may carry -fopenmp, and dic_tests must not call
         # into an OpenMP runtime (GOMP_* for libgomp, __kmpc_* for libomp).
         # Symbols, not ldd: the system OpenCV may pull a runtime in itself.
+        # Fails closed: a missing compile database or a failing nm is an error,
+        # not a pass (`if grep` alone took either for "no match").
         run: |
+          test -s build/tests/compile_commands.json || {
+            echo "::error::no compile_commands.json to check"; exit 1; }
           if grep -q -- '-fopenmp' build/tests/compile_commands.json; then
             echo "::error::a compile command uses -fopenmp"; exit 1
           fi
-          if nm -D --undefined-only build/tests/dic_tests | grep -E ' (GOMP_|omp_|__kmpc_)'; then
+          undef=$(nm -D --undefined-only build/tests/dic_tests)
+          test -n "$undef"
+          if grep -E ' (GOMP_|omp_|__kmpc_)' <<<"$undef"; then
             echo "::error::dic_tests calls into an OpenMP runtime"; exit 1
           fi
           echo "no -fopenmp, no OpenMP runtime calls"
 
       - name: Run dic_tests
-        run: ./build/tests/dic_tests
+        run: ctest --test-dir build/tests --output-on-failure
 
       - name: ccache statistics
         if: always()
@@ -183,7 +196,7 @@ jobs:
       CCACHE_COMPILERCHECK: content
       SHARD_1: "Incremental.EarlyUpdate_WhenReportedPointsDrop:Incremental.Rotation90_200Frames_TracksTheTurningRoi:Incremental.LongHorizon_160Frames"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
 
@@ -191,7 +204,7 @@ jobs:
         run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
 
       - name: Cache apt packages
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/apt-cache
           key: apt-san-${{ matrix.id }}-${{ runner.os }}-${{ steps.month.outputs.month }}
@@ -212,7 +225,7 @@ jobs:
         run: bash scripts/ci-apt-install.sh ${{ matrix.packages }}
 
       - name: Cache ccache objects
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.ccache
           key: ccache-san-${{ matrix.id }}-${{ github.sha }}
@@ -238,6 +251,9 @@ jobs:
           # libomp's own lazy lock-pool init races with itself, entirely inside
           # the uninstrumented runtime with no engine frames on either stack.
           TSAN_OPTIONS: ignore_noninstrumented_modules=1
+          # The build already aborts on the first report
+          # (-fno-sanitize-recover); this adds the stack to the log.
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: |
           if [ "${{ matrix.shard }}" = 1 ]; then F="$SHARD_1"; else F="-$SHARD_1"; fi
           ./build/tests/dic_tests "$F"
@@ -247,10 +263,15 @@ jobs:
         run: ccache --show-stats
 
   # ===================================================================
-  # C ABI smoke — vendored OpenCV, libsemper_c
+  # The shipped configuration — vendored OpenCV 4.14, as the C SDK, the
+  # wheels and the Android library link it. The host jobs above build against
+  # the runner's system OpenCV (headers of the vendored core for the SIMD
+  # intrinsics, libraries of another version); this one runs the whole host
+  # suite against the OpenCV that ships, plus the C ABI smoke and contract
+  # binaries, the exported-symbol check and the C++ example.
   # ===================================================================
   c-sdk-smoke:
-    name: C SDK smoke
+    name: Vendored OpenCV (C SDK, host tests, examples)
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
@@ -259,7 +280,7 @@ jobs:
       CCACHE_MAXSIZE: 500M
       CCACHE_COMPILERCHECK: content
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
 
@@ -270,7 +291,7 @@ jobs:
         run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
 
       - name: Cache apt packages
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/apt-cache
           key: apt-ccache-${{ runner.os }}-${{ steps.month.outputs.month }}
@@ -281,67 +302,141 @@ jobs:
         run: bash scripts/ci-apt-install.sh ccache
 
       - name: Cache ccache objects
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.ccache
           key: ccache-c-sdk-${{ github.sha }}
           restore-keys: ccache-c-sdk-
 
-      - name: Configure C SDK
+      - name: Configure
         run: |
           cmake -S . -B build/sdk \
             -DCMAKE_BUILD_TYPE=Release \
             -DSEMPER_BUILD_C_SDK=ON \
-            -DSEMPER_BUILD_TESTS=OFF \
+            -DSEMPER_BUILD_TESTS=ON \
+            -DSEMPER_BUILD_EXAMPLES=ON \
             -DSEMPER_ANDROID=OFF \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
-      - name: Build semper_c + smoke + contract
-        run: cmake --build build/sdk --target semper_c semper_c_smoke semper_c_contract -j"$(nproc)"
+      - name: Build
+        run: >
+          cmake --build build/sdk -j"$(nproc)"
+          --target semper_c semper_c_smoke semper_c_contract dic_tests run_translation
 
-      - name: Run C smoke
-        run: |
-          SMOKE=$(find build/sdk -name semper_c_smoke -type f | head -n1)
-          test -n "$SMOKE"
-          # Shared lib lives next to the adapter build tree on Linux.
-          export LD_LIBRARY_PATH="$(dirname "$SMOKE"):$(dirname "$SMOKE")/../adapters/c:${LD_LIBRARY_PATH:-}"
-          # Also search common CMake output dirs.
-          for d in build/sdk/adapters/c build/sdk/lib build/sdk/bin; do
-            [ -d "$d" ] && export LD_LIBRARY_PATH="$(pwd)/$d:$LD_LIBRARY_PATH"
-          done
-          "$SMOKE"
-
-      - name: Run C ABI contract
-        run: |
-          CONTRACT=$(find build/sdk -name semper_c_contract -type f | head -n1)
-          test -n "$CONTRACT"
-          export LD_LIBRARY_PATH="$(dirname "$CONTRACT"):$(dirname "$CONTRACT")/../adapters/c:${LD_LIBRARY_PATH:-}"
-          for d in build/sdk/adapters/c build/sdk/lib build/sdk/bin; do
-            [ -d "$d" ] && export LD_LIBRARY_PATH="$(pwd)/$d:$LD_LIBRARY_PATH"
-          done
-          "$CONTRACT"
+      - name: Run dic_tests, C smoke and C ABI contract
+        run: ctest --test-dir build/sdk --output-on-failure
 
       - name: Check exported ABI symbols against golden list
         run: |
           # VERSION/SOVERSION makes libsemper_c.so a symlink to
-          # libsemper_c.so.$MAJOR; -type f would skip the link and fail
-          # the test -n check with no nm output.
+          # libsemper_c.so.$MAJOR; -type f would skip the link.
           LIB=$(find build/sdk -name 'libsemper_c.so' | head -n1)
           test -n "$LIB"
           echo "Inspecting $LIB"
-          # The documented entry points are the ONLY symbols that may be
-          # exported (visibility is hidden + explicit SEMPER_C_API). An accidental
-          # export, or a dropped annotation, changes this set and fails the diff.
-          nm -D --defined-only "$LIB" | awk '$2=="T"{print $3}' \
-            | grep '^semper_' | sort > /tmp/abi_symbols.actual
-          echo "Exported semper_* symbols:"; cat /tmp/abi_symbols.actual
+          # Every defined dynamic symbol, of any type -- not only text symbols
+          # named semper_*: a leaked C++ or OpenCV symbol, data or weak, fails
+          # here too. The documented entry points are the ONLY exports
+          # (adapters/c/semper_c.map, -fvisibility=hidden, SEMPER_C_API).
+          nm -D --defined-only "$LIB" > /tmp/abi_nm
+          test -s /tmp/abi_nm
+          awk '{print $NF}' /tmp/abi_nm | sort > /tmp/abi_symbols.actual
+          echo "Exported symbols:"; cat /tmp/abi_symbols.actual
           if ! diff -u tests/c/abi_symbols.txt /tmp/abi_symbols.actual; then
             echo "::error::Exported C ABI symbol set drifted from tests/c/abi_symbols.txt"
             echo "If this change is intentional, update the golden list and bump the"
             echo "version per docs/CONTRACT.md §A.1."
             exit 1
           fi
+
+      - name: ccache statistics
+        if: always()
+        run: ccache --show-stats
+
+  # ===================================================================
+  # The C ABI and the Python module under ASan+UBSan: the two adapters that
+  # take raw pointers, capacities and arrays from their callers. dic_tests
+  # does not link either, so the sanitizer jobs above never saw them.
+  # ===================================================================
+  adapters-sanitized:
+    name: C ABI + Python (ASan+UBSan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 500M
+      CCACHE_COMPILERCHECK: content
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+
+      - name: Sparse OpenCV checkout
+        run: bash scripts/sparse-opencv.sh
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - id: month
+        run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache apt packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/apt-cache
+          key: apt-ccache-${{ runner.os }}-${{ steps.month.outputs.month }}
+          restore-keys: apt-ccache-${{ runner.os }}-
+
+      - name: Install ccache
+        timeout-minutes: 15
+        run: bash scripts/ci-apt-install.sh ccache
+
+      - name: Install pybind11, numpy, pytest
+        run: python -m pip install -r bindings/python/requirements-ci.txt
+
+      - name: Cache ccache objects
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-adapters-san-${{ github.sha }}
+          restore-keys: ccache-adapters-san-
+
+      - name: Configure
+        run: |
+          cmake -S . -B build/san \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSEMPER_SANITIZER=address,undefined \
+            -DSEMPER_BUILD_C_SDK=ON \
+            -DSEMPER_BUILD_PYTHON=ON \
+            -DPython_EXECUTABLE="$(command -v python)" \
+            -Dpybind11_DIR="$(python -m pybind11 --cmakedir)" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build
+        run: cmake --build build/san -j"$(nproc)" --target semper_c semper_c_smoke semper_c_contract _semper
+
+      - name: C smoke and C ABI contract
+        run: ctest --test-dir build/san --output-on-failure -R '^semper_c_'
+
+      - name: Python binding tests
+        # The interpreter is not instrumented, so the runtime is preloaded;
+        # CPython's own allocations are not leaks the engine made.
+        run: |
+          PKG="$RUNNER_TEMP/pkg"
+          mkdir -p "$PKG/semper"
+          cp bindings/python/semper/*.py "$PKG/semper/"
+          cp "$(find build/san -name '_semper*.so' | head -n1)" "$PKG/semper/"
+          cd "$RUNNER_TEMP"
+          LD_PRELOAD="$(gcc -print-file-name=libasan.so) $(gcc -print-file-name=libubsan.so)" \
+          ASAN_OPTIONS=detect_leaks=0 PYTHONPATH="$PKG" \
+            python -m pytest -v "$GITHUB_WORKSPACE/bindings/python/tests"
+
+      - name: ccache statistics
+        if: always()
+        run: ccache --show-stats
 
   # ===================================================================
   # Python bindings — pip-build the package from the tree (scikit-build-core,
@@ -360,14 +455,14 @@ jobs:
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
 
       - name: Sparse OpenCV checkout
         run: bash scripts/sparse-opencv.sh
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
 
@@ -375,7 +470,7 @@ jobs:
         run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
 
       - name: Cache apt packages
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/apt-cache
           key: apt-ccache-${{ runner.os }}-${{ steps.month.outputs.month }}
@@ -386,7 +481,7 @@ jobs:
         run: bash scripts/ci-apt-install.sh ccache
 
       - name: Cache ccache objects
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.ccache
           key: ccache-python-${{ github.sha }}
@@ -398,7 +493,8 @@ jobs:
         # would never hit the cache.
         run: |
           export CMAKE_BUILD_PARALLEL_LEVEL="$(nproc)"
-          python -m pip install -v -C build-dir="$GITHUB_WORKSPACE/build/py" ./bindings/python pytest
+          python -m pip install -r bindings/python/requirements-ci.txt
+          python -m pip install -v -C build-dir="$GITHUB_WORKSPACE/build/py" ./bindings/python
 
       - name: Run binding tests
         # Outside the checkout, so `import semper` can only resolve to the
@@ -421,7 +517,7 @@ jobs:
       # mtime, decides whether old objects still apply.
       CCACHE_COMPILERCHECK: content
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
 
@@ -432,7 +528,7 @@ jobs:
         run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
 
       - name: Cache apt packages
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/apt-cache
           key: apt-ccache-${{ runner.os }}-${{ steps.month.outputs.month }}
@@ -443,7 +539,7 @@ jobs:
         run: bash scripts/ci-apt-install.sh ccache
 
       - name: Cache ccache objects
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.ccache
           key: ccache-android-${{ github.sha }}
@@ -469,9 +565,14 @@ jobs:
           LIB=$(find build/android -name libsemper_core.so -type f | head -n1)
           test -n "$LIB"
           NM="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
-          "$NM" -D --defined-only "$LIB" | awk '{print $NF}' | grep '^Java_' | sort | tee /tmp/jni_symbols
-          grep -q '^Java_com_sempermechanics_semper_SemperNativeLib_computeFullFieldDirect$' /tmp/jni_symbols
-          grep -q '^Java_com_sempermechanics_semper_SemperNativeLib_computeIncrementalFrame$' /tmp/jni_symbols
+          "$NM" -D --defined-only "$LIB" > /tmp/jni_nm
+          test -s /tmp/jni_nm
+          # Every JNI entry point, both packages, against the golden list: a
+          # dropped export (or an unexpected new one) fails here, not with an
+          # UnsatisfiedLinkError in the app.
+          awk '{print $NF}' /tmp/jni_nm | grep -E '^(Java_|JNI_)' | sort > /tmp/jni_symbols
+          cat /tmp/jni_symbols
+          diff -u tests/jni/jni_symbols.txt /tmp/jni_symbols
 
   # ===================================================================
   # Coverage — report-only, no gate (SEMPER_COVERAGE). Surfaces which src/
@@ -494,7 +595,7 @@ jobs:
       # 466 s of the 935 s on fbfaae3; shard 2 runs the rest.
       SHARD_1: "Incremental.EarlyUpdate_WhenReportedPointsDrop:Incremental.LongHorizon_160Frames:DiceIncremental.OhtCfrp_LadderTotalsAgreeWithDice"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
 
@@ -502,7 +603,7 @@ jobs:
         run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
 
       - name: Cache apt packages
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/apt-cache
           key: apt-coverage-${{ runner.os }}-${{ steps.month.outputs.month }}
@@ -531,7 +632,7 @@ jobs:
         run: gcovr --root . build/cov --filter 'src/' --json -o coverage-${{ matrix.shard }}.json
 
       - name: Upload coverage JSON
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-json-${{ matrix.shard }}
           path: coverage-${{ matrix.shard }}.json
@@ -543,13 +644,13 @@ jobs:
     timeout-minutes: 20
     steps:
       # The tracefiles name sources relative to the repo root.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - id: month
         run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
 
       - name: Cache apt packages
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/apt-cache
           key: apt-coverage-report-${{ runner.os }}-${{ steps.month.outputs.month }}
@@ -561,7 +662,7 @@ jobs:
         # their JSON.
         run: bash scripts/ci-apt-install.sh gcovr
 
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           pattern: coverage-json-*
           merge-multiple: true
@@ -577,7 +678,7 @@ jobs:
 
       - name: Upload coverage.xml
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-xml
           path: coverage.xml

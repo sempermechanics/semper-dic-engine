@@ -17,6 +17,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(NATIVE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
+# `ctest` runs the suite (CI does). Without this a ctest in the build tree
+# reported "No tests were found" and exited 0.
+enable_testing()
+
 # Treat any first-party warning as an error under -DSEMPER_WERROR=ON.
 # Off by default for local builds; CI host job enables it (-DSEMPER_WERROR=ON).
 option(SEMPER_WERROR "Fail the build on compiler warnings in first-party code" OFF)
@@ -25,7 +29,11 @@ option(SEMPER_WERROR "Fail the build on compiler warnings in first-party code" O
 option(DIC_OPENMP "Build the pipeline sources with OpenMP" ON)
 
 if (NOT MSVC)
-    add_compile_options(-O2 -ffast-math -Wall -Wextra)
+    # The libraries' own flags (root CMakeLists.txt): -O3 -ffast-math, with
+    # floating-point contraction off so a multiply-add rounds the same on
+    # every target (aarch64 fused it, x86-64 does not), and NaN/Inf kept
+    # meaningful so the engine's checks for them hold.
+    add_compile_options(-O3 -ffast-math -fno-finite-math-only -ffp-contract=off -Wall -Wextra)
     if (SEMPER_WERROR)
         # GCC's -Waggressive-loop-optimizations is a known false positive on
         # SIMD residual tails (reports absurd iteration counts). Keep it as a
@@ -40,7 +48,8 @@ if (NOT MSVC)
         endif ()
     endif ()
 else ()
-    add_compile_options(/O2 /fp:fast /W3)
+    # /fp:precise, as the libraries are built with MSVC (its default).
+    add_compile_options(/O2 /fp:precise /W3)
     if (SEMPER_WERROR)
         add_compile_options(/WX)
     endif ()
@@ -48,8 +57,16 @@ endif ()
 
 set(DIC_SANITIZER "" CACHE STRING "Comma-separated sanitizers (address,undefined,thread) or empty")
 if (DIC_SANITIZER AND NOT MSVC)
-    add_compile_options(-fsanitize=${DIC_SANITIZER} -g -fno-omit-frame-pointer)
-    add_link_options(-fsanitize=${DIC_SANITIZER})
+    # Every report aborts the run (-fno-sanitize-recover): UBSan used to print
+    # "runtime error:" and carry on, and the suite still exited 0.
+    # float-cast-overflow is not in -fsanitize=undefined; it is what catches a
+    # NaN or out-of-range coordinate cast to an index.
+    set(_dic_san ${DIC_SANITIZER})
+    if (DIC_SANITIZER MATCHES "undefined")
+        set(_dic_san "${DIC_SANITIZER},float-cast-overflow")
+    endif ()
+    add_compile_options(-fsanitize=${_dic_san} -fno-sanitize-recover=all -g -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=${_dic_san} -fno-sanitize-recover=all)
     # Golden-corpus numbers are a Release-host gate. Sanitizers change
     # floating-point results enough to trip that tight relative check.
     add_compile_definitions(SEMPER_SANITIZER_BUILD=1)
@@ -150,6 +167,8 @@ add_executable(dic_tests
         ${DIC_PERF_TESTS}
         ${DIC_ENGINE_SOURCES}
 )
+
+add_test(NAME dic_tests COMMAND dic_tests)
 
 target_include_directories(dic_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}

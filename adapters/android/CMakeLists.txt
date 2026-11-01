@@ -22,7 +22,7 @@ target_compile_definitions(semper_android PRIVATE SEMPER_ANDROID_LOG=1)
 
 if(NOT MSVC)
     target_compile_options(semper_android PRIVATE
-            -O3 -flto -ffast-math -fopenmp -fPIC -fvisibility=hidden -fexceptions -Wall -Wextra
+            -O3 -flto -ffast-math -fno-finite-math-only -ffp-contract=off -fopenmp -fPIC -fvisibility=hidden -fexceptions -Wall -Wextra
     )
     target_link_options(semper_android PRIVATE
             -s -flto -Wl,-z,max-page-size=16384

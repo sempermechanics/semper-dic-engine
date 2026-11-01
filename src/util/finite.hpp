@@ -1,10 +1,12 @@
 #ifndef SEMPER_UTIL_FINITE_HPP
 #define SEMPER_UTIL_FINITE_HPP
 
-// Inf/NaN checks that survive -ffast-math. The engine is built with it, and
-// under it std::isfinite / std::isnan may be folded to a constant and a
-// comparison may be assumed never to involve a NaN, so `!(x > eps)` stops
-// catching one. These read the exponent bits instead.
+// Inf/NaN checks. The engine is built with -ffast-math, and was built with
+// its -ffinite-math-only part, under which std::isfinite / std::isnan may be
+// folded to a constant and a comparison assumed never to involve a NaN, so
+// `!(x > eps)` stopped catching one. The builds now add -fno-finite-math-only
+// (CMakeLists.txt), which makes those checks hold again; these read the
+// exponent bits, which hold either way.
 
 #include <cstdint>
 #include <cstring>

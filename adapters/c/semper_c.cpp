@@ -82,7 +82,11 @@ SEMPER_C_API int semper_set_reference(semper_engine* eng,
                          const uint8_t* img, size_t img_len,
                          const uint8_t* mask, size_t mask_len,
                          int expected_w, int expected_h) {
-    if (eng == nullptr || img == nullptr || img_len == 0) return SEMPER_ERR_INIT;
+    if (eng == nullptr) return SEMPER_ERR_INIT;
+    // The old reference goes first, so a call that fails leaves none (the next
+    // semper_run returns SEMPER_ERR_INIT) rather than the previous image.
+    eng->cache.reset();
+    if (img == nullptr || img_len == 0) return SEMPER_ERR_INIT;
     return guarded_call(SEMPER_ERR_INIT, [&] {
         cv::Mat ref = Semper::io::decode_gray(img, img_len, expected_w, expected_h);
         if (ref.empty()) return SEMPER_ERR_INIT;
@@ -100,7 +104,8 @@ SEMPER_C_API int semper_run(semper_engine* eng,
                float* out, int out_capacity,
                float* metrics, int metrics_len,
                semper_progress_cb cb, void* user) {
-    if (eng == nullptr || def == nullptr || def_len == 0 || params == nullptr || out == nullptr)
+    if (eng == nullptr || def == nullptr || def_len == 0 || params == nullptr || out == nullptr ||
+        out_capacity < 0)
         return SEMPER_ERR_INIT;
     return guarded_call(SEMPER_ERR_INIT, [&] {
         // The cancel window opens here, before the decode: a semper_cancel()
@@ -139,7 +144,13 @@ SEMPER_C_API int semper_incremental_init(semper_incremental* inc,
                          int expected_w, int expected_h,
                          const semper_params* params,
                          int32_t update_interval) {
-    if (inc == nullptr || ref == nullptr || ref_len == 0 || params == nullptr) return SEMPER_ERR_INIT;
+    if (inc == nullptr) return SEMPER_ERR_INIT;
+    // A failed init leaves the handle uninitialized whatever it held before:
+    // the old session goes first (a decode failure used to return before it
+    // was touched, and the handle went on tracking against the old sequence).
+    inc->session.reset();
+    inc->width = inc->height = 0;
+    if (ref == nullptr || ref_len == 0 || params == nullptr) return SEMPER_ERR_INIT;
     return guarded_call(SEMPER_ERR_INIT, [&] {
         cv::Mat ref_gray = Semper::io::decode_gray(ref, ref_len, expected_w, expected_h);
         if (ref_gray.empty()) return SEMPER_ERR_INIT;
@@ -161,7 +172,8 @@ SEMPER_C_API int semper_incremental_process(semper_incremental* inc,
                          float* metrics, int metrics_len,
                          semper_incremental_info* info,
                          semper_progress_cb cb, void* user) {
-    if (inc == nullptr || def == nullptr || def_len == 0 || out == nullptr) return SEMPER_ERR_INIT;
+    if (inc == nullptr || def == nullptr || def_len == 0 || out == nullptr || out_capacity < 0)
+        return SEMPER_ERR_INIT;
     if (!inc->session.initialized()) return SEMPER_ERR_INIT;
     return guarded_call(SEMPER_ERR_INIT, [&] {
         CancelScope cancel_window(inc->cancel);   // before the decode, as semper_run
@@ -171,7 +183,9 @@ SEMPER_C_API int semper_incremental_process(semper_incremental* inc,
         IncrementalFrameInfo fi;
         const int rc = inc->session.process_frame(def_gray, out, out_capacity, metrics, metrics_len,
                                                   inc->cancel, to_progress(cb, user), &fi);
-        if (info != nullptr) {
+        // Only a frame that was solved has info; an error leaves the
+        // session as it was and the caller's struct untouched.
+        if (info != nullptr && rc >= 0) {
             info->reference_frame = fi.reference_frame;
             info->reference_updated = fi.reference_updated ? 1 : 0;
             info->tracked_points = fi.tracked_points;

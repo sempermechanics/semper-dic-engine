@@ -328,7 +328,13 @@ namespace {
 
 TEST_CASE(GoldenCorpus, CaptureOrCompare_4x4Bicubic) {
 #if defined(SEMPER_SANITIZER_BUILD) || defined(SEMPER_COVERAGE_BUILD)
-    std::printf("  [4x4] skipped under sanitizer/coverage (numeric golden is a Release-host gate)\n");
+    // The corpus is the broadest exercise of OptimizationEngine, so it still
+    // runs under the sanitizers; only the numeric comparison is a
+    // Release-host gate (instrumented and -O1 builds move the floats).
+    const auto points = run_corpus(/*use_6x6=*/false);
+    CHECK(!points.empty());
+    std::printf("  [4x4] %zu points solved under sanitizer/coverage; numeric compare skipped\n",
+                points.size());
     return;
 #endif
     if (capture_mode()) {
@@ -343,7 +349,13 @@ TEST_CASE(GoldenCorpus, CaptureOrCompare_4x4Bicubic) {
 
 TEST_CASE(GoldenCorpus, CaptureOrCompare_6x6Keys) {
 #if defined(SEMPER_SANITIZER_BUILD) || defined(SEMPER_COVERAGE_BUILD)
-    std::printf("  [6x6] skipped under sanitizer/coverage (numeric golden is a Release-host gate)\n");
+    // The corpus is the broadest exercise of OptimizationEngine, so it still
+    // runs under the sanitizers; only the numeric comparison is a
+    // Release-host gate (instrumented and -O1 builds move the floats).
+    const auto points = run_corpus(/*use_6x6=*/true);
+    CHECK(!points.empty());
+    std::printf("  [6x6] %zu points solved under sanitizer/coverage; numeric compare skipped\n",
+                points.size());
     return;
 #endif
     if (capture_mode()) {

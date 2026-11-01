@@ -7,6 +7,13 @@ find_package(pybind11 CONFIG REQUIRED)
 
 pybind11_add_module(_semper src/module.cpp)
 target_link_libraries(_semper PRIVATE semper_pipeline)
+# CI's sanitized job builds the module this way and runs pytest with the
+# sanitizer runtime preloaded, so module.cpp is instrumented as well.
+if(SEMPER_SANITIZER AND NOT MSVC)
+    target_compile_options(_semper PRIVATE -fsanitize=${SEMPER_SANITIZER} -fno-sanitize-recover=all
+                           -g -fno-omit-frame-pointer)
+    target_link_options(_semper PRIVATE -fsanitize=${SEMPER_SANITIZER} -fno-sanitize-recover=all)
+endif()
 
 # Installed into the `semper` package dir; scikit-build-core packs it into the wheel.
 install(TARGETS _semper LIBRARY DESTINATION semper)

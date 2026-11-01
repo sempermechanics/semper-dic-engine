@@ -260,6 +260,13 @@ struct FieldCapture {
     seeding::AkazeRef akaze_deformed;
 };
 
+// ReferenceCache::adopt, with the AKAZE features of the adopted image handed
+// over in the same step. Strong guarantee: if it throws (the Ghost Wall can),
+// the cache still holds the outgoing reference, unchanged -- what lets
+// IncrementalSession leave the session as it was when an update fails.
+void adopt_reference(ReferenceCache &cache, std::unique_ptr<Image> prepared, cv::Mat gray_in,
+                     const cv::Mat &roi_mask, seeding::AkazeRef handover);
+
 // The one place solve parameters are checked, for run_full_field and
 // IncrementalSession::init alike, against a width x height reference.
 // Returns 0 with `p` normalised, or the code to return:

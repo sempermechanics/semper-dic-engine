@@ -512,8 +512,20 @@ namespace Semper {
 
         const float alpha = 1.0f, gamma = 2.0f, rho = 0.5f, sigma = 0.5f;
         for (int iter = 0; iter < 100; ++iter) { // 🚀 Increased to 100
+            // Vertices by score, written out as the insertion sort std::sort
+            // performs on a range this short (3 or 7), so the order is the
+            // same: at -O3 GCC cannot see n_pts <= 7 and reports std::sort's
+            // indexing as out of bounds of idx.
             int idx[7] = {0, 1, 2, 3, 4, 5, 6};
-            std::sort(idx, idx + n_pts, [&](int a, int b) { return y[a] < y[b]; });
+            for (int a = 1; a < n_pts; ++a) {
+                const int v = idx[a];
+                int b = a;
+                while (b > 0 && y[v] < y[idx[b - 1]]) {
+                    idx[b] = idx[b - 1];
+                    --b;
+                }
+                idx[b] = v;
+            }
 
             if (std::abs(y[idx[0]] - y[idx[n_pts - 1]]) < 1e-5f)
                 break;

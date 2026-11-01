@@ -299,17 +299,16 @@ Java_com_sempermechanics_semper_SemperNativeLib_initializeReference(
     // would hold its two images until the next initializeIncremental.
     g_session.reset();
     g_session_w = g_session_h = 0;
+    // The old reference goes first: a call that fails -- on bytes that do not
+    // decode, or on an exception, which used to keep it -- leaves none, so
+    // the next computeFullFieldDirect returns -3 instead of solving against
+    // the previous image. (This export returns nothing to report the failure.)
+    g_cache.reset();
     guarded_call([&] {
         cv::Mat refMat;
-        if (refBytes == nullptr || !decode_optional(env, refBytes, width, height, refMat)) {
-            g_cache.reset();
-            return;
-        }
+        if (refBytes == nullptr || !decode_optional(env, refBytes, width, height, refMat)) return;
         cv::Mat roiMask;
-        if (!decode_optional(env, maskBytes, refMat.cols, refMat.rows, roiMask)) {
-            g_cache.reset();
-            return;
-        }
+        if (!decode_optional(env, maskBytes, refMat.cols, refMat.rows, roiMask)) return;
         g_cache.set_from_gray(refMat, roiMask);
     }, report_exception);
 }
@@ -354,7 +353,9 @@ Java_com_sempermechanics_semper_SemperNativeLib_computeFullFieldDirect(
                 metrics_len ? metrics_buf : nullptr, metrics_len,
                 [&progress](int pct) { progress(pct); });
 
-        if (metrics_len) copy_metrics(env, out_metrics, metrics_buf);
+        // Only a solve that ran describes this frame: an error leaves the
+        // caller's array as it was rather than zeroing it.
+        if (metrics_len && result >= 0) copy_metrics(env, out_metrics, metrics_buf);
         return result;
     }, report_exception);
 }
@@ -438,6 +439,10 @@ Java_com_sempermechanics_semper_SemperNativeLib_computeIncrementalFrame(
                 [&progress](int pct) { progress(pct); }, &info);
         g_session->set_debug_dir(std::string());
 
+        // An error leaves the session as it was and writes no frame info; the
+        // caller's arrays keep what they held rather than a default (zeroed)
+        // info describing no frame.
+        if (result < 0) return result;
         if (metrics_len) copy_metrics(env, out_metrics, metrics_buf);
         if (out_info != nullptr && env->GetArrayLength(out_info) >= 6) {
             const jint values[6] = {info.reference_frame, info.reference_updated ? 1 : 0,
@@ -506,6 +511,30 @@ Java_com_indicvision_semper_SemperNativeLib_computeFullFieldDirect(
             env, self, refBytes, defBytes, maskBytes, rectX, rectY, rectWidth, rectHeight,
             step, subsetSize, strainWindow, use6x6Interpolator, outputBuffer, callbackObj,
             out_metrics);
+}
+
+JNIEXPORT jint JNICALL
+Java_com_indicvision_semper_SemperNativeLib_initializeIncremental(
+        JNIEnv* env, jobject self, jbyteArray refBytes, jbyteArray maskBytes,
+        jint width, jint height, jint rectX, jint rectY, jint rectWidth,
+        jint rectHeight, jint step, jint subsetSize, jint strainWindow,
+        jboolean use6x6Interpolator, jint updateInterval) {
+    return Java_com_sempermechanics_semper_SemperNativeLib_initializeIncremental(
+            env, self, refBytes, maskBytes, width, height, rectX, rectY, rectWidth,
+            rectHeight, step, subsetSize, strainWindow, use6x6Interpolator, updateInterval);
+}
+
+JNIEXPORT jint JNICALL
+Java_com_indicvision_semper_SemperNativeLib_computeIncrementalFrame(
+        JNIEnv* env, jobject self, jbyteArray defBytes, jobject outputBuffer,
+        jobject callbackObj, jfloatArray out_metrics, jintArray out_info) {
+    return Java_com_sempermechanics_semper_SemperNativeLib_computeIncrementalFrame(
+            env, self, defBytes, outputBuffer, callbackObj, out_metrics, out_info);
+}
+
+JNIEXPORT void JNICALL
+Java_com_indicvision_semper_SemperNativeLib_releaseIncremental(JNIEnv* env, jobject self) {
+    Java_com_sempermechanics_semper_SemperNativeLib_releaseIncremental(env, self);
 }
 
 }  // extern "C"

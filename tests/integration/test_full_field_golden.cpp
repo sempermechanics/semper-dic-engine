@@ -278,13 +278,17 @@ const float *tol_for_slot() {
 } // namespace
 
 TEST_CASE(FullFieldGolden, CaptureOrCompare) {
-#if defined(SEMPER_SANITIZER_BUILD) || defined(SEMPER_COVERAGE_BUILD)
-    std::printf("  [full-field] skipped under sanitizer/coverage "
-                "(numeric golden is a Release-host gate)\n");
-    return;
-#endif
     std::vector<SolveOutput> runs;
     for (const auto &sc : SCENARIOS) runs.push_back(solve_scenario(sc));
+#if defined(SEMPER_SANITIZER_BUILD) || defined(SEMPER_COVERAGE_BUILD)
+    // The scenarios still run, so the sanitizers see every solve path they
+    // take; only the numeric comparison is a Release-host gate (instrumented
+    // and -O1 builds move the floats).
+    for (const auto &r : runs) CHECK(r.code > 0);
+    std::printf("  [full-field] solved under sanitizer/coverage; numeric compare skipped "
+                "(a Release-host gate)\n");
+    return;
+#endif
 
     if (capture_mode()) {
         REQUIRE(write_golden(golden_path(), runs));
