@@ -45,6 +45,19 @@ signature, slot or packing changed.
   contraction (`-ffp-contract=off`) and multiply-then-add instead of `v_fma`
   in the SIMD kernels. Baseline x86-64 results are unchanged.
 
+### Changed — results (golden tolerances unchanged, no re-capture)
+- The Simplex scores a warp that samples under 90% of the subset as the worst
+  (`tuning::kMinValidPixelFraction`, IC-GN's floor): near an image edge it
+  could pass its gate on a few surviving pixels and hand IC-GN a seed it then
+  rejected.
+- The coarse integer search before the translation Simplex ranks offsets by a
+  ZNSSD over its sample, leaving out Ghost-Wall and off-image samples; raw SSD
+  was pulled off by an exposure change.
+- A Simplex rescue keeps the better of the two IC-GN runs instead of always
+  the second.
+- Sample positions are summed in double and rounded once (about 1e-3 px of
+  rounding at 8000 px in float).
+
 ### Fixed — image I/O
 - Masks: a non-8-bit mask is boolean (nonzero included). An all-zero 16-bit
   or bool mask used to be stretched to 128 (everything included); a NumPy
