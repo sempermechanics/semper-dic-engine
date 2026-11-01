@@ -413,8 +413,12 @@ inline void record_simplex_outcome(ThreadStats &bucket, const AnalysisResult &re
 // output point in the field at the same time, and Path B would then flood
 // fill from it. Returning the outcomes instead lets run_full_field apply them
 // after the median pass, which is the whole point of having a median pass.
-// It also makes compute_order deterministic, since the numbering now happens
-// in one serial loop over the lattice instead of racing between threads.
+// It also makes the anchors' compute_order deterministic, since their
+// numbering now happens in one serial loop over the lattice instead of racing
+// between threads. Paths A and B number the nodes they solve in the order the
+// workers finish them, so there compute_order (like thread_id) records the
+// scheduling of that run -- debug output only (the maps and the CSV); nothing
+// packed or reported depends on it.
 struct AnchorResult {
     int gx = 0, gy = 0;             // lattice node's position in the grid
     float rx = 0, ry = 0;           // and in image pixels

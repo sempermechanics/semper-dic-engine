@@ -232,3 +232,80 @@ def test_calls_on_one_engine_are_serialised():
     assert not t.is_alive()
     assert len(results) == 1
     assert results[0].count > 0 or results[0].count == semper.ERR_CANCELLED
+
+
+def test_dicerror_survives_pickling():
+    # A DicError raised in a multiprocessing worker reaches the parent pickled;
+    # it used to come back as "engine error invalid ROI" with the code kept.
+    import pickle
+
+    err = pickle.loads(pickle.dumps(semper.DicError(semper.ERR_ROI)))
+    assert err.code == semper.ERR_ROI
+    assert str(err) == str(semper.DicError(semper.ERR_ROI))
+
+
+def test_boolean_and_zero_one_masks():
+    # A mask is boolean unless it is a 0..255 uint8 mask: an all-False bool
+    # mask used to be stretched to 128 (everything included), and a uint8 0/1
+    # mask excluded every pixel (ERR_ROI).
+    ref = _speckle()
+    deformed = np.roll(ref, 2, axis=1)
+    rect = (40, 40, 176, 176)
+    eng = semper.Engine()
+    eng.set_reference(ref)
+    plain = eng.run(deformed, rect=rect, step=20, subset=31, strain_window=41)
+
+    ones = np.ones(ref.shape, np.uint8)            # 0/1 mask, all selected
+    got = eng.run(deformed, rect=rect, step=20, subset=31, strain_window=41, mask=ones)
+    assert got.count == plain.count
+
+    full = np.ones(ref.shape, bool)
+    got = eng.run(deformed, rect=rect, step=20, subset=31, strain_window=41, mask=full)
+    assert got.count == plain.count
+
+    none = np.zeros(ref.shape, bool)               # nothing selected
+    got = eng.run(deformed, rect=rect, step=20, subset=31, strain_window=41, mask=none,
+                  raise_on_error=False)
+    assert got.count == semper.ERR_ROI
+
+
+def test_progress_must_be_callable():
+    ref = _speckle()
+    eng = semper.Engine()
+    eng.set_reference(ref)
+    with pytest.raises(TypeError):
+        eng.run(ref, rect=(40, 40, 176, 176), step=20, subset=31, strain_window=41, progress=5)
+
+
+def test_progress_exception_cancels_and_is_raised():
+    # It used to be logged on the solver's thread and the solve went on.
+    class Stop(Exception):
+        pass
+
+    def progress(pct):
+        raise Stop(pct)
+
+    ref = _speckle()
+    eng = semper.Engine()
+    eng.set_reference(ref)
+    with pytest.raises(Stop):
+        eng.run(np.roll(ref, 2, axis=1), rect=(40, 40, 176, 176), step=5, subset=31,
+                strain_window=41, progress=progress)
+    # The engine is usable afterwards.
+    assert eng.run(np.roll(ref, 2, axis=1), rect=(40, 40, 176, 176), step=20, subset=31,
+                   strain_window=41).count > 0
+
+
+def test_reentrant_call_from_progress_raises_instead_of_deadlocking():
+    # set_reference from the progress callback waited for the solve that
+    # called it, forever.
+    ref = _speckle()
+    eng = semper.Engine()
+    eng.set_reference(ref)
+
+    def progress(pct):
+        eng.set_reference(ref)
+
+    with pytest.raises(RuntimeError, match="progress callback"):
+        eng.run(np.roll(ref, 2, axis=1), rect=(40, 40, 176, 176), step=5, subset=31,
+                strain_window=41, progress=progress)

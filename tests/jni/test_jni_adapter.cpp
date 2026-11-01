@@ -996,7 +996,11 @@ TEST_CASE(JniAdapter, ImageDimensions_OrZeros) {
     CHECK(dims(bytes.get()) == std::make_pair(64, 40));
     CHECK(dims(garbage.get()) == std::make_pair(0, 0));
     CHECK(dims(nullptr) == std::make_pair(0, 0));
-    CHECK(dims(refused.get()) == std::make_pair(0, 0));
+    // A refused pin leaves an OutOfMemoryError pending, and no further JNI
+    // call may be made: null comes back and Java sees the error. It used to
+    // allocate the result array with the exception pending.
+    CHECK(SNL(getImageDimensions)(j.env, j.self, refused.get()) == nullptr);
+    CHECK(fakejni::st().pending_exception);
     fakejni::st().pending_exception = false;
     CHECK(unpinned(bytes) && unpinned(garbage) && unpinned(refused));
     j.check_balanced();

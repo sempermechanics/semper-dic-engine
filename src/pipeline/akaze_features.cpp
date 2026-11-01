@@ -11,6 +11,10 @@
 #include <semper/seeding.hpp>
 #include <semper/tuning.hpp>
 #include "util/finite.hpp"
+#include "util/log.hpp"
+
+#undef LOG_TAG
+#define LOG_TAG "SemperAkaze"
 
 #include <opencv2/calib3d.hpp>
 #include <opencv2/features2d.hpp>
@@ -23,6 +27,10 @@ namespace Semper {
 namespace seeding {
 
 namespace {
+
+// The smallest crop, at the detection scale, AKAZE is run on: below it the
+// scale pyramid and the descriptor patch do not fit.
+constexpr long kMinDetectPx = 16;
 
 double ms_since(std::chrono::high_resolution_clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(
@@ -49,10 +57,25 @@ void without_opencv_pool(F&& f) {
 
 void detect(const cv::Mat& gray, const cv::Rect& rect, double scale,
             std::vector<cv::KeyPoint>& kp, cv::Mat& desc) {
+    kp.clear();
+    desc.release();
+    // Too small to detect in at this scale: the guard used to be on the
+    // full-resolution rect, and at 0.25x a 50 px image is 12 px. No features
+    // is no global model, from which the solve falls back to Path C.
+    if (std::lround(rect.width * scale) < kMinDetectPx || std::lround(rect.height * scale) < kMinDetectPx)
+        return;
     without_opencv_pool([&] {
-        cv::Mat small;
-        cv::resize(gray(rect), small, cv::Size(), scale, scale, cv::INTER_AREA);
-        cv::AKAZE::create()->detectAndCompute(small, cv::noArray(), kp, desc);
+        try {
+            cv::Mat small;
+            cv::resize(gray(rect), small, cv::Size(), scale, scale, cv::INTER_AREA);
+            cv::AKAZE::create()->detectAndCompute(small, cv::noArray(), kp, desc);
+        } catch (const cv::Exception& e) {
+            // A detector failure is no model, not a failed solve (the
+            // exception used to leave solve_anchor_seeds: -3 at the C ABI).
+            LOGE("AKAZE detection at %.2fx failed (%s); no global model", scale, e.what());
+            kp.clear();
+            desc.release();
+        }
     });
 }
 

@@ -44,9 +44,22 @@ bool node_masked(const cv::Mat &roiMask, const FullFieldParams &params, int x, i
 //   0 converged without Simplex      3 failed, Simplex ran after an IC-GN reject
 //   1 rescued after an IC-GN reject  4 failed, Simplex ran after the budget ran out
 //   2 rescued after the budget       5 failed, no Simplex
+// A node holds a result iff solved && corr >= 0 (FieldCapture): ZNSSD 0 is a
+// perfect match, which `corr > 0` used to class as failed.
+bool has_result(const GridPoint &gp) { return gp.solved && gp.corr >= 0.0f; }
+
+// A map value in 0..255. The casts were undefined for anything outside that
+// range -- the strain sentinel (-1000), a compute_order past max_order, or a
+// division by a zero max_order / max_corr; NaN maps to 0.
+uchar to_u8(float v) {
+    if (!(v >= 0.0f)) return 0;
+    if (v >= 255.0f) return 255;
+    return (uchar)v;
+}
+
 int solver_state(const GridPoint &gp) {
     const bool timed_out = gp.icgn_iters >= tuning::kIcgnMaxIter;
-    if (gp.solved && gp.corr > 0.0f) {
+    if (has_result(gp)) {
         if (!gp.used_simplex) return 0;
         return timed_out ? 2 : 1;
     }
@@ -87,7 +100,7 @@ if (!local_debug_dir.empty()) {
         for (int y = 0; y < gridH; ++y) {
             for (int x = 0; x < gridW; ++x) {
                 const auto &gp = resultGrid[y][x];
-                if (gp.solved && gp.corr > 0.0f) {
+                if (has_result(gp)) {
                     if (gp.compute_order > max_order) max_order = gp.compute_order;
                     if (gp.corr > max_corr) max_corr = gp.corr;
                     int idx = y * gridW + x;
@@ -127,12 +140,12 @@ if (!local_debug_dir.empty()) {
 
                 if (!gp.solved || gp.compute_order < 0) continue;
 
-                propMap.at<uchar>(y, x) = (uchar) ((float) gp.compute_order / max_order * 255.0f);
+                propMap.at<uchar>(y, x) = to_u8((float) gp.compute_order / max_order * 255.0f);
                 threadMap.at<cv::Vec3b>(y, x) = THREAD_COLORS[std::max(0, std::min(gp.thread_id, 11))];
-                corrMap.at<uchar>(y, x) = (uchar) ((gp.corr / max_corr) * 255.0f);
+                corrMap.at<uchar>(y, x) = to_u8((gp.corr / max_corr) * 255.0f);
 
                 int idx = y * gridW + x;
-                strainMap.at<uchar>(y, x) = (uchar) (
+                strainMap.at<uchar>(y, x) = to_u8(
                         ((strainField.exx[idx] - min_exx) / (max_exx - min_exx)) * 255.0f);
             }
         }

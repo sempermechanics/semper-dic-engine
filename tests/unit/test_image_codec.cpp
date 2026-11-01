@@ -299,6 +299,87 @@ TEST_CASE(ImageCodec, ImageDimensions_RawBufferYieldsZeros_KnownTrap) {
     CHECK(oh == 0);
 }
 
+// A mask is not an image: a non-8-bit mask is boolean (nonzero included), not
+// stretched. to_gray8 turned an all-zero 16-bit mask into 128 -- "everything
+// included", the opposite of what it said.
+TEST_CASE(ImageCodec, Mask16BitAndFloat_AreBoolean) {
+    cv::Mat zero16(6, 8, CV_16UC1, cv::Scalar(0));
+    std::vector<uchar> png;
+    REQUIRE(cv::imencode(".png", zero16, png));
+    cv::Mat m = Semper::io::decode_mask(png.data(), png.size());
+    REQUIRE(m.type() == CV_8UC1);
+    CHECK(cv::countNonZero(m) == 0);                 // all excluded
+    CHECK(cv::countNonZero(decode_gray(png.data(), png.size()) == 128) == 48);   // the image path
+
+    cv::Mat labels(4, 4, CV_16UC1, cv::Scalar(0));
+    labels.at<uint16_t>(1, 1) = 1;                   // label 1: not "dark"
+    labels.at<uint16_t>(2, 2) = 2;
+    cv::Mat lm = Semper::io::to_mask8(labels);
+    CHECK(lm.at<uchar>(1, 1) == 255);
+    CHECK(lm.at<uchar>(2, 2) == 255);
+    CHECK(lm.at<uchar>(0, 0) == 0);
+
+    cv::Mat f(3, 3, CV_32FC1, cv::Scalar(0.2f));     // a float mask of 0.2: included
+    CHECK(cv::countNonZero(Semper::io::to_mask8(f) == 255) == 9);
+    // 8-bit keeps the < 128 rule, untouched.
+    cv::Mat g8 = make_gray(5, 4);
+    CHECK(cv::countNonZero(Semper::io::to_mask8(g8) != g8) == 0);
+    CHECK(Semper::io::to_mask8(cv::Mat()).empty());
+}
+
+// One hot pixel used to set the scale of a whole 16-bit frame.
+TEST_CASE(ImageCodec, Encoded16Bit_HotPixelDoesNotSetTheScale) {
+    const int w = 100, h = 50;
+    cv::Mat u16(h, w, CV_16UC1);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            u16.at<uint16_t>(y, x) = static_cast<uint16_t>(1000 + 20 * x);   // 1000..2980
+    u16.at<uint16_t>(7, 7) = 65535;
+    cv::Mat g = Semper::io::to_gray8(u16);
+    REQUIRE(g.type() == CV_8UC1);
+    CHECK(g.at<uchar>(7, 7) == 255);                 // saturated
+    // The speckle keeps nearly the whole 8-bit range (it used to get ~8 levels).
+    CHECK(g.at<uchar>(0, 0) <= 3);
+    CHECK(g.at<uchar>(0, w - 1) >= 250);
+    int distinct = 0;
+    for (int x = 1; x < w; ++x) distinct += g.at<uchar>(0, x) != g.at<uchar>(0, x - 1) ? 1 : 0;
+    CHECK(distinct >= 95);
+}
+
+// A PNG whose header declares more pixels than the engine holds is refused
+// before it is decoded, and image_dimensions reads the header without decoding.
+TEST_CASE(ImageCodec, OversizedHeader_RefusedBeforeDecode) {
+    cv::Mat small = make_gray(16, 9);
+    std::vector<uchar> png;
+    REQUIRE(cv::imencode(".png", small, png));
+    int ow = 0, oh = 0;
+    image_dimensions(png.data(), png.size(), ow, oh);
+    CHECK(ow == 16);
+    CHECK(oh == 9);
+    // Rewrite IHDR to 40000 x 40000 (1.6e9 pixels).
+    std::vector<uchar> big = png;
+    const uint32_t d = 40000;
+    for (int k = 0; k < 2; ++k) {
+        big[16 + 4 * k] = (uchar)(d >> 24); big[17 + 4 * k] = (uchar)(d >> 16);
+        big[18 + 4 * k] = (uchar)(d >> 8);  big[19 + 4 * k] = (uchar)d;
+    }
+    CHECK(decode_gray(big.data(), big.size()).empty());
+    CHECK(Semper::io::decode_mask(big.data(), big.size()).empty());
+    CHECK(decode_bgr(big.data(), big.size()).empty());
+    image_dimensions(big.data(), big.size(), ow, oh);
+    CHECK(ow == 40000);
+    CHECK(oh == 40000);
+    // JPEG and TIFF headers are read too.
+    for (const char *ext : {".jpg", ".tif", ".bmp"}) {
+        std::vector<uchar> enc;
+        REQUIRE(cv::imencode(ext, small, enc));
+        ow = oh = 0;
+        image_dimensions(enc.data(), enc.size(), ow, oh);
+        CHECK(ow == 16);
+        CHECK(oh == 9);
+    }
+}
+
 #else
 
 TEST_CASE(ImageCodec, OpenCvRequired_SkippedWithoutOpenCV) {

@@ -98,6 +98,13 @@ $$
 * $\Delta g = \sqrt{\frac{1}{|S|} \sum_{\mathbf{x}_i \in S} [g(W(\mathbf{x}_i; \mathbf{p})) - \bar{g}]^2}$ : Standard deviation of deformed
 * $|S| = (2N+1)^2$ : Number of pixels in subset
 
+**What the engine reports.** The score every solve returns, and every gate
+compares with (`tuning::kCorrAccept` = 0.15, the anchor and Simplex gates),
+is this sum divided by the number of pixels it ran over, i.e. the per-pixel
+mean $C_{\text{ZNSSD}} / |S_v|$, where $S_v$ are the pixels §6.6 calls
+valid (`OptimizationEngine`, `error_sum_sq / valid_pixels`). The mean ranges
+over $[0, 4]$ and does not grow with the subset size.
+
 ### 3.2 Properties
 
 **Invariance to Linear Intensity Changes:**
@@ -119,10 +126,14 @@ Thus, ZNSSD is invariant to affine intensity transformations.
 
 ### 3.3 Relationship to Cross-Correlation
 
-ZNSSD can be related to the Zero-Normalized Cross-Correlation (ZNCC):
+ZNSSD can be related to the Zero-Normalized Cross-Correlation (ZNCC). With
+$\Delta f$, $\Delta g$ the standard deviations over $|S|$ pixels as above,
+the sum is $C_{\text{ZNSSD}} = 2|S|(1 - \text{ZNCC})$, so the per-pixel mean
+the engine reports is
 $$
-C_{\text{ZNSSD}} = 2(1 - \text{ZNCC})
+C_{\text{ZNSSD}} / |S| = 2(1 - \text{ZNCC})
 $$
+and the 0.15 result gate is $\text{ZNCC} \ge 0.925$.
 where:
 $$
 \text{ZNCC} = \frac{\sum [f - \bar{f}][g - \bar{g}]}{\sqrt{\sum [f - \bar{f}]^2} \sqrt{\sum [g - \bar{g}]^2}}
@@ -402,7 +413,7 @@ ICGN may fail to converge if:
 **Failure Indicators:**
 
 *  after convergence.
-* Maximum iterations (20) reached without .
+* Maximum iterations (`tuning::kIcgnMaxIter` = 50) reached without convergence.
 
 ### 7.2 Nelder-Mead Simplex Algorithm
 
@@ -428,11 +439,11 @@ Compute centroid of best  points:
 **Implementation:**
 
 ```cpp
-// OptimizationEngine.cpp, line 168-209
-for (int iter = 0; iter < 80; ++iter) {
-    // Sort vertices by cost
-    std::sort(idx.begin(), idx.end(), 
-        [&](int a, int b){ return y[a] < y[b]; });
+// OptimizationEngine::solve_simplex
+for (int iter = 0; iter < 100; ++iter) {
+    // Sort vertices by cost (an insertion sort over the 3 or 7 vertices --
+    // the order std::sort gives on a range this short)
+    for (int a = 1; a < n_pts; ++a) { /* insert idx[a] by y */ }
     
     // Compute centroid
     for (int i = 0; i < DIM; ++i)
@@ -459,7 +470,7 @@ sampled by the same routine as IC-GN (a non-finite score counts as the worst,
 **Typical Performance:**
 
 * Evaluation cost: ~0.5 ms per vertex
-* Total iterations: 40-80
+* Total iterations: up to 100 (stops early when the vertex costs agree within 1e-5)
 * Total time: ~2-5 ms (10x slower than ICGN but saves failed points)
 
 ---
@@ -790,9 +801,12 @@ Linearized form (Cauchy strain):
 
 **Motivation:** Displacement data from DIC is noisy. Direct differentiation amplifies noise.
 
-**Method:** Fit a smooth polynomial surface to displacement data over a local window, then differentiate analytically.
+**Method:** Fit a plane to the displacement data over a circular window, then differentiate it.
 
-**Polynomial Model (Quadratic):**
+**Model (linear, a plane per component):** $u(x, y) = c_0 + c_1 x + c_2 y$,
+likewise $v$; $\partial u / \partial x = c_1$, $\partial u / \partial y = c_2$.
+(Earlier versions of this section described a quadratic fit; the code has
+always fitted a plane.)
 For displacement component :
 
 **Least-Squares Fitting:**
@@ -826,7 +840,11 @@ for (int dy = -grid_rad; dy <= grid_rad; ++dy) {
     }
 }
 
-Eigen::Vector3d Cu = AtA.ldlt().solve(AtU);
+// Explicit 3x3 inverse, with its reciprocal condition number computed
+// LAPACK-style (1 / (||AtA||_1 ||AtA^-1||_1)); a window with rcond < 1e-12
+// (nodes on a line) is skipped and keeps the sentinel.
+Eigen::Matrix3d AtA_inv = AtA.inverse();
+Eigen::Vector3d Cu = AtA_inv * AtU;
 double dudx = Cu(1);
 double dudy = Cu(2);
 

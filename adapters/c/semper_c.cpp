@@ -8,6 +8,8 @@
 #include <semper/version.hpp>
 #include <opencv2/core.hpp>
 
+#include <atomic>
+
 
 using Semper::guarded_call;
 using Semper::pipeline::CancelScope;
@@ -23,15 +25,35 @@ using Semper::pipeline::ReferenceCache;
 struct semper_engine {
     ReferenceCache cache;
     CancelToken cancel;
+    std::atomic<bool> busy{false};   // a call is in flight on this handle
 };
 
 struct semper_incremental {
     IncrementalSession session;
     CancelToken cancel;
     int width = 0, height = 0;   // frames are decoded against the first image's size
+    std::atomic<bool> busy{false};
 };
 
 namespace {
+
+// One call at a time per handle (semper_c.h). A second one -- from another
+// thread, or from inside the first call's progress callback -- used to run
+// against the cache or session the first was solving with; it now returns
+// SEMPER_ERR_INIT and touches nothing. The cancel entry points never take it.
+class HandleCall {
+public:
+    explicit HandleCall(std::atomic<bool>& busy) noexcept
+        : busy_(busy), owned_(!busy.exchange(true, std::memory_order_acquire)) {}
+    ~HandleCall() { if (owned_) busy_.store(false, std::memory_order_release); }
+    HandleCall(const HandleCall&) = delete;
+    HandleCall& operator=(const HandleCall&) = delete;
+    bool owned() const noexcept { return owned_; }
+
+private:
+    std::atomic<bool>& busy_;
+    bool owned_;
+};
 
 FullFieldParams to_params(const semper_params* params) {
     FullFieldParams p;
@@ -48,9 +70,11 @@ FullFieldParams to_params(const semper_params* params) {
 
 // No mask bytes is no mask; mask bytes that do not decode are an error. Solving
 // without them would report a field over the regions the caller excluded.
+// io::decode_mask, not decode_gray: a 16-bit or float mask is boolean
+// (nonzero included), not stretched like an image.
 bool decode_mask(const uint8_t* mask, size_t mask_len, int w, int h, cv::Mat& roi) {
     if (mask == nullptr || mask_len == 0) return true;
-    roi = Semper::io::decode_gray(mask, mask_len, w, h);
+    roi = Semper::io::decode_mask(mask, mask_len, w, h);
     return !roi.empty();
 }
 
@@ -83,6 +107,8 @@ SEMPER_C_API int semper_set_reference(semper_engine* eng,
                          const uint8_t* mask, size_t mask_len,
                          int expected_w, int expected_h) {
     if (eng == nullptr) return SEMPER_ERR_INIT;
+    HandleCall call(eng->busy);
+    if (!call.owned()) return SEMPER_ERR_INIT;
     // The old reference goes first, so a call that fails leaves none (the next
     // semper_run returns SEMPER_ERR_INIT) rather than the previous image.
     eng->cache.reset();
@@ -107,6 +133,8 @@ SEMPER_C_API int semper_run(semper_engine* eng,
     if (eng == nullptr || def == nullptr || def_len == 0 || params == nullptr || out == nullptr ||
         out_capacity < 0)
         return SEMPER_ERR_INIT;
+    HandleCall call(eng->busy);
+    if (!call.owned()) return SEMPER_ERR_INIT;
     return guarded_call(SEMPER_ERR_INIT, [&] {
         // The cancel window opens here, before the decode: a semper_cancel()
         // issued while the frame decodes stops this solve.
@@ -145,6 +173,8 @@ SEMPER_C_API int semper_incremental_init(semper_incremental* inc,
                          const semper_params* params,
                          int32_t update_interval) {
     if (inc == nullptr) return SEMPER_ERR_INIT;
+    HandleCall call(inc->busy);
+    if (!call.owned()) return SEMPER_ERR_INIT;
     // A failed init leaves the handle uninitialized whatever it held before:
     // the old session goes first (a decode failure used to return before it
     // was touched, and the handle went on tracking against the old sequence).
@@ -174,6 +204,8 @@ SEMPER_C_API int semper_incremental_process(semper_incremental* inc,
                          semper_progress_cb cb, void* user) {
     if (inc == nullptr || def == nullptr || def_len == 0 || out == nullptr || out_capacity < 0)
         return SEMPER_ERR_INIT;
+    HandleCall call(inc->busy);
+    if (!call.owned()) return SEMPER_ERR_INIT;
     if (!inc->session.initialized()) return SEMPER_ERR_INIT;
     return guarded_call(SEMPER_ERR_INIT, [&] {
         CancelScope cancel_window(inc->cancel);   // before the decode, as semper_run
