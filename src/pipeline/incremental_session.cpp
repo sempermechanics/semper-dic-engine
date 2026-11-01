@@ -247,6 +247,7 @@ int IncrementalSession::init(const cv::Mat& ref_gray, const cv::Mat& roi_mask,
 int IncrementalSession::process_frame(const cv::Mat& def_gray, float* output, int output_capacity,
                                       float* metrics, int metrics_len, CancelToken& cancel,
                                       ProgressCallback on_progress, IncrementalFrameInfo* info) {
+    cancel.enter();
     return impl_ ? impl_->process(def_gray, output, output_capacity, metrics, metrics_len,
                                   cancel, std::move(on_progress), info)
                  : -3;
@@ -255,8 +256,10 @@ int IncrementalSession::process_frame(const cv::Mat& def_gray, float* output, in
 int IncrementalSession::process_frame(const cv::Mat& def_gray, float* output, int output_capacity,
                                       float* metrics, int metrics_len,
                                       ProgressCallback on_progress, IncrementalFrameInfo* info) {
+    CancelToken& cancel = detail::global_cancel_token();
+    cancel.enter();
     return impl_ ? impl_->process(def_gray, output, output_capacity, metrics, metrics_len,
-                                  detail::global_cancel_token(), std::move(on_progress), info)
+                                  cancel, std::move(on_progress), info)
                  : -3;
 }
 

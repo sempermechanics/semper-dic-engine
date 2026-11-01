@@ -40,6 +40,12 @@ constexpr int kSeedFailed = -5;
  * that reads a stale `false` only costs one more point, and nothing downstream
  * orders against this flag.
  *
+ * A solve clears its token on entry, so a stale cancel from a previous solve
+ * never aborts the next one. A caller that does work of its own before the
+ * solve starts (decoding the frame, waiting for a lock, allocating the output)
+ * opens the window at its own entry instead, with [CancelScope]: a request
+ * made during that work then stops the solve rather than being cleared by it.
+ *
  * Non-copyable / non-movable (holds a std::atomic); pass by reference.
  */
 class CancelToken {
@@ -52,8 +58,40 @@ public:
     void clear() noexcept { flag_.store(false, std::memory_order_relaxed); }
     bool requested() const noexcept { return flag_.load(std::memory_order_relaxed); }
 
+    /** Opens the cancel window now: clears any earlier request, and the next
+     *  solve's entry keeps the requests made from here on. Use [CancelScope]. */
+    void begin() noexcept {
+        flag_.store(false, std::memory_order_relaxed);
+        window_open_.store(true, std::memory_order_release);
+    }
+    /** Closes a window that no solve entered (an early return). */
+    void end() noexcept { window_open_.store(false, std::memory_order_release); }
+    /** Solve entry (the engine's own entry points call it): clears a request
+     *  left from before, unless [begin] opened the window for this call. */
+    void enter() noexcept {
+        if (!window_open_.exchange(false, std::memory_order_acq_rel)) clear();
+    }
+
 private:
     std::atomic<bool> flag_{false};
+    std::atomic<bool> window_open_{false};
+};
+
+/**
+ * One adapter call's cancel window: [CancelToken::begin] on construction, so
+ * a cancel requested at any point of the call -- its own decoding and locking
+ * included -- reaches the solve it starts; [CancelToken::end] on exit, so a
+ * call that returned before reaching a solve leaves no window open.
+ */
+class CancelScope {
+public:
+    explicit CancelScope(CancelToken& token) noexcept : token_(token) { token_.begin(); }
+    ~CancelScope() { token_.end(); }
+    CancelScope(const CancelScope&) = delete;
+    CancelScope& operator=(const CancelScope&) = delete;
+
+private:
+    CancelToken& token_;
 };
 
 /**
@@ -72,7 +110,9 @@ private:
  * within a point or two instead of at the end of the frame. run_full_field clears
  * the token it polls on entry, so a stale cancel from a previous solve never
  * aborts the next one. [clear_cancel] remains public for callers that reset
- * explicitly.
+ * explicitly. A solve that has seen a request finishes as cancelled even if
+ * [clear_cancel] runs before it returns: clearing prepares the next solve, it
+ * does not withdraw the cancel from the one in flight.
  *
  * Deliberately kept in a header of its own, with no OpenCV in it, so the flag can
  * be linked and tested without the rest of the pipeline.

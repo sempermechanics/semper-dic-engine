@@ -10,6 +10,7 @@
 
 
 using Semper::guarded_call;
+using Semper::pipeline::CancelScope;
 using Semper::pipeline::CancelToken;
 using Semper::pipeline::FullFieldParams;
 using Semper::pipeline::IncrementalFrameInfo;
@@ -102,6 +103,9 @@ SEMPER_C_API int semper_run(semper_engine* eng,
     if (eng == nullptr || def == nullptr || def_len == 0 || params == nullptr || out == nullptr)
         return SEMPER_ERR_INIT;
     return guarded_call(SEMPER_ERR_INIT, [&] {
+        // The cancel window opens here, before the decode: a semper_cancel()
+        // issued while the frame decodes stops this solve.
+        CancelScope cancel_window(eng->cancel);
         // Decode against the cached reference's dimensions, matching the Android path.
         cv::Mat def_gray = Semper::io::decode_gray(def, def_len, eng->cache.width, eng->cache.height);
         if (def_gray.empty()) return SEMPER_ERR_INIT;
@@ -160,6 +164,7 @@ SEMPER_C_API int semper_incremental_process(semper_incremental* inc,
     if (inc == nullptr || def == nullptr || def_len == 0 || out == nullptr) return SEMPER_ERR_INIT;
     if (!inc->session.initialized()) return SEMPER_ERR_INIT;
     return guarded_call(SEMPER_ERR_INIT, [&] {
+        CancelScope cancel_window(inc->cancel);   // before the decode, as semper_run
         cv::Mat def_gray = Semper::io::decode_gray(def, def_len, inc->width, inc->height);
         if (def_gray.empty()) return SEMPER_ERR_INIT;
 

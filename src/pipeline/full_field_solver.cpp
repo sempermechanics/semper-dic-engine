@@ -52,6 +52,7 @@ int run_full_field(
     int metrics_len,
     CancelToken& cancel,
     ProgressCallback on_progress) {
+    cancel.enter();
     return run_full_field_impl(cache, def_gray, roi_mask, params, output_ptr,
                                output_capacity, metrics, metrics_len,
                                std::move(on_progress), nullptr, cancel);
@@ -67,10 +68,11 @@ int run_full_field(
     float* metrics,
     int metrics_len,
     ProgressCallback on_progress) {
+    CancelToken& cancel = detail::global_cancel_token();
+    cancel.enter();
     return run_full_field_impl(cache, def_gray, roi_mask, params, output_ptr,
                                output_capacity, metrics, metrics_len,
-                               std::move(on_progress), nullptr,
-                               detail::global_cancel_token());
+                               std::move(on_progress), nullptr, cancel);
 }
 
 namespace internal {
@@ -147,7 +149,13 @@ int run_full_field_impl(
     int metrics_len,
     ProgressCallback on_progress,
     FieldCapture* capture,
-    CancelToken& cancel) {
+    CancelToken& cancel_token) {
+
+        // Every poll below goes through this: a request seen once stays seen
+        // for the rest of the solve, whatever happens to the token meanwhile.
+        // The entry points cleared the token (CancelToken::enter) before any
+        // work of their own, so nothing is cleared here.
+        const SolveCancel cancel(cancel_token);
 
         std::string local_debug_dir = cache.debug_dir;
         cache.debug_dir.clear();
@@ -169,11 +177,8 @@ int run_full_field_impl(
         FullFieldParams params = params_in;
         const int param_rc = validate_params(params, cache.width, cache.height);
         if (param_rc != 0) return param_rc;
-        SEMPER_ASSERT(output_capacity >= 0);
-        // Clear any leftover cancel from a previous solve so this run starts fresh.
-        // Without this, a caller that cancelled and then started a new solve
-        // without resetting would get an instant -99.
-        cancel.clear();
+        // A negative capacity holds nothing: the packing writes no point.
+        if (output_capacity < 0) output_capacity = 0;
 
         LOGD("=== computeFullFieldDirect (HYBRID CORE) START ===");
 
@@ -396,9 +401,11 @@ int run_full_field_impl(
         // The pool is left marked stale (grid_valid is false until below).
         prepass_errors.rethrow_if_any();
 
-        // The cancel flag only ever goes up during a solve, so if it is still
-        // clear here every iteration above ran: the pool is complete and safe
-        // to reuse. Otherwise it stays marked stale for the next solve.
+        // An iteration skips only for a cancel it saw (or an exception,
+        // rethrown above), and SolveCancel latches what any poll saw, so a
+        // clear here means every iteration ran even if the token was cleared
+        // meanwhile: the pool is complete and safe to reuse. Otherwise it
+        // stays marked stale, and the solve returns kCancelled below.
         if (!cancel.requested()) {
             pre.rect_x = params.rect_x; pre.rect_y = params.rect_y;
             pre.rect_w = params.rect_w; pre.rect_h = params.rect_h;
@@ -413,9 +420,12 @@ int run_full_field_impl(
             pre.grid_valid = true;
         }
         }
+        // A pool with holes cannot seed or solve its nodes: stop here, before
+        // spending the AKAZE match on a field that will not be returned.
+        if (cancel.requested()) return kCancelled;
         const HessianPool& hessian_pool = pre.hessian_pool;
 
-        timings.prepass = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_prepass_start).count();
+        timings.prepass =std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_prepass_start).count();
 
         // Anchor-lattice seeding: an AKAZE homography for the global motion,
         // then IC-GN on a lattice of grid nodes. It records but publishes
@@ -564,6 +574,11 @@ int run_full_field_impl(
             capture->deformed = std::move(defImgOwner);
             capture->deformed_gray = def_gray.clone();
             capture->akaze_deformed = std::move(seeds.def_features);
+        }
+        // The solve has completed: the next one against this reference starts
+        // its AKAZE search at the scale this one settled on.
+        if (seeds.akaze_level >= 0 && cache.precompute) {
+            cache.precompute->akaze_first_level = seeds.akaze_level;
         }
 
         defMat.release(); roiMask.release();

@@ -844,6 +844,98 @@ TEST_CASE(FullField, RefCache_CancelledSolveDoesNotPoisonCache) {
                     solve_fresh(ref_gray, frames[0], cv::Mat(), p)));
 }
 
+// A cancel requested and then cleared while the solve runs (the JNI
+// setCancelRequested(false) is lock-free). The pre-pass used to infer from the
+// cleared flag that it had run every node: the solve then went on with holes
+// in the Hessian pool, returned them as a success, and marked the pool
+// complete for every later solve against the reference. Now a request any
+// poll saw stays seen for the rest of the solve: it returns kCancelled, or --
+// if the request landed after the last poll -- the whole field.
+TEST_CASE(FullField, RefCache_CancelClearedMidSolve_StaysCancelled) {
+    cv::Mat ref_gray;
+    const std::vector<cv::Mat> frames = affine_frames(ref_gray, 1);
+    FullFieldParams p = params_for(W, H);
+    p.step = 4; p.strain_window = 17;
+    const SolveOut clean = solve_fresh(ref_gray, frames[0], cv::Mat(), p);
+    REQUIRE(clean.rc > 0);
+
+    ReferenceCache shared;
+    shared.set_from_gray(ref_gray, cv::Mat());
+    Semper::pipeline::CancelToken token;
+    std::vector<float> out((size_t)(W / 4) * (H / 4) * 8, 0.0f);
+    float metrics[23] = {};
+    bool first = true;
+    const int rc = run_full_field(shared, frames[0], cv::Mat(), p, out.data(), (int)out.size(),
+                                  metrics, 23, token, [&](int) {
+                                      if (!first) return;
+                                      first = false;
+                                      token.request();
+                                      // Long enough for the workers' polls to see it.
+                                      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                                      token.clear();
+                                  });
+    CHECK(rc == kCancelled || rc == clean.rc);
+    if (rc == clean.rc)
+        CHECK(std::memcmp(out.data(), clean.out.data(), (size_t)rc * 8 * sizeof(float)) == 0);
+    // Whatever that solve did, the cache serves the next one exactly.
+    CHECK(bit_equal(solve_on(shared, frames[0], cv::Mat(), p), clean));
+}
+
+// A caller that does work of its own before the solve -- every adapter decodes
+// the frame first -- opens the cancel window at its entry (CancelScope). A
+// request made during that work used to be cleared by the solve's entry.
+TEST_CASE(CancelToken, ScopeKeepsRequestsMadeBeforeTheSolve) {
+    using Semper::pipeline::CancelScope;
+    using Semper::pipeline::CancelToken;
+    cv::Mat ref_gray, def_gray;
+    make_pair(ref_gray, def_gray);
+    ReferenceCache cache;
+    cache.set_from_gray(ref_gray, cv::Mat());
+    const FullFieldParams p = params_for(W, H);
+    const int cap = 8 * ((W / STEP) * (H / STEP) + 8);
+    std::vector<float> out((size_t)cap, 0.0f);
+    auto solve = [&](CancelToken &t) {
+        return run_full_field(cache, def_gray, cv::Mat(), p, out.data(), cap, nullptr, 0, t, nullptr);
+    };
+
+    CancelToken token;
+    token.request();   // stale: before the window, so the window clears it
+    {
+        CancelScope window(token);
+        CHECK(!token.requested());
+        token.request();   // during the caller's own preamble
+        CHECK(solve(token) == kCancelled);
+    }
+    {
+        CancelScope window(token);   // a new call: the last request is stale now
+        CHECK(solve(token) >= 0);
+    }
+    // Without a window the solve's entry clears a stale request, as always.
+    token.request();
+    CHECK(solve(token) >= 0);
+    // A window that no solve entered (an early return) is closed on exit, so
+    // the next solve's entry clears a request made after it.
+    { CancelScope window(token); }
+    token.request();
+    CHECK(solve(token) >= 0);
+}
+
+// SolveCancel, the solve's view of its token: a request any poll saw stays
+// seen, whatever happens to the token afterwards.
+TEST_CASE(CancelToken, SolveCancelLatchesWhatItSaw) {
+    Semper::pipeline::CancelToken t;
+    const Semper::pipeline::internal::SolveCancel stop(t);
+    CHECK(!stop.requested());
+    t.request();
+    t.clear();                 // cleared before any poll: never seen
+    CHECK(!stop.requested());
+    t.request();
+    CHECK(stop.requested());   // seen ...
+    t.clear();
+    CHECK(stop.requested());   // ... and still seen once the token is cleared
+    CHECK(!t.requested());
+}
+
 // The debug export reads the ROI mask at every grid node. With a rect past
 // the image those reads were out of bounds (roiMask.at<> is unchecked in
 // Release). validate_params now clips the rect first, and the export's own

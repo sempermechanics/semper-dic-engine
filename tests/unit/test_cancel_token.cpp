@@ -112,6 +112,48 @@ TEST_CASE(CancelToken, FreeFunctionsActOnTheGlobalTokenOnly) {
     CHECK(solve.requested());  // ...nor is it cleared by it
 }
 
+// The cancel window. enter() is what every solve entry point calls: it clears a
+// stale request unless begin() opened the window for this call, in which case
+// a request made since begin() is kept. end() closes a window no solve entered.
+TEST_CASE(CancelToken, WindowKeepsRequestsSinceBegin) {
+    CancelToken t;
+    t.request();
+    t.enter();                 // no window: a stale request is cleared
+    CHECK(!t.requested());
+
+    t.request();
+    t.begin();                 // the window clears what came before it ...
+    CHECK(!t.requested());
+    t.request();               // ... and keeps what comes after
+    t.enter();
+    CHECK(t.requested());
+
+    t.enter();                 // enter() consumed the window: back to clearing
+    CHECK(!t.requested());
+
+    t.begin();
+    t.end();                   // closed by an early return, never entered
+    t.request();
+    t.enter();
+    CHECK(!t.requested());
+}
+
+TEST_CASE(CancelToken, ScopeOpensAndClosesTheWindow) {
+    CancelToken t;
+    {
+        Semper::pipeline::CancelScope scope(t);
+        t.request();
+        t.enter();
+        CHECK(t.requested());
+    }
+    {
+        Semper::pipeline::CancelScope scope(t);
+    }   // no solve entered: closed here
+    t.request();
+    t.enter();
+    CHECK(!t.requested());
+}
+
 // The metrics writer copies the largest prefix the caller's buffer holds;
 // every adapter goes through this one table. 18 is not a prefix the contract
 // offers (slots 17 and 18 came in together), so an 18-float buffer gets 17.

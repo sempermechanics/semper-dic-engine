@@ -23,6 +23,7 @@
 #include <vector>
 
 namespace py = pybind11;
+using Semper::pipeline::CancelScope;
 using Semper::pipeline::CancelToken;
 using Semper::pipeline::FullFieldParams;
 using Semper::pipeline::ProgressCallback;
@@ -102,6 +103,10 @@ public:
                   std::array<int, 4> rect, int step, int subset, int strain_window,
                   bool use_6x6, const py::object& progress) {
         auto lock = lock_without_gil(mutex_);
+        // From here on a cancel() stops this solve, the decode and the output
+        // allocation below included (they used to run before the solve
+        // cleared the token, which dropped a cancel issued meanwhile).
+        CancelScope cancel_window(cancel_);
         cv::Mat def = to_gray(deformed, cache_.width, cache_.height);
         if (def.empty()) throw std::runtime_error("failed to decode deformed image");
         cv::Mat roi = to_mask(mask, cache_.width, cache_.height);
@@ -212,6 +217,7 @@ public:
     // Returns (code, points|None, metrics, info dict).
     py::tuple process(const py::object& deformed, const py::object& progress) {
         auto lock = lock_without_gil(mutex_);
+        CancelScope cancel_window(cancel_);   // as Engine.run
         cv::Mat def = to_gray(deformed, width_, height_);
         if (def.empty()) throw std::runtime_error("failed to decode deformed image");
         std::vector<float> out(static_cast<size_t>(std::max(session_.max_points(), 1)) * 8, 0.0f);

@@ -22,6 +22,7 @@
 #define LOG_TAG "SemperJNI"
 
 using Semper::guarded_call;
+using Semper::pipeline::CancelScope;
 using Semper::pipeline::FullFieldParams;
 using Semper::pipeline::IncrementalFrameInfo;
 using Semper::pipeline::IncrementalParams;
@@ -324,6 +325,11 @@ Java_com_sempermechanics_semper_SemperNativeLib_computeFullFieldDirect(
     if (env == nullptr || defBytes == nullptr || outputBuffer == nullptr)
         return -3;
     std::lock_guard<std::mutex> lock(g_cache.mutex);
+    // The cancel window opens once this call holds the lock: a
+    // setCancelRequested(true) from here on -- during the decode below
+    // included -- stops this solve. One that arrived while the lock was held
+    // by the previous solve was meant for that one, and is cleared here.
+    CancelScope cancel_window(Semper::pipeline::detail::global_cancel_token());
     return guarded_call(-3, [&] {
         float* output_ptr = nullptr;
         const int output_capacity = output_capacity_floats(env, outputBuffer, output_ptr);
@@ -405,6 +411,7 @@ Java_com_sempermechanics_semper_SemperNativeLib_computeIncrementalFrame(
     if (env == nullptr || defBytes == nullptr || outputBuffer == nullptr) return -3;
     std::lock_guard<std::mutex> lock(g_cache.mutex);
     if (!g_session) return -3;
+    CancelScope cancel_window(Semper::pipeline::detail::global_cancel_token());   // as computeFullFieldDirect
     return guarded_call(-3, [&] {
         float* output_ptr = nullptr;
         const int output_capacity = output_capacity_floats(env, outputBuffer, output_ptr);

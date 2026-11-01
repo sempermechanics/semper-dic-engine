@@ -178,6 +178,7 @@ struct GlobalModel {
     bool full = false;            // corners move > kSimilarityMinCornerPx beyond t
     int matches = 0;
     double scale = 0.0;
+    int level = -1;               // index of `scale` in kAkazeScales; -1: none
     double rotation_deg = 0.0, iso_scale = 1.0;
     seeding::AkazeRef def_side;   // the deformed frame's features at `scale`
 
@@ -241,7 +242,10 @@ GlobalModel match_global_model(ReferenceCache& cache, const cv::Mat& defMat,
     for (int lv = first; lv < levels && !good; ++lv) good = try_level(lv);
     for (int lv = 0; lv < first && best_level < 0 && !good; ++lv) good = try_level(lv);
     if (best_level < 0) return gm;
-    pre.akaze_first_level = best_level;
+    // Where the next solve's search starts is recorded once this one has
+    // completed (run_full_field_impl): a cancelled or failed solve leaves it
+    // as it was, so submitting the frame again gives what it would have.
+    gm.level = best_level;
 
     gm.H = best.homography;
     gm.matches = best.inliers();
@@ -289,7 +293,7 @@ MeshSeedResult solve_anchor_seeds(
         const ResultGrid& resultGrid,
         std::vector<ThreadStats>& stats,
         PhaseTimings& timings,
-        const CancelToken& cancel) {
+        const SolveCancel& cancel) {
 
     MeshSeedResult out;
     if (cache.ref_img == nullptr || gridW <= 0 || gridH <= 0) return out;
@@ -304,6 +308,7 @@ MeshSeedResult solve_anchor_seeds(
         r.locked = gm.locked();
         r.matches = gm.matches;
         r.akaze_scale = (float)gm.scale;
+        r.akaze_level = gm.level;
         r.rotation_deg = (float)gm.rotation_deg;
         r.scale = (float)gm.iso_scale;
         r.homography = gm.H;
