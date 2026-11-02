@@ -37,7 +37,7 @@ res.metrics    # (24,) float32 telemetry
 |---|---|
 | Errors | A negative engine code raises `semper.DicError` (`.code` holds it). Pass `raise_on_error=False` to get the code in `res.count` instead. |
 | Masks | `mask=` selects the pixels to correlate. Bool arrays, non-uint8 arrays and uint8 arrays holding only 0 and 1: nonzero is included. Other uint8 masks: pixels below 128 are excluded. |
-| Cancel | `eng.cancel()` stops a solve in progress; it is safe from any thread, including the progress callback. Ctrl-C also cancels. |
+| Cancel | `eng.cancel()` stops a solve in progress; it is safe from any thread, including the progress callback. Ctrl-C also cancels. Any other method called from the progress callback raises `RuntimeError`. |
 | Threads | Calls on one `Engine` run one at a time. Use one `Engine` per thread to solve in parallel. |
 
 ### Image sequences
