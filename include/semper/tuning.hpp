@@ -260,7 +260,8 @@ inline constexpr float kIncEarlyUpdateDrop = 0.05f;
  * schedule, to a frame that reports fewer than this fraction of the points
  * reported on the first frame against the current reference, or, before that
  * frame (and always with N = 1), of the points the reference itself reported
- * when it was solved. Frame 1 has nothing to compare with.
+ * when it was solved. Frame 0 was never solved: against it, the count is its
+ * grid's node count after the boundary and mask scan.
  * Such a frame is a failed solve, not an increment outgrowing the images: the
  * seed locked onto a wrong solution or nothing matched (now and then on a
  * 6-10 deg step over a small noisy ROI), and the few points it reports may be
