@@ -3,6 +3,10 @@
 
 # Sparse OpenCV checkouts omit doc/ and data/ (~600 MB). OpenCV's CMakeLists
 # always add_subdirectory() those paths, so plant no-op stubs when missing.
+# scripts/sparse-opencv.sh plants them first; this covers a sparse checkout
+# made by hand. They land in the submodule's worktree, which git does not
+# report (.gitmodules: ignore = untracked); a read-only source tree needs the
+# script run once, or a full checkout, which has the real directories.
 foreach(_stub doc data)
     if(NOT EXISTS "${OPENCV_SRC_DIR}/${_stub}/CMakeLists.txt")
         file(MAKE_DIRECTORY "${OPENCV_SRC_DIR}/${_stub}")

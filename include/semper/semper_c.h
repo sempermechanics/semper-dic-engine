@@ -15,6 +15,10 @@
  * Threading: an engine handle is NOT internally synchronized; use one handle per
  * thread, or serialize calls to a handle. semper_cancel() is the exception — it is
  * safe to call from another thread while semper_run() is in flight on the handle.
+ * A call made on a handle while another is in flight on it -- from another
+ * thread, or from inside that call's progress callback -- returns
+ * SEMPER_ERR_INIT and does nothing (since v0.7.0; it used to run against the
+ * state the first call was solving with).
  */
 
 #include <stddef.h>
@@ -84,7 +88,12 @@ SEMPER_C_API void           semper_destroy(semper_engine* eng);
  * `img`/`mask` are encoded bytes (PNG/JPEG) or, when expected_w/expected_h > 0, a
  * raw RGBA/ALPHA_8 buffer. `mask`/`mask_len` may be NULL/0 for no ROI mask.
  * Returns 0 on success, SEMPER_ERR_INIT on decode failure -- of the mask too:
- * mask bytes that do not decode are never treated as "no mask".
+ * mask bytes that do not decode are never treated as "no mask". The previous
+ * reference is released first, so after a failure the handle has none (the
+ * next semper_run returns SEMPER_ERR_INIT; since v0.7.0).
+ *
+ * Mask: a pixel is excluded where an 8-bit mask is below 128 (0 out, 255 in).
+ * A 16-bit or float mask file is boolean instead: nonzero is included.
  */
 SEMPER_C_API int semper_set_reference(semper_engine* eng,
                          const uint8_t* img, size_t img_len,
@@ -99,7 +108,9 @@ SEMPER_C_API int semper_set_reference(semper_engine* eng,
  * from a thread the solver owns, not the calling thread; only the final 100,
  * sent when the solve succeeds, is delivered on the calling thread before
  * semper_run returns. Calls never overlap. A mask that does not decode
- * returns SEMPER_ERR_INIT.
+ * returns SEMPER_ERR_INIT, as does a negative out_capacity.
+ * A semper_cancel() issued at any point of the call -- while `def` is still
+ * being decoded included -- stops it (since v0.7.0).
  * Returns the point count (>= 0) or a SEMPER_ERR_* code.
  */
 SEMPER_C_API int semper_run(semper_engine* eng,
@@ -125,7 +136,9 @@ SEMPER_C_API const char* semper_version(void);
  * displacement from the first image, at the first image's grid points, in the
  * same packed layout as semper_run: 8 floats per point
  * [x0, y0, u, v, exx, eyy, exy, corr], strain being Green-Lagrange of the
- * total displacement. A point the solve cannot reach on a frame is followed
+ * total displacement. As everywhere in the output, exy is the tensor
+ * component, 1/2 (du/dY + dv/dX + ...), not the engineering shear strain
+ * gamma_xy = 2 * exy. A point the solve cannot reach on a frame is followed
  * on estimated motion but not reported until it is measured (and, after a
  * long coast, confirmed) again; one that cannot be followed at all is dropped
  * for good.
@@ -155,7 +168,8 @@ SEMPER_C_API void                semper_incremental_destroy(semper_incremental* 
  * Start a sequence at the first image. `ref`/`mask` are decoded as for
  * semper_set_reference; `params` describes the first image's grid (as for
  * semper_run). Returns 0, SEMPER_ERR_ROI, SEMPER_ERR_INIT (decode failure,
- * update_interval < 0) or SEMPER_ERR_STRAIN_WINDOW.
+ * update_interval < 0) or SEMPER_ERR_STRAIN_WINDOW. Any session the handle
+ * held is released first, so a failed init leaves it uninitialized.
  */
 SEMPER_C_API int semper_incremental_init(semper_incremental* inc,
                          const uint8_t* ref, size_t ref_len,
@@ -169,7 +183,8 @@ SEMPER_C_API int semper_incremental_init(semper_incremental* inc,
  * frame can return is (rect_w / step) * (rect_h / step) points. `metrics`,
  * `info` and `cb` may be NULL; `cb` is called as for semper_run, from a
  * solver thread except for the final 100. Returns the point count (>= 0) or a
- * SEMPER_ERR_* code (SEMPER_ERR_INIT also before a successful init).
+ * SEMPER_ERR_* code (SEMPER_ERR_INIT also before a successful init). `info`
+ * is written only when a frame was solved (a return >= 0).
  */
 SEMPER_C_API int semper_incremental_process(semper_incremental* inc,
                          const uint8_t* def, size_t def_len,

@@ -4,6 +4,9 @@ option(SEMPER_BUILD_C_SDK "Build the stable C ABI shared library (semper_c)" OFF
 option(SEMPER_BUILD_PYTHON "Build the pybind11 Python extension" OFF)
 option(SEMPER_BUILD_EXAMPLES "Build beginner C++ examples (links semper_pipeline)" OFF)
 option(SEMPER_FORCE_RELEASE "Force Release flags even when AGP passes Debug" ON)
+# Fail configure instead of building the pipeline serially when OpenMP is not
+# found (the macOS wheels set it: a serial wheel is several times slower).
+option(SEMPER_REQUIRE_OPENMP "Fail configure if OpenMP is not found (host builds)" OFF)
 # Host builds always print errors (LOGE) to stderr. The per-solve profiling
 # and routing trace (LOGD, ~30 lines a solve) only with this on, so the C SDK
 # and the Python wheel stay quiet. Android logs through logcat either way.

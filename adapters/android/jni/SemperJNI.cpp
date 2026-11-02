@@ -22,6 +22,7 @@
 #define LOG_TAG "SemperJNI"
 
 using Semper::guarded_call;
+using Semper::pipeline::CancelScope;
 using Semper::pipeline::FullFieldParams;
 using Semper::pipeline::IncrementalFrameInfo;
 using Semper::pipeline::IncrementalParams;
@@ -38,6 +39,20 @@ static std::unique_ptr<IncrementalSession> g_session;
 static int g_session_w = 0, g_session_h = 0;
 
 namespace {
+
+// Set on the thread running a ProgressBridge callback. The solve that calls
+// it holds g_cache.mutex, so a locking export entered from the callback (the
+// app calling setDebugOutputDir, say, from onProgressUpdate) waited for a
+// lock its own caller held: the callback never returned, the solve waited
+// for its progress thread forever, and the app hung. Such a call now fails
+// at once instead: the export logs it and returns its error value.
+thread_local bool t_in_progress_callback = false;
+
+bool reentered_from_callback(const char* what) {
+    if (!t_in_progress_callback) return false;
+    LOGE("%s called from inside a progress callback; refused (the solve holds the lock)", what);
+    return true;
+}
 
 // Every export runs its body through guarded_call: a C++ exception reaching a
 // JNI frame aborts the app, so it is logged and becomes the export's error
@@ -89,7 +104,9 @@ struct ProgressBridge {
             return;
         }
         if (pEnv && !pEnv->ExceptionCheck()) {
+            t_in_progress_callback = true;
             pEnv->CallVoidMethod(globalCallback, methodId, (jint)percentage);
+            t_in_progress_callback = false;
             if (pEnv->ExceptionCheck()) pEnv->ExceptionClear();
         }
         // Do not detach if we were already on a JNI thread (main compute thread).
@@ -98,11 +115,15 @@ struct ProgressBridge {
     }
 };
 
-// Decode an optional byte array (encoded image, or raw pixels at w x h).
+// Decode an optional byte array (encoded image, or raw pixels at w x h); masks
+// pass io::decode_mask, so a 16-bit or float mask is boolean, not stretched.
 // Returns false when the array exists but its elements cannot be read or do
 // not decode: a mask that failed to decode used to mean "no mask", and the
 // solve then reported a field over the regions the caller excluded.
-bool decode_optional(JNIEnv* env, jbyteArray bytes, int w, int h, cv::Mat& out) {
+using DecodeFn = cv::Mat (*)(const uint8_t*, size_t, int, int);
+
+bool decode_optional(JNIEnv* env, jbyteArray bytes, int w, int h, cv::Mat& out,
+                     DecodeFn decode = &Semper::io::decode_gray) {
     out.release();
     if (bytes == nullptr || env->GetArrayLength(bytes) <= 0) return true;
     jsize len = env->GetArrayLength(bytes);
@@ -113,7 +134,7 @@ bool decode_optional(JNIEnv* env, jbyteArray bytes, int w, int h, cv::Mat& out) 
         JNIEnv* env; jbyteArray bytes; jbyte* buf;
         ~Release() { env->ReleaseByteArrayElements(bytes, buf, JNI_ABORT); }
     } release{env, bytes, buf};
-    out = Semper::io::decode_gray(reinterpret_cast<uint8_t*>(buf), (size_t)len, w, h);
+    out = decode(reinterpret_cast<uint8_t*>(buf), (size_t)len, w, h);
     return !out.empty();
 }
 
@@ -174,14 +195,19 @@ extern "C" {
 JNIEXPORT void JNICALL
 Java_com_sempermechanics_semper_SemperNativeLib_setDebugOutputDir(
         JNIEnv* env, jobject, jstring debugDir) {
+    if (reentered_from_callback("setDebugOutputDir")) return;
     guarded_call([&] {
         std::lock_guard<std::mutex> lock(g_cache.mutex);
         g_cache.debug_dir.clear();
         if (debugDir == nullptr) return;
         const char* dir = env->GetStringUTFChars(debugDir, nullptr);
         if (dir == nullptr) return;   // OutOfMemoryError pending in Java
+        // Released on every path, a throwing std::string included.
+        struct Release {
+            JNIEnv* env; jstring s; const char* chars;
+            ~Release() { env->ReleaseStringUTFChars(s, chars); }
+        } release{env, debugDir, dir};
         g_cache.debug_dir = std::string(dir);
-        env->ReleaseStringUTFChars(debugDir, dir);
     }, report_exception);
 }
 
@@ -234,20 +260,30 @@ Java_com_sempermechanics_semper_SemperNativeLib_getPreviewFromBytes(
         cv::resize(fullImg, rgba, cv::Size(targetWidth, targetHeight));
         cv::cvtColor(rgba, rgba, cv::COLOR_BGR2RGBA);
 
+        // Each lookup is checked before the next JNI call: calling into the
+        // VM with an exception pending is not allowed. A failure returns
+        // null with the exception cleared, as documented above (it used to
+        // reach Java as a throw from createBitmap's OOM or IAE).
+        auto fail = [env]() -> jobject {
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            return nullptr;
+        };
         jclass bitmapCls = env->FindClass("android/graphics/Bitmap");
-        if (bitmapCls == nullptr) return nullptr;
+        if (bitmapCls == nullptr || env->ExceptionCheck()) return fail();
         jmethodID createBitmapMethod = env->GetStaticMethodID(
                 bitmapCls, "createBitmap",
                 "(IILandroid/graphics/Bitmap$Config;)Landroid/graphics/Bitmap;");
+        if (createBitmapMethod == nullptr || env->ExceptionCheck()) return fail();
         jclass configCls = env->FindClass("android/graphics/Bitmap$Config");
-        if (createBitmapMethod == nullptr || configCls == nullptr) return nullptr;
+        if (configCls == nullptr || env->ExceptionCheck()) return fail();
         jfieldID argb8888Field = env->GetStaticFieldID(
                 configCls, "ARGB_8888", "Landroid/graphics/Bitmap$Config;");
-        if (argb8888Field == nullptr) return nullptr;
+        if (argb8888Field == nullptr || env->ExceptionCheck()) return fail();
         jobject config = env->GetStaticObjectField(configCls, argb8888Field);
+        if (config == nullptr || env->ExceptionCheck()) return fail();
         jobject jBitmap = env->CallStaticObjectMethod(
                 bitmapCls, createBitmapMethod, targetWidth, targetHeight, config);
-        if (jBitmap == nullptr || env->ExceptionCheck()) return nullptr;
+        if (jBitmap == nullptr || env->ExceptionCheck()) return fail();
 
         AndroidBitmapInfo info;
         if (AndroidBitmap_getInfo(env, jBitmap, &info) < 0 ||
@@ -275,12 +311,13 @@ Java_com_sempermechanics_semper_SemperNativeLib_getImageDimensions(
     if (fileData != nullptr) {
         jsize len = env->GetArrayLength(fileData);
         jbyte* buf = env->GetByteArrayElements(fileData, nullptr);
-        if (buf != nullptr) {
-            guarded_call([&] {
-                Semper::io::image_dimensions(reinterpret_cast<uint8_t*>(buf), (size_t)len, w, h);
-            }, report_exception);
-            env->ReleaseByteArrayElements(fileData, buf, JNI_ABORT);
-        }
+        // An OutOfMemoryError is pending: no further JNI call may be made,
+        // and Java sees that error rather than a {0, 0}.
+        if (buf == nullptr) return nullptr;
+        guarded_call([&] {
+            Semper::io::image_dimensions(reinterpret_cast<uint8_t*>(buf), (size_t)len, w, h);
+        }, report_exception);
+        env->ReleaseByteArrayElements(fileData, buf, JNI_ABORT);
     }
     jintArray result = env->NewIntArray(2);
     if (result == nullptr) return nullptr;   // OutOfMemoryError pending in Java
@@ -293,22 +330,22 @@ JNIEXPORT void JNICALL
 Java_com_sempermechanics_semper_SemperNativeLib_initializeReference(
         JNIEnv* env, jobject, jbyteArray refBytes, jbyteArray maskBytes,
         jint width, jint height) {
+    if (reentered_from_callback("initializeReference")) return;
     std::lock_guard<std::mutex> lock(g_cache.mutex);
     // Back to the fixed-reference path: an incremental session left open
     // would hold its two images until the next initializeIncremental.
     g_session.reset();
     g_session_w = g_session_h = 0;
+    // The old reference goes first: a call that fails -- on bytes that do not
+    // decode, or on an exception, which used to keep it -- leaves none, so
+    // the next computeFullFieldDirect returns -3 instead of solving against
+    // the previous image. (This export returns nothing to report the failure.)
+    g_cache.reset();
     guarded_call([&] {
         cv::Mat refMat;
-        if (refBytes == nullptr || !decode_optional(env, refBytes, width, height, refMat)) {
-            g_cache.reset();
-            return;
-        }
+        if (refBytes == nullptr || !decode_optional(env, refBytes, width, height, refMat)) return;
         cv::Mat roiMask;
-        if (!decode_optional(env, maskBytes, refMat.cols, refMat.rows, roiMask)) {
-            g_cache.reset();
-            return;
-        }
+        if (!decode_optional(env, maskBytes, refMat.cols, refMat.rows, roiMask, &Semper::io::decode_mask)) return;
         g_cache.set_from_gray(refMat, roiMask);
     }, report_exception);
 }
@@ -323,7 +360,13 @@ Java_com_sempermechanics_semper_SemperNativeLib_computeFullFieldDirect(
     (void)refBytes;  // reference comes from initializeReference cache
     if (env == nullptr || defBytes == nullptr || outputBuffer == nullptr)
         return -3;
+    if (reentered_from_callback("computeFullFieldDirect")) return -3;
     std::lock_guard<std::mutex> lock(g_cache.mutex);
+    // The cancel window opens once this call holds the lock: a
+    // setCancelRequested(true) from here on -- during the decode below
+    // included -- stops this solve. One that arrived while the lock was held
+    // by the previous solve was meant for that one, and is cleared here.
+    CancelScope cancel_window(Semper::pipeline::detail::global_cancel_token());
     return guarded_call(-3, [&] {
         float* output_ptr = nullptr;
         const int output_capacity = output_capacity_floats(env, outputBuffer, output_ptr);
@@ -334,7 +377,7 @@ Java_com_sempermechanics_semper_SemperNativeLib_computeFullFieldDirect(
         if (defMat.empty()) return -3;
 
         cv::Mat roiMask;
-        if (!decode_optional(env, maskBytes, g_cache.width, g_cache.height, roiMask)) return -3;
+        if (!decode_optional(env, maskBytes, g_cache.width, g_cache.height, roiMask, &Semper::io::decode_mask)) return -3;
 
         const FullFieldParams params = make_params(rectX, rectY, rectWidth, rectHeight,
                                                    step, subsetSize, strainWindow, use6x6Interpolator);
@@ -348,7 +391,9 @@ Java_com_sempermechanics_semper_SemperNativeLib_computeFullFieldDirect(
                 metrics_len ? metrics_buf : nullptr, metrics_len,
                 [&progress](int pct) { progress(pct); });
 
-        if (metrics_len) copy_metrics(env, out_metrics, metrics_buf);
+        // Only a solve that ran describes this frame: an error leaves the
+        // caller's array as it was rather than zeroing it.
+        if (metrics_len && result >= 0) copy_metrics(env, out_metrics, metrics_buf);
         return result;
     }, report_exception);
 }
@@ -365,6 +410,7 @@ Java_com_sempermechanics_semper_SemperNativeLib_initializeIncremental(
         jint width, jint height, jint rectX, jint rectY, jint rectWidth,
         jint rectHeight, jint step, jint subsetSize, jint strainWindow,
         jboolean use6x6Interpolator, jint updateInterval) {
+    if (reentered_from_callback("initializeIncremental")) return -3;
     std::lock_guard<std::mutex> lock(g_cache.mutex);
     g_cache.reset();
     g_session.reset();
@@ -375,7 +421,7 @@ Java_com_sempermechanics_semper_SemperNativeLib_initializeIncremental(
         cv::Mat refMat;
         if (!decode_optional(env, refBytes, width, height, refMat) || refMat.empty()) return -3;
         cv::Mat roiMask;
-        if (!decode_optional(env, maskBytes, refMat.cols, refMat.rows, roiMask)) return -3;
+        if (!decode_optional(env, maskBytes, refMat.cols, refMat.rows, roiMask, &Semper::io::decode_mask)) return -3;
 
         IncrementalParams ip;
         ip.field = make_params(rectX, rectY, rectWidth, rectHeight, step, subsetSize,
@@ -403,8 +449,10 @@ Java_com_sempermechanics_semper_SemperNativeLib_computeIncrementalFrame(
         JNIEnv* env, jobject, jbyteArray defBytes, jobject outputBuffer,
         jobject callbackObj, jfloatArray out_metrics, jintArray out_info) {
     if (env == nullptr || defBytes == nullptr || outputBuffer == nullptr) return -3;
+    if (reentered_from_callback("computeIncrementalFrame")) return -3;
     std::lock_guard<std::mutex> lock(g_cache.mutex);
     if (!g_session) return -3;
+    CancelScope cancel_window(Semper::pipeline::detail::global_cancel_token());   // as computeFullFieldDirect
     return guarded_call(-3, [&] {
         float* output_ptr = nullptr;
         const int output_capacity = output_capacity_floats(env, outputBuffer, output_ptr);
@@ -431,6 +479,10 @@ Java_com_sempermechanics_semper_SemperNativeLib_computeIncrementalFrame(
                 [&progress](int pct) { progress(pct); }, &info);
         g_session->set_debug_dir(std::string());
 
+        // An error leaves the session as it was and writes no frame info; the
+        // caller's arrays keep what they held rather than a default (zeroed)
+        // info describing no frame.
+        if (result < 0) return result;
         if (metrics_len) copy_metrics(env, out_metrics, metrics_buf);
         if (out_info != nullptr && env->GetArrayLength(out_info) >= 6) {
             const jint values[6] = {info.reference_frame, info.reference_updated ? 1 : 0,
@@ -445,6 +497,7 @@ Java_com_sempermechanics_semper_SemperNativeLib_computeIncrementalFrame(
 /** Close the incremental session and free its reference. */
 JNIEXPORT void JNICALL
 Java_com_sempermechanics_semper_SemperNativeLib_releaseIncremental(JNIEnv*, jobject) {
+    if (reentered_from_callback("releaseIncremental")) return;
     std::lock_guard<std::mutex> lock(g_cache.mutex);
     g_session.reset();
     g_session_w = g_session_h = 0;
@@ -499,6 +552,30 @@ Java_com_indicvision_semper_SemperNativeLib_computeFullFieldDirect(
             env, self, refBytes, defBytes, maskBytes, rectX, rectY, rectWidth, rectHeight,
             step, subsetSize, strainWindow, use6x6Interpolator, outputBuffer, callbackObj,
             out_metrics);
+}
+
+JNIEXPORT jint JNICALL
+Java_com_indicvision_semper_SemperNativeLib_initializeIncremental(
+        JNIEnv* env, jobject self, jbyteArray refBytes, jbyteArray maskBytes,
+        jint width, jint height, jint rectX, jint rectY, jint rectWidth,
+        jint rectHeight, jint step, jint subsetSize, jint strainWindow,
+        jboolean use6x6Interpolator, jint updateInterval) {
+    return Java_com_sempermechanics_semper_SemperNativeLib_initializeIncremental(
+            env, self, refBytes, maskBytes, width, height, rectX, rectY, rectWidth,
+            rectHeight, step, subsetSize, strainWindow, use6x6Interpolator, updateInterval);
+}
+
+JNIEXPORT jint JNICALL
+Java_com_indicvision_semper_SemperNativeLib_computeIncrementalFrame(
+        JNIEnv* env, jobject self, jbyteArray defBytes, jobject outputBuffer,
+        jobject callbackObj, jfloatArray out_metrics, jintArray out_info) {
+    return Java_com_sempermechanics_semper_SemperNativeLib_computeIncrementalFrame(
+            env, self, defBytes, outputBuffer, callbackObj, out_metrics, out_info);
+}
+
+JNIEXPORT void JNICALL
+Java_com_indicvision_semper_SemperNativeLib_releaseIncremental(JNIEnv* env, jobject self) {
+    Java_com_sempermechanics_semper_SemperNativeLib_releaseIncremental(env, self);
 }
 
 }  // extern "C"

@@ -60,6 +60,12 @@ class DicError(RuntimeError):
         self.code = code
         super().__init__(_MESSAGES.get(code, f"engine error {code}"))
 
+    def __reduce__(self):
+        # Rebuilt from the code, so the message survives pickling (e.g. out
+        # of a multiprocessing worker); the default rebuilt it from the
+        # message, which became the "code" of a new, unknown error.
+        return (self.__class__, (self.code,))
+
 
 @dataclass
 class Result:
@@ -79,7 +85,19 @@ class Engine:
 
     Calls on one instance are serialised: a second thread's ``set_reference``
     or ``run`` waits for the solve in flight. :meth:`cancel` never waits, and
-    may be called from any thread, the progress callback included. A mask that
+    may be called from any thread, the progress callback included; any other
+    method called from the progress callback raises ``RuntimeError`` (it would
+    wait for the solve that called it). Ctrl-C (``KeyboardInterrupt``) cancels
+    a solve and is raised once it has stopped.
+
+    ``progress`` is called with a percentage from a thread the solve owns. It
+    must be callable (``TypeError`` otherwise); an exception it raises cancels
+    the solve and is raised from :meth:`run`.
+
+    A mask selects the pixels to correlate. A bool array, or any numeric dtype
+    other than uint8, is boolean: nonzero is included. A uint8 mask holding
+    only 0 and 1 is the same. Any other uint8 mask (and encoded bytes)
+    excludes the pixels below 128, so 0/255 masks work as before. A mask that
     does not decode raises ``ValueError`` rather than being ignored.
     """
 
@@ -198,7 +216,8 @@ class IncrementalSession:
         if code < 0:
             if raise_on_error:
                 raise DicError(code)
-            return FrameResult(code, np.empty((0, 8), np.float32), metrics, info)
+            # No frame was solved: no info (an empty dict).
+            return FrameResult(code, np.empty((0, 8), np.float32), metrics, {})
         return FrameResult(code, points, metrics, info)
 
     @property

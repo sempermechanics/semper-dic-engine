@@ -14,6 +14,9 @@ namespace Semper {
             (int64_t)w * (int64_t)h > (int64_t)std::numeric_limits<int>::max()) {
             throw std::length_error("Image: width * height does not fit in an int");
         }
+        if (raw_pixels == nullptr && w > 0 && h > 0) {
+            throw std::invalid_argument("Image: no pixels for a non-empty image");
+        }
         intensities.resize(w * h);
         for (int i = 0; i < w * h; ++i) {
             intensities[i] = static_cast<scalar_t>(raw_pixels[i]);
@@ -79,8 +82,10 @@ namespace Semper {
     }
 
     scalar_t Image::interpolate_keys_fourth(scalar_t x, scalar_t y) const {
-        // 🚀 DICe LAYER 1: Explicit demotion boundary for 6x6 kernel
-        if (x <= 2.5f || x >= width - 3.5f || y <= 2.5f || y >= height - 3.5f) {
+        // 🚀 DICe LAYER 1: Explicit demotion boundary for 6x6 kernel.
+        // Written as "inside or demote" so a NaN demotes (and bilinear then
+        // rejects it) instead of reaching the int casts below.
+        if (!(x > 2.5f && x < width - 3.5f && y > 2.5f && y < height - 3.5f)) {
             return interpolate_bilinear(x, y); // 🚀 Demotes to Bilinear directly!
         }
 
@@ -190,8 +195,10 @@ namespace Semper {
     }
 
     scalar_t Image::interpolate_bilinear(scalar_t x, scalar_t y) const {
-        // DICe LAYER 1: Absolute hard boundary for Bilinear 2x2 kernel
-        if (x < 0.0f || x >= width - 1.5f || y < 0.0f || y >= height - 1.5f) {
+        // DICe LAYER 1: Absolute hard boundary for Bilinear 2x2 kernel.
+        // "Inside or reject": a NaN (or Inf) coordinate is rejected here
+        // rather than cast to an index (undefined, and an out-of-bounds read).
+        if (!(x >= 0.0f && x < width - 1.5f && y >= 0.0f && y < height - 1.5f)) {
             return 0.0f; // Explicitly kills the pixel, returning a zero intensity
         }
         int xi = static_cast<int>(x); int yi = static_cast<int>(y);
@@ -204,8 +211,9 @@ namespace Semper {
     }
 
     scalar_t Image::interpolate_bicubic(scalar_t x, scalar_t y) const {
-        // DICe LAYER 1: Explicit demotion boundary for 4x4 kernel
-        if (x < 1.0f || x >= width - 2.0f || y < 1.0f || y >= height - 2.0f) {
+        // DICe LAYER 1: Explicit demotion boundary for 4x4 kernel ("inside
+        // or demote", so a NaN demotes and bilinear rejects it).
+        if (!(x >= 1.0f && x < width - 2.0f && y >= 1.0f && y < height - 2.0f)) {
             return interpolate_bilinear(x, y); // Demotes to Bilinear
         }
 

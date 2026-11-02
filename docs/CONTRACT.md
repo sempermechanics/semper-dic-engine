@@ -136,6 +136,13 @@ int run_full_field(..., CancelToken& token, ProgressCallback on_progress = nullp
   and cancel independently, and `request_cancel()` does not reach them. (Until
   v0.5.0 the token was bound into one process-global pointer for the duration
   of the solve, so two concurrent solves polled whichever was bound last.)
+  A caller that does work before the solve (every adapter decodes the frame
+  first) opens the cancel window at its own entry with `CancelScope`
+  (unreleased, additive): the solve then keeps a request made since, instead
+  of clearing it on entry. Until then a cancel issued while the frame decoded
+  was lost. A request the solve has seen stays in force for the rest of it:
+  clearing the flag mid-solve (JNI `setCancelRequested(false)`) prepares the
+  next solve and does not un-cancel this one, which returns `-99`.
 - **You may** make it faster or more accurate (Internal). **You may not** change
   return-code meanings, 8-float packing, the capacity-drop rule, or metric slot
   indices without a major bump.
@@ -161,8 +168,15 @@ is **Internal**. It is reused while `rect`, `step`,
 `subset_size` and the ROI mask are unchanged, and dropped by `reset`,
 `set_from_gray` and `adopt` -- except that `adopt` carries over the AKAZE
 detection scale the outgoing reference settled on, so incremental DIC does
-not climb the scale pyramid again at every update. Outputs are bit-identical
-with or without it.
+not climb the scale pyramid again at every update. The scan, the Hessian
+pool and the reference keypoints give bit-identical outputs with or without
+the cache. The AKAZE starting scale does not: a solve starts its global-motion
+search at the scale an earlier completed solve against the same reference
+settled on, so it can take its model from a finer scale than a cold solve
+would, and its field can differ from a cold solve's in the last bits (the
+seeds differ). A cancelled or failed solve leaves that scale as it was.
+`set_from_gray` and `adopt` install a reference only once it is complete: if
+one throws, the cache is left empty (`set_from_gray`) or as it was (`adopt`).
 `adopt(...)` (added v0.4.0) hands an already-prepared image to the cache; it
 exists for `IncrementalSession` and is **Internal** despite living in a Stable
 header.
@@ -222,7 +236,20 @@ public:
   `-3` also covers "not initialized" and a frame whose size differs from the
   first image.
 - **Errors and cancellation** leave the session exactly as it was, so the same
-  frame can be submitted again.
+  frame can be submitted again. That includes an exception thrown out of
+  `process_frame` (a reference update builds its next state in full before
+  installing any of it).
+- **Update floor**: the reference never moves to a frame that reports under
+  half the count it is compared with -- the first frame on the current
+  reference, or what the reference reported when it was solved, or, while the
+  reference is still the first image, its node count after the boundary and
+  mask scan (`frame0_points`). Without that last case a first frame that solved
+  nothing became the reference and every later frame reported 0 points.
+- **Nothing left to follow**: when no node of the current reference's grid can
+  be solved (the tracked material has moved into the border margin), the
+  nodes are dropped and the frame returns 0 points with zeroed metrics, as
+  when every node has been lost. It used to return `-2` on that frame and on
+  every later one.
 - **Metrics** describe the increment solve against the current reference. The
   frame-0 bookkeeping is in `IncrementalFrameInfo`, not in new metric slots.
 
@@ -277,9 +304,32 @@ cv::Mat to_gray8(const cv::Mat& img);                         // added v0.5.0
 
 Empty `cv::Mat` = failure; do not switch to throwing.
 
+Added (unreleased, additive):
+
+```cpp
+cv::Mat to_mask8(const cv::Mat& mask);
+cv::Mat decode_mask(const uint8_t* data, size_t len, int expected_w = 0, int expected_h = 0);
+```
+
+- **Masks**: the engine excludes a pixel whose 8-bit mask value is below 128.
+  An 8-bit mask passes through unchanged (0 out, 255 in). A mask of any other
+  depth -- 16-bit, signed, float, a NumPy bool array -- is boolean: nonzero is
+  included. The C ABI and JNI decode masks with `decode_mask`; Python treats
+  bool and non-uint8 arrays as boolean and a uint8 mask holding only 0 and 1
+  as one too. Until then a non-8-bit mask went through `to_gray8`, whose
+  stretch made an all-zero mask 128 (everything included), and a uint8 0/1
+  mask excluded every pixel (`-2`).
+- **Size**: an image of more than 2^28 pixels is refused (empty `Mat`), before
+  it is decoded where the header gives its size (PNG, JPEG, BMP, TIFF): the
+  engine spends about 13 bytes a pixel, and a few kilobytes of compressed
+  input could declare enough pixels to exhaust memory. `image_dimensions`
+  reads PNG, JPEG, BMP and TIFF headers without decoding (it decoded the whole
+  image in colour).
+
 - **Depth** *(v0.5.0)*: an encoded image of any depth other than 8-bit is
-  mapped linearly from its own min..max onto 0..255 (`to_gray8`); a flat one
-  becomes 128. Before, `convertTo(CV_8U)` saturated it — a 12-bit camera frame
+  mapped linearly onto 0..255 (`to_gray8`); a flat one becomes 128. The range
+  mapped is the image's 0.1th to 99.9th percentile (unreleased; min..max
+  before), so a hot pixel no longer sets the scale; values outside saturate. Before, `convertTo(CV_8U)` saturated it — a 12-bit camera frame
   came out nearly all white. ZNSSD is invariant to that affine map, so only
   quantization changes for frames that already decoded correctly.
 - **Raw or encoded** *(v0.5.0)*: with `expected_w/h`, a buffer of exactly
@@ -317,7 +367,20 @@ void semper_incremental_cancel(semper_incremental*);           /* thread-safe */
 
 `semper_params` is unchanged; the interval is a separate argument so its layout
 stays Frozen. These eleven functions are the **only** exported symbols; the
-golden list in §A.6 fails CI if that set changes.
+golden list in §A.6 fails CI if that set changes. CI compares every defined
+dynamic symbol of `libsemper_c` with it, of any type, and on ELF a linker
+version script (`adapters/c/semper_c.map`) keeps template instantiations from
+system headers out of the export table.
+
+Unreleased behaviour of the C ABI, signatures unchanged:
+
+- A call on a handle while another is in flight on it -- from another thread
+  or from the first call's progress callback -- returns `SEMPER_ERR_INIT` and
+  does nothing; `semper_cancel` / `semper_incremental_cancel` are exempt.
+- `semper_set_reference` and `semper_incremental_init` release what the handle
+  held first, so a failed call leaves no reference or session behind.
+- A negative `out_capacity` is `SEMPER_ERR_INIT`; `info` is written only when
+  `semper_incremental_process` returns `>= 0`.
 
 Every entry point is annotated `SEMPER_C_API`. The shared library is built with
 `-fvisibility=hidden` (on Windows a DLL exports only what is marked
@@ -339,8 +402,21 @@ exported — a symbol that loses its annotation silently vanishes from the ABI.
 
 JNI exports live in `adapters/android/jni/SemperJNI.cpp` under the package
 `com.sempermechanics.semper.SemperNativeLib`, with forwarders for the old
-`com.indicvision.semper` package until the apps have moved. All OpenMP work must stay on one pinned
-thread on Android.
+`com.indicvision.semper` package until the apps have moved -- all nine exports,
+the three incremental ones included (they were missing). `JNI_OnLoad` sets
+OpenCV's own thread pool to one thread; the engine's parallel regions and Path
+B's workers use `std::thread::hardware_concurrency()` threads (an earlier
+version of this document said all OpenMP work stayed on one pinned thread,
+which the code never did). CI checks every exported `Java_*` symbol against
+`tests/jni/jni_symbols.txt`.
+
+A locking export called from inside `onProgressUpdate` returns its error value
+(`-3`, or nothing for the `void` ones) instead of waiting for the lock the
+solve calling it holds, which hung the app. `initializeReference` releases the
+previous reference first, so after a failed call there is none and the next
+`computeFullFieldDirect` returns `-3`. `computeFullFieldDirect` and
+`computeIncrementalFrame` write the metrics and info arrays only when they
+return `>= 0`.
 
 | JNI export | Public engine calls used |
 |---|---|

@@ -1,0 +1,5 @@
+# Pinned test-time dependencies for CI (the python-bindings and
+# adapters-sanitized jobs). The package itself needs numpy>=1.21 only.
+pybind11==3.1.0
+numpy==2.5.4
+pytest==9.2.0

@@ -58,33 +58,54 @@ void ReferenceCache::set_from_gray(const cv::Mat& gray_in, const cv::Mat& roi_ma
     // larger image before copying it rather than when the solve starts.
     if ((int64_t)gray_in.cols * (int64_t)gray_in.rows >
         (int64_t)std::numeric_limits<int>::max()) return;
-    gray = gray_in.clone();
+    // Built aside and installed only once complete: the gradients and the
+    // Ghost Wall can throw (bad_alloc, cv::Exception), and a throw used to
+    // leave ref_img set over empty gradient planes, or unmasked, for the next
+    // solve to read. Now the cache stays empty, as on any other failure.
+    cv::Mat g = gray_in.clone();
+    auto img = std::make_unique<Image>(g.cols, g.rows, g.data);
+    img->prepare_data(false);
+    stamp_ghost_wall(*img, roi_mask);
+    gray = std::move(g);
     width = gray.cols;
     height = gray.rows;
-    ref_img = std::make_unique<Image>(width, height, gray.data);
-    ref_img->prepare_data(false);
-    stamp_ghost_wall(*ref_img, roi_mask);
+    ref_img = std::move(img);
 }
 
 void ReferenceCache::adopt(std::unique_ptr<Image> prepared, cv::Mat gray_in, const cv::Mat& roi_mask) {
-    // The AKAZE detection scale the outgoing reference settled on depends on
-    // the speckle, not on the frame: carry it over, so incremental DIC does not
-    // climb the scale pyramid again at every reference update.
-    const int akaze_level = precompute ? precompute->akaze_first_level : 0;
-    reset();
-    if (!prepared || gray_in.empty()) return;
-    gray = std::move(gray_in);
-    width = gray.cols;
-    height = gray.rows;
-    ref_img = std::move(prepared);
-    stamp_ghost_wall(*ref_img, roi_mask);
-    if (akaze_level > 0) {
-        precompute = std::make_unique<internal::RefPrecompute>();
-        precompute->akaze_first_level = akaze_level;
-    }
+    internal::adopt_reference(*this, std::move(prepared), std::move(gray_in), roi_mask,
+                              seeding::AkazeRef{});
 }
 
 namespace internal {
+
+void adopt_reference(ReferenceCache& cache, std::unique_ptr<Image> prepared, cv::Mat gray_in,
+                     const cv::Mat& roi_mask, seeding::AkazeRef handover) {
+    if (!prepared || gray_in.empty()) {
+        cache.reset();
+        return;
+    }
+    // Everything that can throw runs before the cache changes: a throw leaves
+    // the outgoing reference in place (IncrementalSession relies on it to
+    // leave the session as it was).
+    stamp_ghost_wall(*prepared, roi_mask);
+    // The AKAZE detection scale the outgoing reference settled on depends on
+    // the speckle, not on the frame: carry it over, so incremental DIC does not
+    // climb the scale pyramid again at every reference update.
+    const int akaze_level = cache.precompute ? cache.precompute->akaze_first_level : 0;
+    std::unique_ptr<RefPrecompute> pre;
+    if (akaze_level > 0 || handover.usable()) {
+        pre = std::make_unique<RefPrecompute>();
+        pre->akaze_first_level = akaze_level;
+        pre->akaze_handover = std::move(handover);
+    }
+    cache.reset();
+    cache.gray = std::move(gray_in);
+    cache.width = cache.gray.cols;
+    cache.height = cache.gray.rows;
+    cache.ref_img = std::move(prepared);
+    cache.precompute = std::move(pre);
+}
 
 bool RefPrecompute::grid_matches(const FullFieldParams& p, const cv::Mat& mask) const {
     if (!grid_valid) return false;

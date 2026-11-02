@@ -318,7 +318,11 @@ TEST_CASE(Incremental, Rotation90_200Frames_TracksTheTurningRoi) {
     FullFieldParams p = centred_params(256, 256, 110, 5);
     p.strain_window = 15;
     struct Case { int interval; bool six; int until; double min_within; double max_rms; };
-    for (const Case c : {Case{5, true, T, 0.95, 0.08}, Case{10, false, T, 0.95, 0.20},
+    // N = 10 with 4x4: 0.175 px rms when the suite was built at -O2, 0.208 px
+    // at -O3, the flags the libraries ship with and the suite now uses. The
+    // difference is the weak corner below, 200 chained frames on; the share
+    // within 0.5 px (395 points) did not move.
+    for (const Case c : {Case{5, true, T, 0.95, 0.08}, Case{10, false, T, 0.95, 0.25},
                          Case{1, true, T / 2, 0.90, 0.40}}) {
         p.use_6x6_interpolator = c.six;
         const std::vector<Frame> inc = run_session(s, cv::Mat(), p, c.interval);
@@ -386,14 +390,15 @@ TEST_CASE(Incremental, LostNodesNeverReturn) {
     CHECK(inc.back().info.tracked_points < inc.front().info.frame0_points);
 }
 
-TEST_CASE(Incremental, EveryNodeLost_ZeroedMetricsAndFinalProgress) {
+TEST_CASE(Incremental, FailedFirstFrame_NeverBecomesTheReference) {
     // Frame 1 is frame 0 under heavy noise (sigma 40): AKAZE, which detects
-    // at 0.25x and 0.5x where the noise averages out, still locks, but no
-    // 21 px subset clears kCorrAccept. The solve succeeds measuring no node,
-    // and with N = 1 the reference moves onto it with none alive (sigma 25
-    // to 90 all do this here). Frame 2 then has nothing to follow and runs no
-    // solve. It used to return 0 with the caller's metrics untouched -- the
-    // previous frame's numbers, or garbage -- and no final progress tick.
+    // at 0.25x and 0.5x where the noise averages out, still locks, but almost
+    // no 21 px subset clears kCorrAccept. The solve succeeds measuring next to
+    // nothing. The update floor had no count to compare a first frame on
+    // frame 0 with, so with N = 1 the reference moved onto it with no node
+    // alive, and every later frame -- a clean one included -- followed nothing
+    // and reported 0 points. The floor now compares with frame 0's node count:
+    // the reference stays, and frame 2 (frame 0 itself) is solved against it.
     const int w = 320, h = 320;
     const dictest::SmoothSpeckleField field(31, w, h);
     const cv::Mat ref = dictest::render_frame(field, w, h, dictest::identity_motion(), 0.0f, 1000);
@@ -411,32 +416,26 @@ TEST_CASE(Incremental, EveryNodeLost_ZeroedMetricsAndFinalProgress) {
     IncrementalFrameInfo info1;
     const int rc1 = session.process_frame(noisy, out.data(), cap, metrics,
                                           Semper::pipeline::kMetricsLen, nullptr, &info1);
-    std::printf("    frame 1: rc %d  tracked %d  updated %d  lock %g\n", rc1, info1.tracked_points,
-                (int)info1.reference_updated, metrics[21]);
-    // The route under test: a successful, locked frame that leaves nothing alive.
+    std::printf("    frame 1: rc %d  tracked %d of %d  updated %d  lock %g\n", rc1, info1.tracked_points,
+                info1.frame0_points, (int)info1.reference_updated, metrics[21]);
+    // The route under test: a successful, locked frame under half the count.
     REQUIRE(rc1 >= 0);
     REQUIRE(metrics[21] == 1.0f);
-    REQUIRE(info1.reference_updated);
-    REQUIRE(info1.tracked_points == 0);
+    REQUIRE(info1.frame0_points > 0);
+    CHECK(rc1 < info1.frame0_points / 2);
+    CHECK(!info1.reference_updated);
+    CHECK(info1.reference_frame == 0);
 
-    for (float &v : metrics) v = -1.0f;
-    struct Call { int pct; std::thread::id tid; };
-    std::vector<Call> calls;
-    std::mutex calls_mutex;
     IncrementalFrameInfo info2;
     const int rc2 = session.process_frame(ref, out.data(), cap, metrics,
-                                          Semper::pipeline::kMetricsLen, [&](int pct) {
-        std::lock_guard<std::mutex> lk(calls_mutex);
-        calls.push_back({pct, std::this_thread::get_id()});
-    }, &info2);
-    CHECK(rc2 == 0);
-    for (int i = 0; i < Semper::pipeline::kMetricsLen; ++i) CHECK(metrics[i] == 0.0f);
-    REQUIRE(calls.size() == 1);
-    CHECK(calls[0].pct == 100);
-    CHECK(calls[0].tid == std::this_thread::get_id());
-    CHECK(info2.reference_frame == 1);
-    CHECK(info2.tracked_points == 0);
-    CHECK(!info2.reference_updated);
+                                          Semper::pipeline::kMetricsLen, nullptr, &info2);
+    std::printf("    frame 2: rc %d  tracked %d of %d  updated %d\n", rc2, info2.tracked_points,
+                info2.frame0_points, (int)info2.reference_updated);
+    CHECK(info2.reference_frame == 0);
+    CHECK(rc2 >= info2.frame0_points / 2);
+    CHECK(info2.reference_updated);
+    CHECK(info2.tracked_points >= (int)(0.9 * info2.frame0_points));
+    CHECK(session.frames_processed() == 2);
 }
 
 TEST_CASE(Incremental, RepeatRun_BitIdentical) {

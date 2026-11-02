@@ -5,6 +5,113 @@ Versions follow [docs/CONTRACT.md](docs/CONTRACT.md) §A.1. Entries before
 
 ## Unreleased
 
+The next release is a **minor** one (0.7.0): `CancelScope` and
+`CancelToken::begin/end/enter` (`cancel.hpp`) and `io::to_mask8` /
+`io::decode_mask` (`io.hpp`) are additive Stable API. No Frozen value,
+signature, slot or packing changed.
+
+### Fixed — cancellation
+- A cancel issued while an adapter was still decoding the frame (or, in
+  Python and JNI, waiting for its lock or allocating) was cleared by the
+  solve's entry and the solve ran to completion. The adapters open the cancel
+  window at their own entry (`CancelScope`).
+- A cancel requested and then cleared mid-solve (JNI `setCancelRequested`
+  is lock-free) let the Hessian pre-pass mark a pool with holes complete: the
+  solve returned the holes as a success and every later solve against the
+  reference replayed them. A request any poll saw now stays in force for the
+  rest of the solve (`-99`).
+- A cancelled or failed solve no longer moves the cache's AKAZE starting scale.
+
+### Fixed — solver
+- Path B's seed sort used a comparator that was not a strict weak ordering
+  (undefined behaviour in `std::sort`). When every anchor candidate failed the
+  gate, Path C's seed was never tried and the solve returned 0 points.
+- `ReferenceCache::set_from_gray` / `adopt` and an incremental reference
+  update install their result only once complete; an exception (`bad_alloc`,
+  `cv::Exception`) no longer leaves a half-prepared reference or session.
+- Incremental: a first frame that solved nothing (or a handful of nodes) became
+  the reference and every later frame reported 0 points; the floor now compares
+  it with frame 0's node count. A reference whose grid has no solvable node
+  drops the nodes and reports 0 instead of returning `-2` forever.
+- NaN handling: the engine is built with `-fno-finite-math-only` beside
+  `-ffast-math`, under whose finite-math assumption no NaN check was
+  guaranteed to survive, and the interpolators accept only points inside their
+  bounds, so a NaN coordinate is rejected instead of cast to an index.
+  `phase_correlate` rejects a flat reference crop; `median_inplace` leaves NaNs
+  out; `compute_vsg_strain` refuses a zero step or short vectors; `Image`
+  refuses a null pixel pointer; AKAZE is not run on a crop too small at its
+  detection scale, and a detector failure is no model rather than `-3`.
+- Floating point is the same on arm64 and x86-64 where it can be: no FP
+  contraction (`-ffp-contract=off`) and multiply-then-add instead of `v_fma`
+  in the SIMD kernels. Baseline x86-64 results are unchanged.
+
+### Changed — results (golden tolerances unchanged, no re-capture)
+- The Simplex scores a warp that samples under 90% of the subset as the worst
+  (`tuning::kMinValidPixelFraction`, IC-GN's floor): near an image edge it
+  could pass its gate on a few surviving pixels and hand IC-GN a seed it then
+  rejected.
+- The coarse integer search before the translation Simplex ranks offsets by a
+  ZNSSD over its sample, leaving out Ghost-Wall and off-image samples; raw SSD
+  was pulled off by an exposure change.
+- A Simplex rescue keeps the better of the two IC-GN runs instead of always
+  the second.
+- Sample positions are summed in double and rounded once (about 1e-3 px of
+  rounding at 8000 px in float).
+
+### Fixed — image I/O
+- Masks: a non-8-bit mask is boolean (nonzero included). An all-zero 16-bit
+  or bool mask used to be stretched to 128 (everything included); a NumPy
+  uint8 0/1 mask excluded every pixel. 8-bit masks keep the `< 128` rule.
+- `to_gray8` maps a non-8-bit image from its 0.1th to 99.9th percentile, so a
+  hot pixel no longer collapses the speckle to a few grey levels.
+- Images over 2^28 pixels are refused, before decoding where the header gives
+  the size (PNG, JPEG, BMP, TIFF); `image_dimensions` reads those headers
+  instead of decoding the image in colour. Raw-buffer sizes are checked in
+  64 bits.
+
+### Fixed — adapters
+- C ABI: one call at a time per handle (a nested call returns
+  `SEMPER_ERR_INIT`); `semper_set_reference` / `semper_incremental_init`
+  release the old state first; negative `out_capacity` is `SEMPER_ERR_INIT`;
+  `info` written only on success; ELF exports limited to `semper_*`.
+- JNI: no JNI call with an exception pending (`getPreviewFromBytes`,
+  `getImageDimensions`); string chars released on every path; a locking export
+  called from the progress callback fails instead of hanging; metrics and info
+  arrays written only on success; `initializeReference` releases the old
+  reference first; legacy-package forwarders for the three incremental exports.
+- Python: Ctrl-C cancels a solve; an exception raised by `progress` cancels the
+  solve and is raised; a non-callable `progress` is a `TypeError`; calling the
+  object from its own progress callback raises instead of deadlocking; the GIL
+  is released while the reference is prepared; output buffers beyond the
+  solver's int capacity are refused and invalid parameters no longer allocate
+  the whole grid; `info` is empty on an error; `DicError` survives pickling.
+
+### CI
+- `dic_tests` fails when a filter matches no test; `ctest` runs the suite and
+  the C ABI binaries; UBSan halts on the first report and includes
+  `float-cast-overflow`; the golden corpora run (without the numeric
+  comparison) under the sanitizers.
+- New: the C ABI and the Python module under ASan + UBSan; the host suite
+  against the vendored OpenCV that ships (the system-OpenCV jobs paired 4.14
+  headers with 4.6 libraries); the C++ example is built; every exported
+  `semper_*` and `Java_*` symbol is checked against a golden list.
+- Tests build with the libraries' flags (`-O3`; MSVC `/fp:precise`). One
+  long-chain rms bound in `Incremental.Rotation90_200Frames_TracksTheTurningRoi`
+  (N = 10, 4x4) moved from 0.20 to 0.25 px: 0.175 px at `-O2`, 0.208 px at
+  `-O3`, with the same share within 0.5 px.
+- Actions pinned to commit SHAs; read-only token; runs on `main` are not
+  cancelled by the next push; pip installs pinned; fail-closed tool checks;
+  wheels fail on a missing sparse checkout or an empty wheelhouse, and the
+  macOS wheels find (and require) OpenMP.
+
+### Docs
+- MATHEMATICS: the reported score is the per-pixel mean ZNSSD (so
+  `2(1 - ZNCC)` and the 0.15 gate hold for it); IC-GN and Simplex iteration
+  limits (50, 100); the VSG fit is a plane with an explicit inverse and an
+  rcond gate, not a quadratic. `semper_c.h`: `exy` is the tensor component.
+  CONTRACT: the AKAZE starting scale is history-dependent; the JNI thread
+  count sentence matched no code.
+
 ### Tests
 - The Android JNI adapter runs under the sanitizers. The `JniAdapter` suite
   compiles `adapters/android/jni/SemperJNI.cpp` into `dic_tests` against the

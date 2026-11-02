@@ -121,6 +121,8 @@ namespace dictest {
             } catch (std::exception &e) {
                 report_failure("<exception>", 0,
                                std::string("unhandled exception: ") + e.what());
+            } catch (...) {
+                report_failure("<exception>", 0, "unhandled exception of a non-std type");
             }
 
             if (failures() == 0) {
@@ -136,6 +138,12 @@ namespace dictest {
         std::printf("\n========================================\n");
         std::printf("  %d test(s) run: %d passed, %d failed\n", total, passed, failed);
         std::printf("========================================\n");
+        // A filter that matches nothing is a mistake (a renamed test, a typo in
+        // a CI shard list), not a pass: it used to exit 0 having run nothing.
+        if (total == 0) {
+            std::printf("  no test matched the filter '%s'\n", filter ? filter : "");
+            return 1;
+        }
         return failed == 0 ? 0 : 1;
     }
 

@@ -198,6 +198,43 @@ static void test_strain_window_guard(uint8_t* ref, uint8_t* def) {
     semper_destroy(eng);
 }
 
+/* ---- One call at a time per handle (v0.7.0): a call from inside the
+ *      progress callback is refused, not run against the solve's state;
+ *      a negative capacity is an argument error ---- */
+struct reentry_probe {
+    semper_engine* eng;
+    const uint8_t* ref;
+    int calls;
+    int refused;
+};
+
+static void reentry_cb(int pct, void* user) {
+    struct reentry_probe* r = (struct reentry_probe*)user;
+    (void)pct;
+    r->calls++;
+    if (semper_set_reference(r->eng, r->ref, (size_t)W * H, NULL, 0, W, H) == SEMPER_ERR_INIT)
+        r->refused++;
+}
+
+static void test_one_call_per_handle(uint8_t* ref, uint8_t* def) {
+    semper_engine* eng = semper_create();
+    CHECK(semper_set_reference(eng, ref, (size_t)W * H, NULL, 0, W, H) == 0);
+    semper_params p = valid_params();
+    float out[8 * 64];
+    float metrics[SEMPER_METRICS_LEN];
+    CHECK(semper_run(eng, def, (size_t)W * H, NULL, 0, &p, out, -8,
+                     metrics, SEMPER_METRICS_LEN, NULL, NULL) == SEMPER_ERR_INIT);
+    struct reentry_probe r = {eng, ref, 0, 0};
+    int n = semper_run(eng, def, (size_t)W * H, NULL, 0, &p, out, 8 * 64,
+                       metrics, SEMPER_METRICS_LEN, reentry_cb, &r);
+    CHECK(n >= 0);
+    CHECK(r.calls > 0);
+    CHECK(r.refused == r.calls);   /* every nested call refused */
+    /* The handle is free again once the call has returned. */
+    CHECK(semper_set_reference(eng, ref, (size_t)W * H, NULL, 0, W, H) == 0);
+    semper_destroy(eng);
+}
+
 /* ---- Capacity-drop rule (Frozen): never overflow; excess points dropped ---- */
 static void test_capacity_rule(uint8_t* ref, uint8_t* def) {
     semper_engine* eng = semper_create();
@@ -383,6 +420,7 @@ int main(void) {
 
     test_run_null_guards(def);
     test_set_reference_guards(ref);
+    test_one_call_per_handle(ref, def);
     test_degenerate_roi(ref, def);
     test_param_validation(ref, def);
     test_strain_window_guard(ref, def);

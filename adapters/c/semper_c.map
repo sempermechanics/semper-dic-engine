@@ -1,0 +1,10 @@
+/* ELF export list for libsemper_c: the C ABI and nothing else. -fvisibility=hidden
+   already hides the engine, but template instantiations from system headers
+   (libstdc++, OpenCV) keep default visibility and would otherwise be exported.
+   CI diffs the full export list against tests/c/abi_symbols.txt. */
+{
+  global:
+    semper_*;
+  local:
+    *;
+};

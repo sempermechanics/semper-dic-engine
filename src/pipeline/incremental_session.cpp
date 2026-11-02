@@ -107,26 +107,32 @@ struct IncrementalSession::Impl {
                 float* metrics, int metrics_len, CancelToken& cancel,
                 ProgressCallback on_progress, IncrementalFrameInfo* info);
 
-    void move_reference(FieldCapture &cap, const std::vector<float> &U,
-                        const std::vector<float> &V,
-                        const std::vector<unsigned char> &valid, int new_ref_index) {
-        Ubase = U;
-        Vbase = V;
-        alive = valid;
+    // The state a reference update installs. It is built in full before any
+    // of it is, because building it can throw (bad_alloc, cv::Exception) and a
+    // frame that fails must leave the session as it was (CONTRACT: errors
+    // leave the session unchanged, so the same frame can be submitted again).
+    struct NextReference {
+        std::vector<float> Ubase, Vbase;
+        std::vector<unsigned char> alive;
+        cv::Mat mask_k;
+        FullFieldParams params_k;
+    };
+
+    // The reference moved to the frame just solved. U/V/valid are that
+    // frame's totals on the frame-0 grid.
+    NextReference prepare_reference(const std::vector<float> &U, const std::vector<float> &V,
+                                    const std::vector<unsigned char> &valid) const {
+        NextReference r;
+        r.Ubase = U;
+        r.Vbase = V;
+        r.alive = valid;
 
         const int half = params.field.subset_size / 2;
         const int margin = (tuning::kIncMaskExtrapCells + 1) * grid0.step + half;
-        mask_k = warp_material_mask(material_mask0, grid0, Ubase, Vbase, alive, margin);
-        cache.adopt(std::move(cap.deformed), std::move(cap.deformed_gray), mask_k);
-        // The AKAZE features were detected on this very image as the deformed
-        // frame: the next solve reuses them instead of detecting them again.
-        if (cap.akaze_deformed.usable()) {
-            if (!cache.precompute) cache.precompute = std::make_unique<RefPrecompute>();
-            cache.precompute->akaze_handover = std::move(cap.akaze_deformed);
-        }
+        r.mask_k = warp_material_mask(material_mask0, grid0, r.Ubase, r.Vbase, r.alive, margin);
 
-        params_k = params.field;
-        const cv::Rect bb = cv::boundingRect(mask_k);
+        r.params_k = params.field;
+        const cv::Rect bb = cv::boundingRect(r.mask_k);
         // The new grid spans where the tracked frame-0 nodes now sit, plus one
         // step on the far sides: the grid stops at rect + (n-1)*step, which
         // would otherwise leave the last strip of points without a cell to
@@ -138,9 +144,9 @@ struct IncrementalSession::Impl {
         for (int j = 0; j < grid0.gridH; ++j) {
             for (int i = 0; i < grid0.gridW; ++i) {
                 const size_t n = (size_t)j * grid0.gridW + i;
-                if (!alive[n]) continue;
-                const float x = grid0.rect_x + i * grid0.step + Ubase[n];
-                const float y = grid0.rect_y + j * grid0.step + Vbase[n];
+                if (!r.alive[n]) continue;
+                const float x = grid0.rect_x + i * grid0.step + r.Ubase[n];
+                const float y = grid0.rect_y + j * grid0.step + r.Vbase[n];
                 min_x = std::min(min_x, x); max_x = std::max(max_x, x);
                 min_y = std::min(min_y, y); max_y = std::max(max_y, y);
             }
@@ -152,10 +158,10 @@ struct IncrementalSession::Impl {
                                  (int)std::ceil(max_y) - y0 + grid0.step)
                         & cv::Rect(0, 0, width, height);
         }
-        params_k.rect_x = grid_rect.x;
-        params_k.rect_y = grid_rect.y;
-        params_k.rect_w = grid_rect.width;
-        params_k.rect_h = grid_rect.height;
+        r.params_k.rect_x = grid_rect.x;
+        r.params_k.rect_y = grid_rect.y;
+        r.params_k.rect_w = grid_rect.width;
+        r.params_k.rect_h = grid_rect.height;
         // The increment solve's own strain is never reported (frames are
         // packed on the frame-0 grid, with the frame-0 window), but its
         // window must still pass validate_params on this grid, which can be
@@ -163,12 +169,29 @@ struct IncrementalSession::Impl {
         // A window past the bound would only have emptied that solve's
         // packing anyway; capping it changes nothing the caller sees except
         // that frame's metrics slots 1 and 20.
-        params_k.strain_window = (int)std::min<int64_t>(params_k.strain_window,
-                                                        max_strain_window(params_k));
-        if (bb.area() == 0) std::fill(alive.begin(), alive.end(), 0);
-        ref_index = new_ref_index;
-        frames_since_update = 0;
-        ref_reported = -1;
+        r.params_k.strain_window = (int)std::min<int64_t>(r.params_k.strain_window,
+                                                          max_strain_window(r.params_k));
+        if (bb.area() == 0) std::fill(r.alive.begin(), r.alive.end(), 0);
+        return r;
+    }
+
+    // Nothing left to follow on a moved reference: no solve, no points. The
+    // caller's buffers still describe this frame -- zeroed metrics, not the
+    // previous frame's -- and progress still ends at 100.
+    int nothing_to_follow(IncrementalFrameInfo fi, float *metrics, int metrics_len,
+                          const ProgressCallback &on_progress, IncrementalFrameInfo *info) {
+        frame_count++;
+        fi.frame0_points = std::max(frame0_points, 0);
+        if (info) *info = fi;
+        if (metrics != nullptr) {
+            std::fill_n(metrics, metrics_prefix_len(metrics_len), 0.0f);
+        }
+        if (on_progress) {
+            try { on_progress(100); } catch (...) {
+                LOGE("on_progress(100) callback threw; ignoring");
+            }
+        }
+        return 0;
     }
 };
 
@@ -247,6 +270,7 @@ int IncrementalSession::init(const cv::Mat& ref_gray, const cv::Mat& roi_mask,
 int IncrementalSession::process_frame(const cv::Mat& def_gray, float* output, int output_capacity,
                                       float* metrics, int metrics_len, CancelToken& cancel,
                                       ProgressCallback on_progress, IncrementalFrameInfo* info) {
+    cancel.enter();
     return impl_ ? impl_->process(def_gray, output, output_capacity, metrics, metrics_len,
                                   cancel, std::move(on_progress), info)
                  : -3;
@@ -255,8 +279,10 @@ int IncrementalSession::process_frame(const cv::Mat& def_gray, float* output, in
 int IncrementalSession::process_frame(const cv::Mat& def_gray, float* output, int output_capacity,
                                       float* metrics, int metrics_len,
                                       ProgressCallback on_progress, IncrementalFrameInfo* info) {
+    CancelToken& cancel = detail::global_cancel_token();
+    cancel.enter();
     return impl_ ? impl_->process(def_gray, output, output_capacity, metrics, metrics_len,
-                                  detail::global_cancel_token(), std::move(on_progress), info)
+                                  cancel, std::move(on_progress), info)
                  : -3;
 }
 
@@ -277,22 +303,8 @@ int IncrementalSession::Impl::process(const cv::Mat& def_gray, float* output, in
     const GridGeom& g0 = s.grid0;
     const size_t n0 = (size_t)g0.gridW * g0.gridH;
 
-    // Nothing left to follow on a moved reference: no solve, no points. The
-    // caller's buffers still describe this frame -- zeroed metrics, not the
-    // previous frame's -- and progress still ends at 100.
     if (s.ref_index > 0 && s.alive_count() == 0) {
-        s.frame_count++;
-        fi.frame0_points = std::max(s.frame0_points, 0);
-        if (info) *info = fi;
-        if (metrics != nullptr) {
-            std::fill_n(metrics, metrics_prefix_len(metrics_len), 0.0f);
-        }
-        if (on_progress) {
-            try { on_progress(100); } catch (...) {
-                LOGE("on_progress(100) callback threw; ignoring");
-            }
-        }
-        return 0;
+        return s.nothing_to_follow(fi, metrics, metrics_len, on_progress, info);
     }
 
     FieldCapture cap;
@@ -307,6 +319,8 @@ int IncrementalSession::Impl::process(const cv::Mat& def_gray, float* output, in
     std::vector<AnchorNeed> need(n0, AnchorNeed::kKeep);   // for measured nodes
     int coasting = 0;
     int written = 0;
+    // The frame-0 scan's node count, known once the first frame has solved.
+    int frame0_points = s.frame0_points;
 
     // A node the solve did not reach coasts on the plane through the solved
     // increments around it, unreported, until the solve reaches it again or
@@ -348,7 +362,7 @@ int IncrementalSession::Impl::process(const cv::Mat& def_gray, float* output, in
         V = nf.v;
         valid = nf.valid;
         carried = valid;
-        if (s.frame0_points < 0) s.frame0_points = cap.attempted;
+        if (frame0_points < 0) frame0_points = cap.attempted;
         const GapDistance gd = gap_distance(nf);
         for (size_t i = 0; i < n0; ++i) {
             if (valid[i]) {
@@ -362,7 +376,19 @@ int IncrementalSession::Impl::process(const cv::Mat& def_gray, float* output, in
         s.scratch.resize((size_t)std::max(gw * gh, 1) * 8);
         const int rc = run_full_field_impl(s.cache, def_gray, s.mask_k, s.params_k,
                                            s.scratch.data(), (int)s.scratch.size(),
-                                           metrics, metrics_len, std::move(on_progress), &cap, cancel);
+                                           metrics, metrics_len, on_progress, &cap, cancel);
+        if (rc == -2) {
+            // No node of this reference's grid can be solved: the tracked
+            // material has moved into the border margin, or the grid is
+            // narrower than a step. That depends on the reference alone, so
+            // every later frame returned -2 as well and the session could not
+            // move on. The nodes cannot be followed: they are dropped, as at
+            // an update that keeps none, and the frame reports no points.
+            fi.lost_this_frame = s.alive_count();
+            std::fill(s.alive.begin(), s.alive.end(), 0);
+            s.anchors.clear();
+            return s.nothing_to_follow(fi, metrics, metrics_len, on_progress, info);
+        }
         if (rc < 0) return rc;
         const NodeField inc = node_field_from_capture(cap);
         const GapDistance gd = gap_distance(inc);
@@ -436,7 +462,7 @@ int IncrementalSession::Impl::process(const cv::Mat& def_gray, float* output, in
     }
 
     for (unsigned char v : carried) fi.tracked_points += v ? 1 : 0;
-    fi.frame0_points = std::max(s.frame0_points, 0);
+    fi.frame0_points = std::max(frame0_points, 0);
 
     // Early update on a drop in the points reported (written), not in the
     // nodes sampled: a sparse loss of increment nodes still samples through
@@ -446,43 +472,76 @@ int IncrementalSession::Impl::process(const cv::Mat& def_gray, float* output, in
     // frame tries again against the same reference. Until a frame on this
     // reference has set the count (always, with N = 1), the count compared
     // with is the one the reference itself reported when it was solved, so a
-    // failed first frame does not become the count either.
-    const int base = s.ref_reported >= 0 ? s.ref_reported : s.adopted_reported;
+    // failed first frame does not become the count either. Frame 0 reported
+    // nothing (it was never solved): there the count is its grid's node count
+    // after the boundary and mask scan. Without it a frame 1 that solved no
+    // node, or a handful, became the reference, and every later frame
+    // followed nothing.
+    int ref_reported = s.ref_reported;
+    const int base = ref_reported >= 0 ? ref_reported
+                   : s.adopted_reported >= 0 ? s.adopted_reported
+                   : frame0_points;
     if (base > 0 && (float)written < tuning::kIncUpdateMinReported * (float)base) {
         will_update = false;
     } else if (N > 1) {
-        if (s.ref_reported < 0) {
-            s.ref_reported = written;
-        } else if ((float)written < (1.0f - tuning::kIncEarlyUpdateDrop) * (float)s.ref_reported) {
+        if (ref_reported < 0) {
+            ref_reported = written;
+        } else if ((float)written < (1.0f - tuning::kIncEarlyUpdateDrop) * (float)ref_reported) {
             will_update = true;
         }
     }
 
-    s.frame_count++;
     if (will_update) {
         const int before = (s.ref_index == 0) ? fi.frame0_points : s.alive_count();
         // Anchors are cut on the frame about to become the reference, where
         // a measured node sits at X0 + U. A coasting node keeps the one it has.
+        // Built on copies: nothing of the session changes until every step
+        // that can throw has run.
+        std::vector<float> coast_travel = s.coast_travel;
+        auto anchors = s.anchors;
         for (size_t i = 0; i < n0; ++i) {
-            s.coast_travel[i] = (carried[i] && !valid[i]) ? s.coast_travel[i] + coast_step[i] : 0.0f;
+            coast_travel[i] = (carried[i] && !valid[i]) ? coast_travel[i] + coast_step[i] : 0.0f;
             if (!carried[i] || (valid[i] && need[i] == AnchorNeed::kDrop)) {
-                s.anchors.erase(i);
+                anchors.erase(i);
             } else if (valid[i] && need[i] == AnchorNeed::kRefresh) {
                 CoastAnchor a;
                 if (make_anchor(cap.deformed_gray, g0.rect_x + (int)(i % g0.gridW) * g0.step + U[i],
                                 g0.rect_y + (int)(i / g0.gridW) * g0.step + V[i], subset_size, a)) {
-                    s.anchors[i] = std::move(a);
+                    anchors[i] = std::move(a);
                 }
             }
         }
-        s.move_reference(cap, U, V, carried, s.frame_count);
+        Impl::NextReference next = s.prepare_reference(U, V, carried);
+        // The frame just solved becomes the reference as the solver prepared
+        // it, with the AKAZE features detected on it as the deformed frame
+        // (the next solve reuses them instead of detecting them again). The
+        // last step that can throw; it leaves the cache as it was if it does.
+        adopt_reference(s.cache, std::move(cap.deformed), std::move(cap.deformed_gray), next.mask_k,
+                        std::move(cap.akaze_deformed));
+
+        // Commit: moves and swaps only.
+        s.coast_travel.swap(coast_travel);
+        s.anchors.swap(anchors);
+        s.Ubase.swap(next.Ubase);
+        s.Vbase.swap(next.Vbase);
+        s.alive.swap(next.alive);
+        s.mask_k = std::move(next.mask_k);
+        s.params_k = next.params_k;
+        s.frame_count++;
+        s.ref_index = s.frame_count;
+        s.frames_since_update = 0;
+        s.ref_reported = -1;
         s.adopted_reported = written;
+        s.frame0_points = frame0_points;
         fi.reference_updated = true;
         fi.lost_this_frame = std::max(0, before - s.alive_count());
         LOGD("Reference moved to frame %d: %d of %d frame-0 nodes tracked (%d coasting, %d re-anchored)",
              s.ref_index, s.alive_count(), fi.frame0_points, coasting, reanchored);
     } else {
+        s.frame_count++;
         s.frames_since_update++;
+        s.ref_reported = ref_reported;
+        s.frame0_points = frame0_points;
     }
 
     if (info) *info = fi;

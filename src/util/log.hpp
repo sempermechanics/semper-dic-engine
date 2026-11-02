@@ -20,9 +20,21 @@
 #endif
 #elif defined(SEMPER_HOST_LOG)
 #include <cstdio>
+// One line, one write: formatted whole, then handed to stderr in a single
+// fputs. Three fprintf calls per line interleaved between OpenMP workers --
+// one thread's tag in front of another's message.
+#define SEMPER_HOST_LOG_LINE(...)                                              \
+    do {                                                                       \
+        char semper_log_msg_[1024];                                            \
+        std::snprintf(semper_log_msg_, sizeof semper_log_msg_, __VA_ARGS__);   \
+        char semper_log_line_[1100];                                           \
+        std::snprintf(semper_log_line_, sizeof semper_log_line_, "[%s] %s\n",  \
+                      LOG_TAG, semper_log_msg_);                               \
+        std::fputs(semper_log_line_, stderr);                                  \
+    } while (0)
 #ifndef LOGD
 #if defined(SEMPER_HOST_VERBOSE)
-#define LOGD(...) do { std::fprintf(stderr, "[%s] ", LOG_TAG); std::fprintf(stderr, __VA_ARGS__); std::fprintf(stderr, "\n"); } while (0)
+#define LOGD(...) SEMPER_HOST_LOG_LINE(__VA_ARGS__)
 #else
 // Never runs, but still uses its arguments: a value kept only for the trace
 // must not turn into an unused-variable warning (-Werror builds).
@@ -30,7 +42,7 @@
 #endif
 #endif
 #ifndef LOGE
-#define LOGE(...) do { std::fprintf(stderr, "[%s] ", LOG_TAG); std::fprintf(stderr, __VA_ARGS__); std::fprintf(stderr, "\n"); } while (0)
+#define LOGE(...) SEMPER_HOST_LOG_LINE(__VA_ARGS__)
 #endif
 #else
 #ifndef LOGD

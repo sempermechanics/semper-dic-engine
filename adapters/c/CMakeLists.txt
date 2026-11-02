@@ -23,6 +23,20 @@ set_target_properties(semper_c PROPERTIES
 if(NOT MSVC)
     target_compile_options(semper_c PRIVATE -O3 -fPIC -fvisibility=hidden)
 endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Android")
+    target_link_options(semper_c PRIVATE
+            "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/semper_c.map")
+    set_property(TARGET semper_c APPEND PROPERTY LINK_DEPENDS
+            "${CMAKE_CURRENT_SOURCE_DIR}/semper_c.map")
+endif()
+# The adapter takes raw pointers and capacities from its callers: instrument it
+# too when the libraries are (CI's sanitized C SDK job), not just what it links.
+set(_semper_c_san "")
+if(SEMPER_SANITIZER AND NOT MSVC)
+    set(_semper_c_san -fsanitize=${SEMPER_SANITIZER} -fno-sanitize-recover=all)
+    target_compile_options(semper_c PRIVATE ${_semper_c_san} -g -fno-omit-frame-pointer)
+    target_link_options(semper_c PRIVATE ${_semper_c_san})
+endif()
 
 # ---------------------------------------------------------------------------
 # Install + a find_package(Semper) config so downstreams can link Semper::semper_c
@@ -65,9 +79,13 @@ install(FILES
 if(EXISTS "${SEMPER_ROOT}/tests/c/smoke.c")
     add_executable(semper_c_smoke ${SEMPER_ROOT}/tests/c/smoke.c)
     target_link_libraries(semper_c_smoke PRIVATE semper_c)
+    # A sanitized libsemper_c needs the runtime loaded first: link it here too.
+    target_compile_options(semper_c_smoke PRIVATE ${_semper_c_san})
+    target_link_options(semper_c_smoke PRIVATE ${_semper_c_san})
     target_include_directories(semper_c_smoke PRIVATE ${SEMPER_PUBLIC_INCLUDE})
     # smoke.c is C; link the C++ runtime pulled in by semper_c.
     set_target_properties(semper_c_smoke PROPERTIES LINKER_LANGUAGE CXX)
+    add_test(NAME semper_c_smoke COMMAND semper_c_smoke)
 endif()
 
 # C ABI contract binary — asserts the Frozen surface (error codes, argument
@@ -76,9 +94,12 @@ endif()
 if(EXISTS "${SEMPER_ROOT}/tests/c/contract.c")
     add_executable(semper_c_contract ${SEMPER_ROOT}/tests/c/contract.c)
     target_link_libraries(semper_c_contract PRIVATE semper_c)
+    target_compile_options(semper_c_contract PRIVATE ${_semper_c_san})
+    target_link_options(semper_c_contract PRIVATE ${_semper_c_san})
     target_include_directories(semper_c_contract PRIVATE ${SEMPER_PUBLIC_INCLUDE})
     set_target_properties(semper_c_contract PROPERTIES
             LINKER_LANGUAGE CXX   # link the C++ runtime pulled in by semper_c
             C_STANDARD 11
             C_STANDARD_REQUIRED ON)
+    add_test(NAME semper_c_contract COMMAND semper_c_contract)
 endif()

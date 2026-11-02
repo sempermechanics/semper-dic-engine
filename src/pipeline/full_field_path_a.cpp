@@ -89,6 +89,8 @@ void run_path_a(
                     }
 
                     if (res.status == 0 && res.correlation_score <= tuning::kCorrAccept) {
+                        // The order this run's workers finished in: debug output
+                        // only, and not reproducible across runs or thread counts.
                         int order = ctx.compute_order_counter.fetch_add(1, std::memory_order_relaxed);
                         // 🚀 FIX: Passed res.iters at the end instead of icgn_iters_used
                         resultGrid[y][x] = {(float)realX, (float)realY, res.u, res.v, res.ux, res.uy, res.vx, res.vy,

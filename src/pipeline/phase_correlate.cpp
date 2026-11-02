@@ -145,6 +145,9 @@ bool phase_correlate_roi(const PhaseCorrRef &ref, const cv::Mat &def,
     cv::Scalar mean, stddev;
     cv::meanStdDev(def32, mean, stddev);
     if (!(stddev[0] > 1e-3)) return false;
+    // Nor does a blank reference crop: its cross-power spectrum is 0/0.
+    cv::meanStdDev(ref.ref32, mean, stddev);
+    if (!(stddev[0] > 1e-3)) return false;
     // cv::phaseCorrelate multiplies the window into its inputs IN PLACE when
     // their size is already DFT-optimal (no padding copy), so the stored crop
     // must not be handed over directly or every reuse would window it again.

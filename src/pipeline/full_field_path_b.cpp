@@ -171,6 +171,11 @@ void run_path_b(
 
     std::vector<Semper::SeedNode> boundary_seeds;
     std::vector<Semper::SeedNode> global_seeds;
+    // Path C's seed: the grid centre on the global shift, or the node Path C's
+    // search converged on.
+    const Semper::SeedNode path_c_seed(path_c_seed_x, path_c_seed_y, globalU, globalV,
+                                       0.f, 0.f, 0.f, 0.f, 0.f);
+    bool path_c_seed_queued = false;
 
     const int dx4[] = {1, -1, 0, 0}, dy4[] = {0, 0, 1, -1};
     for (int y = 0; y < gridH; ++y) {
@@ -208,11 +213,22 @@ void run_path_b(
 
         if (candidates.empty()) {
             // 🚀 PRIORITY 4: Use the intelligently found Smart Seed from Path C
-            global_seeds.push_back(Semper::SeedNode(path_c_seed_x, path_c_seed_y, globalU, globalV, 0.f, 0.f, 0.f, 0.f, 0.f));
+            global_seeds.push_back(path_c_seed);
+            path_c_seed_queued = true;
         } else {
+            // Smallest displacement first, by whole pixels, then nearest the
+            // grid centre. The comparison used to treat magnitudes within 1 px
+            // as equal, which is not transitive (0, 0.9, 1.8 px with distances
+            // 3, 2, 1 order in a cycle): std::sort's behaviour is undefined on
+            // such a comparator, and libstdc++ can run past the range. Whole
+            // pixels give the same preference as a strict weak ordering; the
+            // grid indices make the order total.
             std::sort(candidates.begin(), candidates.end(), [](const SeedCandidate& a, const SeedCandidate& b) {
-                if (std::abs(a.displacement_mag - b.displacement_mag) > 1.f) return a.displacement_mag < b.displacement_mag;
-                return a.dist_from_center < b.dist_from_center;
+                const float ma = std::floor(a.displacement_mag), mb = std::floor(b.displacement_mag);
+                if (ma != mb) return ma < mb;
+                if (a.dist_from_center != b.dist_from_center) return a.dist_from_center < b.dist_from_center;
+                if (a.iy != b.iy) return a.iy < b.iy;
+                return a.ix < b.ix;
             });
             int seeds_pushed = 0;
             for (const auto& c : candidates) {
@@ -258,6 +274,24 @@ void run_path_b(
         t.gu = seed.u; t.gv = seed.v;
         solve_cell(ctx, engines[0], subsets[0], t);
         commit_cell(ctx, t, resultGrid, stats_pathB, q);
+    }
+    // Anchor candidates are kept anchors that did not clear the result gate,
+    // and they can fail it again here: then the flood had nothing to start
+    // from and the solve returned no points as a success, with Path C's seed
+    // -- which may have converged -- never tried. It gets its turn now, as it
+    // does when there is no candidate at all.
+    if (q.empty() && !global_seeds.empty() && !path_c_seed_queued) {
+        if (ctx.cancel.requested()) return;
+        const int flat = path_c_seed.y_idx * gridW + path_c_seed.x_idx;
+        if (path_c_seed.x_idx >= 0 && path_c_seed.x_idx < gridW && path_c_seed.y_idx >= 0 &&
+            path_c_seed.y_idx < gridH && !claimed[flat]) {
+            claimed[flat] = 1;
+            CellTask t;
+            t.x = path_c_seed.x_idx; t.y = path_c_seed.y_idx;
+            t.gu = path_c_seed.u; t.gv = path_c_seed.v;
+            solve_cell(ctx, engines[0], subsets[0], t);
+            commit_cell(ctx, t, resultGrid, stats_pathB, q);
+        }
     }
 
     // ---- Round bookkeeping. Everything below is guarded by `mtx`. ----------

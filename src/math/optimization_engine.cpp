@@ -8,6 +8,50 @@
 
 namespace Semper {
 
+    namespace {
+
+        // A sample's position in the deformed image: the subset centre plus
+        // the warped offset. Summed in double and rounded to float once: in
+        // float the three roundings fell at the magnitude of the centre --
+        // about 1e-3 px on an 8000 px frame, comparable to the field's own
+        // noise. (-ffast-math may reorder the sum, but in double it no
+        // longer matters.)
+        inline float warped(float c, float a, float b, float t, float x, float y) {
+            return (float)((double)c + ((double)a * x + (double)b * y + (double)t));
+        }
+
+        // DICe's explicit 4-pixel guard, with its rounding: the pixel a warped
+        // point rounds to must be at least 4 px inside the image. Written on
+        // floats -- the old (int) casts were undefined for a NaN or huge
+        // warp -- and exactly equivalent for every finite point below 2^23:
+        // for x >= 0 the rounded pixel is floor(x + 0.5), and x + 0.5f is exact.
+        inline bool inside_guard(float x, float y, int width, int height) {
+            const float rx = x + 0.5f, ry = y + 0.5f;
+            return rx >= 4.0f && rx < (float)(width - 4) &&
+                   ry >= 4.0f && ry < (float)(height - 4);
+        }
+
+        Eigen::Matrix3f warp_matrix(float u, float v, float ux, float uy, float vx, float vy) {
+            Eigen::Matrix3f W = Eigen::Matrix3f::Identity();
+            W(0, 0) = 1.0f + ux;
+            W(0, 1) = uy;
+            W(0, 2) = u;
+            W(1, 0) = vx;
+            W(1, 1) = 1.0f + vy;
+            W(1, 2) = v;
+            return W;
+        }
+
+        AnalysisResult result_from(const Eigen::Matrix3f &W, int status, float score, int iters,
+                                   int invalid_ref_pixels) {
+            AnalysisResult r = {W(0, 2), W(1, 2), W(0, 0) - 1.0f, W(0, 1), W(1, 0), W(1, 1) - 1.0f,
+                                status, score, iters};
+            r.invalid_ref_pixels = invalid_ref_pixels;
+            return r;
+        }
+
+    } // namespace
+
     AnalysisResult OptimizationEngine::calculate_deformation(
             const SubsetData &subset, const Image &def_img, float guess_u,
             float guess_v, float guess_ux, float guess_uy, float guess_vx, float guess_vy, InitializationMode init_mode) {
@@ -58,8 +102,16 @@ namespace Semper {
                 AnalysisResult start_guess = {guess_u, guess_v, guess_ux, guess_uy, guess_vx, guess_vy, 0, 1.0f};
                 AnalysisResult rescue_res = run_simplex(start_guess, false);
                 const int trigger_iters = res.iters;
-                res = run_icgn(rescue_res.u, rescue_res.v, rescue_res.ux, rescue_res.uy, rescue_res.vx, rescue_res.vy);
-                res.trigger_iters = trigger_iters;
+                AnalysisResult rescued = run_icgn(rescue_res.u, rescue_res.v, rescue_res.ux, rescue_res.uy,
+                                                  rescue_res.vx, rescue_res.vy);
+                rescued.trigger_iters = trigger_iters;
+                // The better of the two IC-GN runs. The rescue used to replace
+                // the first one whatever it ended on, so a run that stopped on
+                // the iteration budget with a passing score, followed by a
+                // rescue that ended worse, lost the node.
+                const bool first_better = res.status == 0 &&
+                        (rescued.status != 0 || res.correlation_score < rescued.correlation_score);
+                if (!first_better) res = rescued;
             }
         }
         return res;
@@ -69,23 +121,56 @@ namespace Semper {
                                                     const Image &def_img,
                                                     scalar_t &best_u,
                                                     scalar_t &best_v) {
-        float min_ssd = 1e20f;
-        int search_range = 15;
+        // Every 9th pixel of the subset, zero-mean and unit-variance on both
+        // sides: a ZNSSD over the sample, so the ranking follows the texture.
+        // Raw SSD ranked an offset by brightness as much -- an exposure change
+        // between the frames pulled the search off -- and counted Ghost-Wall
+        // reference pixels (-10) and samples off the image (read as 0) as if
+        // they were texture. Those are left out; an offset that keeps under
+        // half the sample, or samples a flat patch, is not a candidate.
+        const std::vector<bool> ref_valid = build_ref_valid(subset);
+        std::vector<float> r, d;
+        r.reserve(subset.x_offsets.size() / 9 + 1);
+        d.reserve(subset.x_offsets.size() / 9 + 1);
+        size_t sampled = 0;
+        for (size_t i = 0; i < subset.x_offsets.size(); i += 9) sampled++;
+        float best = 1e20f;
+        const int search_range = 15;
 
         for (int v = -search_range; v <= search_range; v += 2) {
             for (int u = -search_range; u <= search_range; u += 2) {
-                float sum_sq_diff = 0.0f;
+                r.clear();
+                d.clear();
                 for (size_t i = 0; i < subset.x_offsets.size(); i += 9) {
-                    float x = subset.cx + subset.x_offsets[i];
-                    float y = subset.cy + subset.y_offsets[i];
-                    float def_val = use_6x6_interpolator ?
-                                    def_img.interpolate_keys_fourth(x + (float)u, y + (float)v) :
-                                    def_img.interpolate_bicubic(x + (float)u, y + (float)v);
-                    float diff = subset.ref_intensities[i] - def_val;
-                    sum_sq_diff += diff * diff;
+                    if (!ref_valid[i]) continue;
+                    const float x = subset.cx + subset.x_offsets[i] + (float)u;
+                    const float y = subset.cy + subset.y_offsets[i] + (float)v;
+                    if (!inside_guard(x, y, def_img.width, def_img.height)) continue;
+                    r.push_back(subset.ref_intensities[i]);
+                    d.push_back(use_6x6_interpolator ? def_img.interpolate_keys_fourth(x, y)
+                                                     : def_img.interpolate_bicubic(x, y));
                 }
-                if (sum_sq_diff < min_ssd) {
-                    min_ssd = sum_sq_diff;
+                if (r.size() < 3 || 2 * r.size() < sampled) continue;
+                const float m = (float)r.size();
+                float mr = 0.0f, md = 0.0f;
+                for (size_t k = 0; k < r.size(); ++k) { mr += r[k]; md += d[k]; }
+                mr /= m;
+                md /= m;
+                float vr = 0.0f, vd = 0.0f;
+                for (size_t k = 0; k < r.size(); ++k) {
+                    vr += (r[k] - mr) * (r[k] - mr);
+                    vd += (d[k] - md) * (d[k] - md);
+                }
+                const float sr = std::sqrt(vr / m), sd = std::sqrt(vd / m);
+                if (!(sr > 1e-5f) || !(sd > 1e-5f)) continue;
+                float score = 0.0f;
+                for (size_t k = 0; k < r.size(); ++k) {
+                    const float e = (r[k] - mr) / sr - (d[k] - md) / sd;
+                    score += e * e;
+                }
+                score /= m;
+                if (score < best) {
+                    best = score;
                     best_u = static_cast<scalar_t>(u);
                     best_v = static_cast<scalar_t>(v);
                 }
@@ -93,39 +178,6 @@ namespace Semper {
         }
     }
 
-    namespace {
-
-        // DICe's explicit 4-pixel guard, with its rounding: the pixel a warped
-        // point rounds to must be at least 4 px inside the image. Written on
-        // floats -- the old (int) casts were undefined for a NaN or huge
-        // warp -- and exactly equivalent for every finite point below 2^23:
-        // for x >= 0 the rounded pixel is floor(x + 0.5), and x + 0.5f is exact.
-        inline bool inside_guard(float x, float y, int width, int height) {
-            const float rx = x + 0.5f, ry = y + 0.5f;
-            return rx >= 4.0f && rx < (float)(width - 4) &&
-                   ry >= 4.0f && ry < (float)(height - 4);
-        }
-
-        Eigen::Matrix3f warp_matrix(float u, float v, float ux, float uy, float vx, float vy) {
-            Eigen::Matrix3f W = Eigen::Matrix3f::Identity();
-            W(0, 0) = 1.0f + ux;
-            W(0, 1) = uy;
-            W(0, 2) = u;
-            W(1, 0) = vx;
-            W(1, 1) = 1.0f + vy;
-            W(1, 2) = v;
-            return W;
-        }
-
-        AnalysisResult result_from(const Eigen::Matrix3f &W, int status, float score, int iters,
-                                   int invalid_ref_pixels) {
-            AnalysisResult r = {W(0, 2), W(1, 2), W(0, 0) - 1.0f, W(0, 1), W(1, 0), W(1, 1) - 1.0f,
-                                status, score, iters};
-            r.invalid_ref_pixels = invalid_ref_pixels;
-            return r;
-        }
-
-    } // namespace
 
     // Batches interpolation 4 pixels at a time via interpolate_keys_fourth_x4
     // / interpolate_bicubic_x4 when 4 consecutive pixels are available and all
@@ -149,8 +201,8 @@ namespace Semper {
         while (i < n) {
             float x = subset.x_offsets_f[i];
             float y = subset.y_offsets_f[i];
-            float final_x = subset.cx + W(0, 0) * x + W(0, 1) * y + W(0, 2);
-            float final_y = subset.cy + W(1, 0) * x + W(1, 1) * y + W(1, 2);
+            float final_x = warped(subset.cx, W(0, 0), W(0, 1), W(0, 2), x, y);
+            float final_y = warped(subset.cy, W(1, 0), W(1, 1), W(1, 2), x, y);
 
             if (!inside_guard(final_x, final_y, def_img.width, def_img.height)) {
                 vals[i] = 0.0f;
@@ -168,8 +220,8 @@ namespace Semper {
                     size_t idx = i + static_cast<size_t>(k);
                     float xk = subset.x_offsets_f[idx];
                     float yk = subset.y_offsets_f[idx];
-                    float fxk = subset.cx + W(0, 0) * xk + W(0, 1) * yk + W(0, 2);
-                    float fyk = subset.cy + W(1, 0) * xk + W(1, 1) * yk + W(1, 2);
+                    float fxk = warped(subset.cx, W(0, 0), W(0, 1), W(0, 2), xk, yk);
+                    float fyk = warped(subset.cy, W(1, 0), W(1, 1), W(1, 2), xk, yk);
                     if (!inside_guard(fxk, fyk, def_img.width, def_img.height)) {
                         group_ok = false;
                         break;
@@ -288,7 +340,7 @@ namespace Semper {
             // valid_pixels becomes 0. We must abort BEFORE the division to prevent
             // a NaN injection that destroys the Newton-Raphson matrix.
             // DICe PARITY: 90% survival threshold.
-            if (valid_pixels < static_cast<int>(n * 0.90f)) return reject(iter);
+            if (valid_pixels < static_cast<int>(n * tuning::kMinValidPixelFraction)) return reject(iter);
 
             float def_mean = def_sum / static_cast<float>(valid_pixels);
             // ==============================================
@@ -424,9 +476,14 @@ namespace Semper {
                                                       warp_matrix(u, v, ux, uy, vx, vy),
                                                       ref_valid, buffer, valid, def_mean);
 
-        // === 🚀 PHASE 3 FIX: GUARD ZNSSD DIVISION BY ZERO ===
-        if (valid_pixels == 0) {
-            return 2.0f; // Return a terrible score so Simplex immediately rejects this guess
+        // Too few pixels to score: the worst score, as for none. With only
+        // "none" refused, the Simplex could walk to a shift near the image
+        // edge where a handful of surviving pixels matched (a mean ZNSSD near
+        // 0), pass its gate, and hand IC-GN a seed it then rejected
+        // (kMinValidPixelFraction, the same floor).
+        if (valid_pixels == 0 ||
+            valid_pixels < static_cast<int>(n * tuning::kMinValidPixelFraction)) {
+            return 2.0f;
         }
 
         def_mean /= static_cast<float>(valid_pixels);
@@ -512,8 +569,20 @@ namespace Semper {
 
         const float alpha = 1.0f, gamma = 2.0f, rho = 0.5f, sigma = 0.5f;
         for (int iter = 0; iter < 100; ++iter) { // 🚀 Increased to 100
+            // Vertices by score, written out as the insertion sort std::sort
+            // performs on a range this short (3 or 7), so the order is the
+            // same: at -O3 GCC cannot see n_pts <= 7 and reports std::sort's
+            // indexing as out of bounds of idx.
             int idx[7] = {0, 1, 2, 3, 4, 5, 6};
-            std::sort(idx, idx + n_pts, [&](int a, int b) { return y[a] < y[b]; });
+            for (int a = 1; a < n_pts; ++a) {
+                const int v = idx[a];
+                int b = a;
+                while (b > 0 && y[v] < y[idx[b - 1]]) {
+                    idx[b] = idx[b - 1];
+                    --b;
+                }
+                idx[b] = v;
+            }
 
             if (std::abs(y[idx[0]] - y[idx[n_pts - 1]]) < 1e-5f)
                 break;

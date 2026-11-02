@@ -209,6 +209,29 @@ TEST_CASE(Engine, AutoSearch_FindsLargeTranslation) {
     CHECK_NEAR(res.v, -8.3f, 0.05f);
 }
 
+// The coarse search itself under an exposure change. It ranked offsets by raw
+// SSD, so a gain and offset on the deformed frame could pull it onto a wrong
+// one, which the 2 px Simplex steps could not undo; it is a ZNSSD over its
+// sample now, invariant to a*I + b like the rest of the solve.
+TEST_CASE(Engine, AutoSearch_FindsLargeShiftUnderExposureChange) {
+    for (unsigned seed : {1234u, 77u, 2025u}) {
+        dictest::SpeckleField field(seed, W, H);
+        Image ref = dictest::make_reference_image(field, W, H);
+        Image def = dictest::make_deformed_image(field, W, H, centered(9.0f, -11.0f));
+        for (auto &v : def.intensities) v = 0.35f * v + 140.0f;   // darker, lifted
+        def.prepare_data(false);
+        SubsetData subset;
+        SubsetPrecomputer::precompute_subset(subset, ref, CX, CY, DIM);
+        REQUIRE(subset.is_initialized);
+        OptimizationEngine engine;
+        const AnalysisResult res = engine.calculate_deformation(subset, def, 0, 0, 0, 0, 0, 0,
+                                                                INIT_AUTO_SEARCH);
+        CHECK(res.status == 0);
+        CHECK_NEAR(res.u, 9.0f, 0.05f);
+        CHECK_NEAR(res.v, -11.0f, 0.05f);
+    }
+}
+
 // --- Photometric invariance: ZNSSD must ignore brightness/contrast ----
 TEST_CASE(Engine, ZnssdInvariantToBrightnessAndContrast) {
     const float u_true = 1.75f;

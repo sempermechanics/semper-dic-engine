@@ -17,6 +17,10 @@
 // =====================================================================
 #include "framework/test_framework.h"
 #include <semper/strain.hpp>
+#include <semper/tuning.hpp>
+#include "util/median.hpp"
+
+#include <limits>
 
 #include <cstdint>
 
@@ -220,4 +224,38 @@ TEST_CASE(Median, EvenCountAveragesMiddlePair) {
     float one[] = {7.0f};
     CHECK(Semper::util::median_inplace(one, 1) == 7.0f);
     CHECK(Semper::util::median_inplace(nullptr, 0) == 0.0f);
+}
+
+// A field the VSG fit cannot read keeps the sentinel everywhere instead of
+// dividing by a zero step (an infinite ceil cast to int) or reading past
+// vectors shorter than the grid they claim.
+TEST_CASE(StrainCalculator, ZeroStepOrShortVectors_KeepTheSentinel) {
+    Semper::DisplacementField d;
+    d.width = 4;
+    d.height = 3;
+    d.step = 0;
+    d.u.assign(12, 0.0f);
+    d.v.assign(12, 0.0f);
+    d.valid.assign(12, true);
+    Semper::StrainField s = Semper::StrainCalculator::compute_vsg_strain(d, 15);
+    REQUIRE(s.exx.size() == 12);
+    for (float e : s.exx) CHECK(e == Semper::tuning::kStrainUninitSentinel);
+
+    d.step = 5;
+    d.u.resize(5);   // shorter than 4 x 3
+    s = Semper::StrainCalculator::compute_vsg_strain(d, 15);
+    REQUIRE(s.exx.size() == 12);
+    for (float e : s.eyy) CHECK(e == Semper::tuning::kStrainUninitSentinel);
+}
+
+// nth_element on a range holding a NaN is undefined: `<` is not a strict weak
+// ordering there. NaNs are left out of the median.
+TEST_CASE(Median, NaNsAreLeftOut) {
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    float a[] = {3.0f, nan, 1.0f, 2.0f, nan};
+    CHECK(Semper::util::median_inplace(a, 5) == 2.0f);
+    float b[] = {nan, nan};
+    CHECK(Semper::util::median_inplace(b, 2) == 0.0f);
+    float c[] = {4.0f, 1.0f, 3.0f, 2.0f};
+    CHECK(Semper::util::median_inplace(c, 4) == 2.5f);
 }

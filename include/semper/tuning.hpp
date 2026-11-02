@@ -14,6 +14,11 @@ inline constexpr float kCorrAccept = 0.15f;
 
 /** Correlation score above which calculate_deformation may try simplex. */
 inline constexpr float kCorrSimplexTrigger = 0.4f;
+/** The share of a subset's pixels a warp must sample inside the image (and off
+ *  the Ghost Wall) for its score to count: IC-GN rejects below it, and the
+ *  Simplex scores such a warp as the worst (2.0), so it cannot walk to a shift
+ *  where a few surviving pixels happen to match. */
+inline constexpr float kMinValidPixelFraction = 0.90f;
 
 /** Simplex residual above which the point is marked failed. */
 inline constexpr float kSimplexFailScore = 0.1f;

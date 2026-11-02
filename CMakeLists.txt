@@ -10,6 +10,11 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(SemperOptions)
 
 set(SEMPER_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
+# float-cast-overflow is not part of -fsanitize=undefined; it catches a NaN or
+# out-of-range coordinate cast to an index, so the UB build adds it.
+if(SEMPER_SANITIZER MATCHES "undefined")
+    set(SEMPER_SANITIZER "${SEMPER_SANITIZER},float-cast-overflow")
+endif()
 set(OPENCV_SRC_DIR "${SEMPER_ROOT}/third_party/opencv")
 set(EIGEN_SRC_DIR "${SEMPER_ROOT}/third_party/eigen")
 
@@ -64,11 +69,19 @@ target_compile_definitions(semper_math PRIVATE
         $<$<BOOL:${SEMPER_VERBOSE_LOG}>:SEMPER_HOST_VERBOSE=1>
 )
 if(NOT MSVC)
-    target_compile_options(semper_math PRIVATE -O3 -ffast-math -fPIC -fvisibility=hidden -Wall -Wextra)
+    # -ffp-contract=off: a multiply-add rounds the same on every target. GCC
+    # and Clang fuse it into an FMA where the ISA has one (aarch64) and not
+    # on baseline x86-64, so results differed between the two.
+    # -fno-finite-math-only keeps NaN and Inf meaningful under -ffast-math:
+    # with it the compiler may assume neither occurs, and then no check for
+    # one -- a comparison, std::isnan, or a test of the bits (Clang marks
+    # arguments nofpclass(nan)) -- is guaranteed to survive. The engine
+    # rejects non-finite warps, scores and image values with such checks.
+    target_compile_options(semper_math PRIVATE -O3 -ffast-math -fno-finite-math-only -ffp-contract=off -fPIC -fvisibility=hidden -Wall -Wextra)
 endif()
 if(SEMPER_SANITIZER AND NOT MSVC)
-    target_compile_options(semper_math PRIVATE -fsanitize=${SEMPER_SANITIZER} -g -fno-omit-frame-pointer)
-    target_link_options(semper_math PUBLIC -fsanitize=${SEMPER_SANITIZER})
+    target_compile_options(semper_math PRIVATE -fsanitize=${SEMPER_SANITIZER} -fno-sanitize-recover=all -g -fno-omit-frame-pointer)
+    target_link_options(semper_math PUBLIC -fsanitize=${SEMPER_SANITIZER} -fno-sanitize-recover=all)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -121,7 +134,7 @@ if(NOT MSVC)
     # Apply aggressive flags only to our TUs, not OpenCV (added after add_subdirectory).
     # -flto is Android-only: MinGW host shared libs (semper_c) fail at runtime with
     # "32 bit pseudo relocation ... out of range" when the static archive was LTO-built.
-    set(_semper_pipeline_opts -O3 -ffast-math -fPIC -fvisibility=hidden -fexceptions -Wall -Wextra)
+    set(_semper_pipeline_opts -O3 -ffast-math -fno-finite-math-only -ffp-contract=off -fPIC -fvisibility=hidden -fexceptions -Wall -Wextra)
     if(SEMPER_ANDROID)
         list(APPEND _semper_pipeline_opts -flto -fopenmp)
         target_compile_options(semper_pipeline PRIVATE ${_semper_pipeline_opts})
@@ -132,6 +145,9 @@ if(NOT MSVC)
         target_compile_options(semper_pipeline PRIVATE ${_semper_pipeline_opts})
         if(OpenMP_CXX_FOUND)
             target_link_libraries(semper_pipeline PUBLIC OpenMP::OpenMP_CXX)
+        elseif(SEMPER_REQUIRE_OPENMP)
+            message(FATAL_ERROR "SEMPER_REQUIRE_OPENMP=ON but OpenMP was not found. With "
+                    "Apple Clang install libomp and pass -DOpenMP_ROOT=$(brew --prefix libomp).")
         else()
             # Serial build: every parallel region runs on the calling thread
             # and its #pragma omp is ignored, which -Wall reports.
@@ -142,8 +158,8 @@ if(NOT MSVC)
 endif()
 if(SEMPER_SANITIZER AND NOT MSVC)
     # Sanitizers and -flto fight; drop LTO when instrumenting.
-    target_compile_options(semper_pipeline PRIVATE -fsanitize=${SEMPER_SANITIZER} -g -fno-omit-frame-pointer -fno-lto)
-    target_link_options(semper_pipeline PUBLIC -fsanitize=${SEMPER_SANITIZER})
+    target_compile_options(semper_pipeline PRIVATE -fsanitize=${SEMPER_SANITIZER} -fno-sanitize-recover=all -g -fno-omit-frame-pointer -fno-lto)
+    target_link_options(semper_pipeline PUBLIC -fsanitize=${SEMPER_SANITIZER} -fno-sanitize-recover=all)
 endif()
 
 add_library(semper INTERFACE)
@@ -153,6 +169,10 @@ target_include_directories(semper INTERFACE ${SEMPER_PUBLIC_INCLUDE})
 # ---------------------------------------------------------------------------
 # Public distribution adapters (off by default)
 # ---------------------------------------------------------------------------
+if(SEMPER_BUILD_TESTS OR SEMPER_BUILD_C_SDK)
+    # ctest from the build root runs dic_tests and the C ABI binaries.
+    enable_testing()
+endif()
 if(SEMPER_BUILD_C_SDK)
     add_subdirectory(adapters/c)
 endif()

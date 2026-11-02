@@ -4,3 +4,6 @@
 [submodule "third_party/opencv"]
 	path = third_party/opencv
 	url = https://github.com/opencv/opencv.git
+	# The sparse checkout (scripts/sparse-opencv.sh, cmake/SemperOpenCV.cmake)
+	# plants stub doc/ and data/ CMakeLists.txt files in it.
+	ignore = untracked

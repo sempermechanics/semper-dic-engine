@@ -26,6 +26,17 @@ namespace Semper {
 
     StrainField StrainCalculator::compute_vsg_strain(const DisplacementField& disp, int window_pixels) {
         StrainField strain;
+        // A field the fit cannot read: no step (the window loop divided by it,
+        // and cast an infinite ceil to int), or vectors shorter than the grid
+        // they claim (read past their end). Every node keeps the sentinel.
+        const size_t want = disp.width > 0 && disp.height > 0 ? (size_t)disp.width * (size_t)disp.height : 0;
+        if (disp.step <= 0 || window_pixels <= 0 || disp.u.size() < want || disp.v.size() < want ||
+            (!disp.valid.empty() && disp.valid.size() < want)) {
+            strain.exx.assign(want, tuning::kStrainUninitSentinel);
+            strain.eyy.assign(want, tuning::kStrainUninitSentinel);
+            strain.exy.assign(want, tuning::kStrainUninitSentinel);
+            return strain;
+        }
         int total_pts = disp.width * disp.height;
 
         // === 🚀 COMPILER-SAFE SENTINEL FIX ===

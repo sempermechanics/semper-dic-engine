@@ -17,6 +17,12 @@
 #include <cstddef>
 #include <opencv2/core/hal/intrin.hpp>
 
+// Multiply, then add -- never cv::v_fma. NEON fuses v_fma into one rounding,
+// SSE2 (the x86-64 baseline) cannot, so with it the same input gave different
+// sums on arm64 and x86-64. Two roundings everywhere keep the targets in step;
+// the build disables compiler contraction for the scalar code likewise
+// (-ffp-contract=off).
+
 namespace Semper {
     namespace simd {
 
@@ -30,7 +36,7 @@ namespace Semper {
             cv::v_float32 acc = cv::vx_setzero_f32();
             for (; i + step <= n; i += step) {
                 cv::v_float32 d = cv::v_sub(cv::vx_load(vals + i), mean_v);
-                acc = cv::v_fma(d, d, acc);
+                acc = cv::v_add(cv::v_mul(d, d), acc);
             }
             sum = cv::v_reduce_sum(acc);
 #endif
@@ -57,7 +63,7 @@ namespace Semper {
                 cv::v_float32 norm_def =
                         cv::v_mul(cv::v_sub(cv::vx_load(vals + i), mean_v), inv_v);
                 cv::v_float32 diff = cv::v_sub(cv::vx_load(ref + i), norm_def);
-                acc = cv::v_fma(diff, diff, acc);
+                acc = cv::v_add(cv::v_mul(diff, diff), acc);
             }
             sum = cv::v_reduce_sum(acc);
 #endif
@@ -107,13 +113,13 @@ namespace Semper {
                 cv::v_float32 norm_def =
                         cv::v_mul(cv::v_sub(cv::vx_load(vals + i), mean_v), inv_v);
                 cv::v_float32 diff = cv::v_sub(cv::vx_load(ref + i), norm_def);
-                err_acc = cv::v_fma(diff, diff, err_acc);
-                a0 = cv::v_fma(cv::vx_load(p0 + i), diff, a0);
-                a1 = cv::v_fma(cv::vx_load(p1 + i), diff, a1);
-                a2 = cv::v_fma(cv::vx_load(p2 + i), diff, a2);
-                a3 = cv::v_fma(cv::vx_load(p3 + i), diff, a3);
-                a4 = cv::v_fma(cv::vx_load(p4 + i), diff, a4);
-                a5 = cv::v_fma(cv::vx_load(p5 + i), diff, a5);
+                err_acc = cv::v_add(cv::v_mul(diff, diff), err_acc);
+                a0 = cv::v_add(cv::v_mul(cv::vx_load(p0 + i), diff), a0);
+                a1 = cv::v_add(cv::v_mul(cv::vx_load(p1 + i), diff), a1);
+                a2 = cv::v_add(cv::v_mul(cv::vx_load(p2 + i), diff), a2);
+                a3 = cv::v_add(cv::v_mul(cv::vx_load(p3 + i), diff), a3);
+                a4 = cv::v_add(cv::v_mul(cv::vx_load(p4 + i), diff), a4);
+                a5 = cv::v_add(cv::v_mul(cv::vx_load(p5 + i), diff), a5);
             }
             err = cv::v_reduce_sum(err_acc);
             dp0 = cv::v_reduce_sum(a0);

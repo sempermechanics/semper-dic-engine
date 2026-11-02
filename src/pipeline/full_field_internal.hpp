@@ -107,6 +107,31 @@ private:
     std::exception_ptr first_;
 };
 
+// A solve's view of its cancel token: once any poll has seen a request, every
+// later poll of this solve sees it too. The token itself can be cleared while
+// the solve runs (the JNI setCancelRequested(false) is lock-free), and a phase
+// that skipped work for a cancel must not be followed by phases that carry on
+// as if it had not: the Hessian pre-pass would leave a holed pool marked
+// complete for every later solve, and Paths A and B a partial field reported
+// as a success.
+class SolveCancel {
+public:
+    explicit SolveCancel(const CancelToken &token) noexcept : token_(token) {}
+    SolveCancel(const SolveCancel &) = delete;
+    SolveCancel &operator=(const SolveCancel &) = delete;
+
+    bool requested() const noexcept {
+        if (seen_.load(std::memory_order_relaxed)) return true;
+        if (!token_.requested()) return false;
+        seen_.store(true, std::memory_order_relaxed);
+        return true;
+    }
+
+private:
+    const CancelToken &token_;
+    mutable std::atomic<bool> seen_{false};
+};
+
 #if defined(SEMPER_TEST_HOOKS)
 // Test build only: tests/CMakeLists.txt defines SEMPER_TEST_HOOKS for
 // dic_tests, and no library target does. Lets a test make code throw that
@@ -200,7 +225,11 @@ struct RefPrecompute {
     // (tuning::kAkazeScales; an entry with no keypoints is not detected yet),
     // keyed on the ROI rect they are padded from. Once a solve has had to
     // escalate past a scale, later solves against this reference start at the
-    // scale it settled on: the coarser ones will not have changed.
+    // scale it settled on: the coarser ones will not have changed. This is
+    // the one piece of state that makes a solve depend on the solves before
+    // it: started at a finer scale, a frame can get its global model from a
+    // different scale than a cold solve would (docs/CONTRACT.md, "Reference
+    // cache"). Only a completed solve moves it.
     cv::Rect akaze_roi;
     std::vector<seeding::AkazeRef> akaze_refs;
     int akaze_first_level = 0;
@@ -231,6 +260,13 @@ struct FieldCapture {
     seeding::AkazeRef akaze_deformed;
 };
 
+// ReferenceCache::adopt, with the AKAZE features of the adopted image handed
+// over in the same step. Strong guarantee: if it throws (the Ghost Wall can),
+// the cache still holds the outgoing reference, unchanged -- what lets
+// IncrementalSession leave the session as it was when an update fails.
+void adopt_reference(ReferenceCache &cache, std::unique_ptr<Image> prepared, cv::Mat gray_in,
+                     const cv::Mat &roi_mask, seeding::AkazeRef handover);
+
 // The one place solve parameters are checked, for run_full_field and
 // IncrementalSession::init alike, against a width x height reference.
 // Returns 0 with `p` normalised, or the code to return:
@@ -260,8 +296,10 @@ int validate_params(FullFieldParams &p, int width, int height);
 int64_t max_strain_window(const FullFieldParams &p);
 
 // run_full_field with an optional capture. capture == nullptr is exactly
-// run_full_field. `cancel` is the one token this solve clears on entry and
-// polls; it is passed down explicitly so concurrent solves never share one.
+// run_full_field. `cancel` is the one token this solve polls, through a
+// SolveCancel; it is passed down explicitly so concurrent solves never share
+// one. It does not clear the token: the public entry points do that
+// (CancelToken::enter) before any work of their own.
 int run_full_field_impl(
         ReferenceCache &cache,
         const cv::Mat &def_gray,
@@ -288,7 +326,7 @@ struct SolveContext {
     const HessianPool &hessian_pool;
     std::atomic<int> &global_points_solved;
     std::atomic<int> &compute_order_counter;
-    const CancelToken &cancel;   // this solve's, polled by every phase
+    const SolveCancel &cancel;   // this solve's, polled by every phase
 };
 
 // Per-phase wall clock, aggregated for the profiling log and the metrics array.
@@ -375,8 +413,12 @@ inline void record_simplex_outcome(ThreadStats &bucket, const AnalysisResult &re
 // output point in the field at the same time, and Path B would then flood
 // fill from it. Returning the outcomes instead lets run_full_field apply them
 // after the median pass, which is the whole point of having a median pass.
-// It also makes compute_order deterministic, since the numbering now happens
-// in one serial loop over the lattice instead of racing between threads.
+// It also makes the anchors' compute_order deterministic, since their
+// numbering now happens in one serial loop over the lattice instead of racing
+// between threads. Paths A and B number the nodes they solve in the order the
+// workers finish them, so there compute_order (like thread_id) records the
+// scheduling of that run -- debug output only (the maps and the CSV); nothing
+// packed or reported depends on it.
 struct AnchorResult {
     int gx = 0, gy = 0;             // lattice node's position in the grid
     float rx = 0, ry = 0;           // and in image pixels
@@ -421,6 +463,10 @@ struct MeshSeedResult {
     bool locked = false;
     int matches = 0;            // RANSAC inliers behind the model
     float akaze_scale = 0.0f;   // detection scale they came from
+    // Its index in kAkazeScales (-1: no model), where the next solve against
+    // this reference starts its search (RefPrecompute::akaze_first_level).
+    // Recorded by run_full_field_impl once the solve has completed.
+    int akaze_level = -1;
     // Whether the anchors were seeded with the full homography rather than its
     // translation at the ROI centre. model_rejected: the homography was tried,
     // its lattice came out weak, and the translation-only lattice re-solved
@@ -482,7 +528,7 @@ MeshSeedResult solve_anchor_seeds(
         const ResultGrid &resultGrid,
         std::vector<ThreadStats> &stats,
         PhaseTimings &timings,
-        const CancelToken &cancel);
+        const SolveCancel &cancel);
 
 // Applies the anchors that cleared the strict gate AND survived the median
 // test. Returns how many were published. Serial by design — compute_order
