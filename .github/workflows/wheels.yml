@@ -50,7 +50,9 @@ jobs:
         env:
           CIBW_BUILD: "cp39-* cp310-* cp311-* cp312-*"
           CIBW_SKIP: "*-win32 *-musllinux_* pp*"
-          CIBW_TEST_REQUIRES: "pytest==9.2.0 numpy"
+          # pytest 9 requires Python >= 3.10; 8.4.2 is the last release that
+          # installs on every interpreter in CIBW_BUILD (cp39 included).
+          CIBW_TEST_REQUIRES: "pytest==8.4.2 numpy"
           CIBW_TEST_COMMAND: "pytest {project}/tests"
           # macOS: Apple Clang has no OpenMP of its own. CMake reads neither
           # CPPFLAGS nor LDFLAGS when looking for it, so these used to leave
