@@ -53,14 +53,19 @@ jobs:
           # pytest 9 requires Python >= 3.10; 8.4.2 is the last release that
           # installs on every interpreter in CIBW_BUILD (cp39 included).
           CIBW_TEST_REQUIRES: "pytest==8.4.2 numpy"
-          CIBW_TEST_COMMAND: "pytest {project}/tests"
-          # macOS: Apple Clang has no OpenMP of its own. CMake reads neither
-          # CPPFLAGS nor LDFLAGS when looking for it, so these used to leave
-          # find_package(OpenMP) failing and the wheel silently serial;
-          # OpenMP_ROOT is what FindOpenMP searches.
-          CIBW_BEFORE_ALL_MACOS: brew install libomp
+          # {package} is bindings/python; {project} is the directory
+          # cibuildwheel runs in (the repository root, whose tests/ is C++).
+          CIBW_TEST_COMMAND: "pytest {package}/tests"
+          # macOS: Apple Clang has no OpenMP of its own, and Homebrew's libomp
+          # targets the runner's macOS (26.0), which delocate refuses to
+          # bundle into a macOS 11.0 wheel. libomp is built from LLVM source
+          # for 11.0 instead; FindOpenMP finds it through OpenMP_ROOT. The
+          # deployment target is set here so that build and the wheels agree
+          # (before-all would otherwise default to 10.9).
+          CIBW_BEFORE_ALL_MACOS: bash scripts/build-libomp-macos.sh /tmp/semper-libomp
           CIBW_ENVIRONMENT_MACOS: >-
-            OpenMP_ROOT="$(brew --prefix libomp)"
+            MACOSX_DEPLOYMENT_TARGET=11.0
+            OpenMP_ROOT=/tmp/semper-libomp
           # Fail the macOS build rather than ship a serial wheel.
           CIBW_CONFIG_SETTINGS_MACOS: "cmake.define.SEMPER_REQUIRE_OPENMP=ON"
         run: python -m cibuildwheel bindings/python --output-dir wheelhouse

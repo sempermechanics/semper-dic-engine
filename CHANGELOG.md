@@ -103,6 +103,12 @@ signature, slot or packing changed.
   cancelled by the next push; pip installs pinned; fail-closed tool checks;
   wheels fail on a missing sparse checkout or an empty wheelhouse, and the
   macOS wheels find (and require) OpenMP.
+- Wheels: the macOS wheels bundle a libomp built from LLVM 21.1.8 source for
+  macOS 11.0 (`scripts/build-libomp-macos.sh`); Homebrew's targets the
+  runner's macOS 26 and delocate rejected it. The wheel tests pin pytest
+  8.4.2 (9.x needs Python 3.10, so cp39 could not install it) and run
+  `{package}/tests`, the Python tests, instead of the repository's C++
+  `tests/`.
 
 ### Docs
 - MATHEMATICS: the reported score is the per-pixel mean ZNSSD (so
