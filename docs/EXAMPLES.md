@@ -1,47 +1,46 @@
-# Beginner examples
+# Sample images and what they verify
 
-Demos live under [`examples/`](../examples/README.md). They use
-**DICe-published sample images** that this repository already treats as
-goldens in the host suite.
+The examples in [`examples/`](../examples/README.md) use two image pairs
+published with DICe. The host test suite checks the engine against both, so
+the examples and the tests agree on what a correct result is.
 
-## Samples
+## Translation — `examples/samples/translation/`
 
-### Translation (`examples/samples/translation/`)
+512 × 512 speckle. `def.tif` is `ref.tif` shifted about 0.4 px along the
+diagonal.
 
-| File | Role |
+| Check | Value |
 |---|---|
-| `ref.tif` / `def.tif` | 512×512 speckle; def ≈ ref shifted **0.4 px** (diagonal) |
-| `expected.json` | Params + pass/fail tolerances |
+| Subset size | 27 |
+| Subset centres | (100, 100), (200, 200), (300, 300), (400, 400) |
+| Pass condition | \|u − 0.4\| ≤ 0.1 px at all four (DICe's published tolerance) |
+| Verified by | `examples/cpp/run_translation`, test `DiceTranslationReal.CustomApp_0p4px_RealSpeckle` |
 
-**Verified subset contract** (C++ demo + host test
-`DiceTranslationReal.CustomApp_0p4px_RealSpeckle`):
+v is also close to 0.4, but DICe asserts only u, and so do these checks.
+`expected.json` holds the parameters and tolerances.
 
-- Subset size **27** at `(100,100)`, `(200,200)`, `(300,300)`, `(400,400)`
-- Assert `|u − 0.4| ≤ 0.1` (DICe’s published tolerance)
-- `v` is typically ~0.4 as well (diagonal shift) but DICe only asserts `u`
+## OHT CFRP — `examples/samples/oht_cfrp/`
 
-### OHT CFRP (`examples/samples/oht_cfrp/`)
+The first load step of a real open-hole tension test on a carbon-fibre
+laminate, 400 × 1040 (portrait).
 
-Real experimental first load step, 400×1040 (portrait). Host test
-`DiceFieldAgreement.OhtCfrp_AgreesWithDiceSolution` compares the subset solver
-to `DICe_solution_01.txt`. Suggested full-field params are in `expected.json`;
-its `rect` is `[x, y, w, h]` as `Engine.run(rect=...)` takes it, and covers
-DICe's grid (x 61–341, y 61–971, step 35).
+| Check | Value |
+|---|---|
+| Reference | DICe's solution `DICe_solution_01.txt` (grid x 61–341, y 61–971, step 35) |
+| Verified by | `DiceFieldAgreement.OhtCfrp_AgreesWithDiceSolution` (subset solver against the DICe field) |
+| Full-field parameters | `expected.json`; its `rect` is `[x, y, w, h]`, as `Engine.run(rect=...)` takes it, and covers DICe's grid |
 
-## Code entry points
+## Code
 
-| Language | Path | What it proves |
-|---|---|---|
-| C++ | [`examples/cpp/run_translation.cpp`](../examples/cpp/run_translation.cpp) | Exact DICe 4-subset contract |
-| Python | [`examples/python/run_synthetic.py`](../examples/python/run_synthetic.py) | Full-field install smoke (+3 px) |
-| Python | [`examples/python/run_translation.py`](../examples/python/run_translation.py) | Load DICe TIFFs via `Engine` |
+| Program | Proves |
+|---|---|
+| [`examples/cpp/run_translation.cpp`](../examples/cpp/run_translation.cpp) | The four-subset translation check |
+| [`examples/python/run_synthetic.py`](../examples/python/run_synthetic.py) | The Python install solves a +3 px synthetic shift |
+| [`examples/python/run_translation.py`](../examples/python/run_translation.py) | The DICe TIFFs load and solve through `Engine` |
 
-```bash
-cmake -S . -B build/sdk -DSEMPER_BUILD_EXAMPLES=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build/sdk --target run_translation
-```
+How to build and run them: [examples/README.md](../examples/README.md).
 
 ## License
 
 Sample images: [`examples/samples/LICENSE.DICe`](../examples/samples/LICENSE.DICe)
-(Sandia / NTESS). Engine code: root [`LICENSE`](../LICENSE).
+(Sandia / NTESS). Engine code: [`LICENSE`](../LICENSE).

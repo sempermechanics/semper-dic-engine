@@ -1,49 +1,64 @@
 # semper-dic
 
-Python bindings for the **Semper** hybrid-Delaunay Digital Image Correlation (DIC)
-engine — the same C++ core exposed as a NumPy-native API for desktop and research use.
+Python bindings for the Semper Digital Image Correlation (DIC) engine. Give it
+a reference image and a deformed image; it returns the displacement and strain
+at each point of a grid, as NumPy arrays.
 
 ## Install
 
 ```bash
-pip install semper-dic          # from a published wheel
-# or, from a source checkout of this engine repo:
-pip install ./bindings/python
+pip install semper-dic                 # published wheel
+pip install ./bindings/python          # from a clone of the engine repository
 ```
 
-Building from source compiles the vendored OpenCV + engine, so a C++17 toolchain
-and CMake are required (the published wheels are self-contained).
+A source build compiles the engine and its vendored OpenCV, so it needs CMake
+and a C++17 compiler. The wheels are self-contained.
 
-## Usage
+## Use
 
 ```python
-import numpy as np
 import semper
 
 eng = semper.Engine()
-eng.set_reference(ref_u8)                 # 2-D uint8 array, or encoded PNG/JPEG bytes
+eng.set_reference(ref)                     # 2-D uint8 array, or PNG/JPEG/TIFF bytes
 res = eng.run(
-    deformed_u8,
-    rect=(0, 0, 512, 512),                # ROI: x, y, w, h
-    step=10, subset=21, strain_window=21,
-    progress=lambda pct: print(pct),      # optional
+    deformed,
+    rect=(0, 0, 512, 512),                 # region: x, y, w, h
+    step=10, subset=21, strain_window=21,  # grid spacing, subset size (odd), strain window
+    progress=lambda pct: print(pct),       # optional
 )
 
-res.count            # number of solved points
-res.points           # (N, 8) float32: x, y, u, v, exx, eyy, exy, corr
-res.metrics          # (24,) float32 telemetry
+res.count      # number of solved points
+res.points     # (N, 8) float32: x, y, u, v, exx, eyy, exy, corr
+res.metrics    # (24,) float32 telemetry
 ```
 
-Call `eng.cancel()` from another thread to stop a run in flight.
+| Topic | Behaviour |
+|---|---|
+| Errors | A negative engine code raises `semper.DicError` (`.code` holds it). Pass `raise_on_error=False` to get the code in `res.count` instead. |
+| Masks | `mask=` selects the pixels to correlate. Bool arrays, non-uint8 arrays and uint8 arrays holding only 0 and 1: nonzero is included. Other uint8 masks: pixels below 128 are excluded. |
+| Cancel | `eng.cancel()` stops a solve in progress; it is safe from any thread, including the progress callback. Ctrl-C also cancels. |
+| Threads | Calls on one `Engine` run one at a time. Use one `Engine` per thread to solve in parallel. |
 
-**Beginner demos** (DICe sample images + verified 0.4 px translation):
+### Image sequences
 
-```bash
-python examples/python/run_synthetic.py
-python examples/python/run_translation.py
+`IncrementalSession` follows large deformation across frames by moving the
+reference forward every `update_interval` frames (`0` keeps the first image).
+It reports total displacement from the first image:
+
+```python
+s = semper.IncrementalSession(frames[0], rect=(0, 0, 512, 512), step=10,
+                              subset=21, strain_window=21, update_interval=1)
+for frame in frames[1:]:
+    res = s.process(frame)
+    res.points                     # (N, 8): totals from frames[0]
+    res.info["reference_frame"]    # also: reference_updated, tracked_points, ...
 ```
 
-See [`examples/README.md`](../../examples/README.md) and [`docs/EXAMPLES.md`](../../docs/EXAMPLES.md).
+## Examples and reference
 
-The output packing, metrics layout, and error codes are **frozen** — see
-[`docs/CONTRACT.md`](../../docs/CONTRACT.md) in this repository.
+- Examples with sample images:
+  [examples/](https://github.com/sempermechanics/semper-dic-engine/tree/main/examples)
+- Output layout, metrics slots and error codes (stable within a major version):
+  [docs/CONTRACT.md](https://github.com/sempermechanics/semper-dic-engine/blob/main/docs/CONTRACT.md)
+- Tests: `pytest bindings/python/tests` from the repository root.
