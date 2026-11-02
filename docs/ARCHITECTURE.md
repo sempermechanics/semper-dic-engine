@@ -1,571 +1,527 @@
 # Engine architecture
 
-API-style reference for the Semper Digital Image Correlation (DIC) engine and
-its Android JNI adapter — module by module, with the invariants each one
-depends on. Written for developers modifying, extending, or debugging the
-pipeline.
+A module-by-module reference for developers who change the Semper Digital
+Image Correlation (DIC) engine: what each module does, the invariants it
+relies on, and how the modules connect. Derivations are in
+[MATHEMATICS.md](MATHEMATICS.md); the public API, return codes and Frozen
+formats in [CONTRACT.md](CONTRACT.md); tests and CI in
+[TESTING.md](TESTING.md); build commands and layout in
+[README.md](../README.md); history in [CHANGELOG.md](../CHANGELOG.md).
 
-For the derivations behind the code see [MATHEMATICS.md](MATHEMATICS.md); for
-how it's verified, [TESTING.md](TESTING.md); for the Frozen/Stable surface,
-[CONTRACT.md](CONTRACT.md).
+## Data flow
 
-```
-Downstream Android app (private)
-  SemperNativeLib.kt
-       |
-       v  adapters/android (JNI marshalling only)
-this repository
-  src/io + pipeline   (decode, AKAZE seeding/anchors/mesh/RGDIC, OpenMP)
-       |
-       v
-  src/math + strain
-  Image -> SubsetPrecomputer -> OptimizationEngine -> StrainCalculator
-  Public API: include/semper/*.hpp  (no jni.h in src/; android/log.h only
-  in src/util/log.hpp, behind SEMPER_ANDROID_LOG)
-```
+1. Decode: the adapter makes an 8-bit gray image and mask (`io.hpp`).
+2. Reference: `ReferenceCache::set_from_gray` builds an `Image` (float
+   intensities and gradients) and stamps the Ghost Wall into masked pixels.
+3. Scan: `run_full_field` validates, prepares the deformed `Image`, and skips
+   grid nodes whose subset touches the border reserve or the mask.
+4. Hessian pre-pass: one `CachedHessianData` per node.
+5. Seeding: an AKAZE + RANSAC homography gives the global motion; IC-GN solves
+   a lattice of about 256 nodes from it; a median test drops blunders.
+6. Mesh guess: a Delaunay mesh over the kept anchors guesses each covered node;
+   the homography covers the rest.
+7. Solve: Path C seeds when nothing else did, Path A solves the guessed nodes,
+   Path B flood-fills the rest.
+8. Pack: displacement median test, VSG strain, 8 floats per point, metrics.
 
-**Data flow for one analysis:** decode images → `Image` (float intensities +
-gradients) → Hessian pre-pass → **anchor-lattice seeding** (an AKAZE + RANSAC
-homography for the global motion, then IC-GN on a lattice of grid nodes seeded
-from it) → Delaunay mesh →
-for each remaining grid point: `SubsetPrecomputer` builds a `SubsetData` →
-`OptimizationEngine.calculate_deformation` solves the 6-DOF warp →
-displacement field → `StrainCalculator` → results buffer back through the
-caller's adapter (JNI, C ABI or Python).
-
-Seeding runs **after** the Hessian pre-pass on purpose: the anchors sit on grid
-nodes, so they reuse the pooled Hessians and a node that converges well enough
-is a final result for that node. Path A then skips it and Path B takes it as a
-boundary seed. See [SEEDING_BENCHMARK.md](SEEDING_BENCHMARK.md) for why this
-replaced AKAZE keypoints as mesh vertices (v0.2.2).
-
-AKAZE came back in v0.6.0 in a different role: its matches no longer become
-mesh vertices, they only fit the global model. Phase correlation (v0.2.2 to
-v0.5.0) gave translation, and a log-polar similarity added rotation and scale,
-but it had a 180° ambiguity and read anisotropic stretch as rotation. A
-homography fitted to AKAZE matches covers rotation at any angle, scale,
-stretch and shear. Matching runs at the coarsest of 0.25x, 0.5x and 1x that
-gives enough RANSAC inliers. Each anchor starts from the displacement and
-gradients the homography puts at it; a homography refitted to the converged
-anchors then seeds the nodes the mesh does not reach. Without a model the
-lattice searches for its own offsets, as v0.5.0 did without a phase lock.
-
-"Converges well enough" is decided in two steps, not one. The lattice solve
-records every node's outcome and writes nothing to the field; the universal
-median test then runs over the whole lattice; and only then does
-`publish_anchor_results` mark the survivors solved. A node that correlates
-confidently onto the wrong speckle blob is dropped by the median test before
-Path B can flood fill from it.
-
-**Work reused across frames.** `ReferenceCache` keeps what depends only on
-the reference and the grid: the node validity scan, the Hessian pool and the
-reference's AKAZE keypoints and descriptors at each scale tried, plus the
-scale the last solve settled on, which is tried first. The
-second and later frames against one reference, with the same `rect`, `step`,
-`subset_size` and mask, skip those steps. The cache is internal, and outputs
-are bit-identical with or without it (`FullField.RefCache_*`). Steepest-descent
-images are not cached: at `dim² × 6` floats per node they would cost too much
-memory for a whole grid on a phone.
-
-Package layout and contributor rules: [`README.md`](../README.md).
-
----
+Every grid-node solve runs `solve_node` (pool entry → `SubsetData` →
+`calculate_deformation` → Ghost Wall rejection) on a `make_engine` engine: LM
+damping (`tuning::kLmAlpha`) and the caller's interpolator. So does
+incremental re-anchoring (`match_anchor`), without `solve_node`.
 
 ## Module: `include/semper/types.hpp`
 
-Shared value types. All math is 32-bit `float` (`scalar_t`).
+All math is 32-bit `float` (`scalar_t`).
 
 ### `struct AnalysisResult`
-The engine's answer for one subset.
 
-| Field | Type | Meaning |
-|---|---|---|
-| `u, v` | float | Displacement of the subset center (px) |
-| `ux, uy, vx, vy` | float | Displacement gradients (∂u/∂x, ∂u/∂y, ∂v/∂x, ∂v/∂y) |
-| `status` | int | `0` = converged, non-zero = failed/aborted |
-| `correlation_score` | float | Final ZNSSD / valid_pixels. **Lower is better**; `2.0` = worst |
-| `iters` | int | ICGN iterations consumed |
-| `invalid_ref_pixels` | int | Reference pixels masked by the ROI ("Ghost Wall") |
+| Field | Meaning |
+|---|---|
+| `u, v` | Displacement of the subset centre (px) |
+| `ux, uy, vx, vy` | ∂u/∂x, ∂u/∂y, ∂v/∂x, ∂v/∂y |
+| `status` | `0` converged, else failed |
+| `correlation_score` | ZNSSD / valid pixels; lower is better, `2.0` on a rejection |
+| `iters` | IC-GN iterations of the final run |
+| `invalid_ref_pixels` | Reference pixels in the Ghost Wall |
+| `trigger_iters` | Iterations of the run that triggered a Simplex rescue (else `iters`) |
 
 ### `struct SubsetData`
-Everything precomputed about one reference subset. Invariants:
 
-- `x_offsets/y_offsets` (and `_f` float mirrors): relative coords in `[-dim/2, +dim/2]`, row-major, length `n = dim²`.
-  **`dim` must be odd and at least 3** — the offsets are built symmetrically
-  around the center pixel, so the subset holds `(2·(dim/2)+1)²` pixels, and for
-  an even `dim` that is more than the `dim²` its buffers hold. The engine
-  enforces this rather than trusting the caller: `run_full_field` and
-  `IncrementalSession::init` return `-3` for any other `subset_size`
-  (`validate_params`, which also clips the rect to the image), and the three
-  `SubsetPrecomputer` functions return an uninitialized subset for one. The app
-  also only offers odd sizes (see [Parameters from the app](#parameters-from-the-app)).
+- `dim` is odd and ≥ 3: the subset holds `(2·(dim/2)+1)²` pixels, more than
+  its `dim²` buffers for an even `dim`. `validate_params` returns `-3` for
+  other sizes; `SubsetPrecomputer` leaves such a subset uninitialized. The app
+  offers only odd sizes ([Parameters from the app](#parameters-from-the-app)).
+- `dim` defaults to `0`; buffers are resized only when it changes.
+- `x_offsets` / `y_offsets` (and `_f` mirrors): `[-dim/2, +dim/2]`, row-major,
+  `n = dim²`.
 - `norm_ref_intensities[i] = (ref_intensities[i] − mean_intensity) / std_dev`.
-- `H` = Σ sd·sdᵀ (6×6 Gauss-Newton Hessian), `H_inv` = its inverse.
-- `steepest_descent_images[i]` = `[gx, gy, gx·x, gx·y, gy·x, gy·y] / std_dev` (Eigen 6×1, AoS).
-- **`sdi_planes`** = SoA mirror of the above: plane *k* occupies `[k·n, (k+1)·n)`.
-  **Must stay in sync with `steepest_descent_images`** — the SIMD fast path reads
-  the planes, the masked slow path reads the Eigen vectors.
-  (Guarded by `SubsetPrecomputer.SdiPlanesMirrorSteepestDescentImages` test.)
-- `is_initialized == false` ⇒ subset touched the image boundary or lacked texture; do not solve it.
-
----
+- `H` = Σ sd·sdᵀ, kept raw for LM damping; `H_inv` its inverse.
+- `steepest_descent_images[i]` = `[gx, gy, gx·x, gx·y, gy·x, gy·y] / std_dev`
+  (Eigen, AoS); `gx_vec` / `gy_vec` keep raw gradients for the texture check.
+- `sdi_planes`: SoA mirror, plane *k* at `[k·n, (k+1)·n)`. Keep it in sync:
+  the SIMD path reads the planes, the masked path the Eigen vectors
+  (`SubsetPrecomputer.SdiPlanesMirrorSteepestDescentImages`).
+- `is_initialized == false`: do not solve it.
 
 ## Module: `include/semper/image.hpp` — class `Image`
 
-Owns intensities + precomputed gradients for one image.
-
 ```cpp
-Image(int_t w, int_t h, const uint8_t* raw_pixels);   // grayscale, row-major
-void prepare_data(bool apply_dice_blur);              // gradients (+ optional 7-tap blur)
+Image(int_t w, int_t h, const uint8_t* raw_pixels);   // 8-bit gray, row-major
+void prepare_data(bool apply_dice_blur);              // gradients (+ optional 7×7 Gaussian blur)
 ```
 
-**Must call `prepare_data` before any gradient/interpolation consumer.**
-Gradients are 4th-order central differences (exact for polynomials ≤ deg 4),
-valid in the interior `[2, dim−3]`; the border ring is zero.
+The constructor throws (`std::length_error`, `std::invalid_argument`) if
+`w·h` overflows `int` or the pixels are null. Call `prepare_data` before use
+(the engine passes `false`). Gradients are 4th-order central differences,
+exact up to degree 4, for `x` in `[2, w−3]` and `y` in `[2, h−3]`; the border
+is zero.
 
 ### Interpolation ladder
 
-| Method | Kernel | Valid region | Out-of-range behavior |
+| Method | Kernel | Valid in x (y with h) | Outside |
 |---|---|---|---|
-| `interpolate_keys_fourth(x,y)` | 6×6 Keys 4th-order | `(2.5, w−3.5)` | demotes → bicubic boundary rule |
-| `interpolate_bicubic(x,y)` | 4×4 Catmull-Rom | `[1, w−2)` | demotes → bilinear |
-| `interpolate_bilinear(x,y)` | 2×2 | `[0, w−1.5)` | returns `0.0f` (kills pixel) |
+| `interpolate_keys_fourth` | 6×6 Keys 4th-order | `(2.5, w−3.5)` | bilinear |
+| `interpolate_bicubic` | 4×4 Catmull-Rom | `[1, w−2)` | bilinear |
+| `interpolate_bilinear` | 2×2 | `[0, w−1.5)` | `0.0f` |
 
-All three are *interpolating* kernels: they reproduce pixel values exactly at
-integer coordinates and reproduce linear ramps exactly at sub-pixel positions.
-IC-GN and the Simplex never call them where bilinear demotion could happen:
-their 4 px guard (`sample_warped_subset`) is stricter than every demotion
-boundary, and a sample's validity is decided by that guard and the reference
-mask, never by its value. A deformed intensity of `0` is black, not missing.
-(Until v0.5.0 IC-GN dropped every sample not `> 0`, so saturated black speckle
-and cubic undershoot next to it were treated as off-image.)
+Each test reads "inside, else demote", so a NaN coordinate is rejected, never
+cast to an index; the `_x4` variants skip it and rely on the caller's guard.
+All three reproduce pixel values at integers and linear ramps exactly.
 
----
+IC-GN, the Simplex and the coarse search sample only inside a 4 px guard
+(`inside_guard`), stricter than every demotion boundary. Validity comes from
+that guard and the mask, never the value: `0` is black, not missing.
 
 ## Module: `include/semper/subset.hpp`
 
-Static factory for `SubsetData`. Three entry points, one implementation:
-`precompute_subset` is `compute_hessian_only` followed by
-`precompute_subset_fast`, so the two routes give the same bytes (guarded,
-bit for bit, by `FastPathMatchesFullPrecompute`; v0.5.0 — it was a third copy
-of the arithmetic before).
+`compute_hessian_only` fills one pool entry (`CachedHessianData`: stats, `H`,
+`H_inv`) without heap allocation. `precompute_subset_fast` rebuilds the
+per-pixel data from an entry (~65% cheaper). `precompute_subset` runs both, so
+both routes give the same bytes (`FastPathMatchesFullPrecompute`).
 
-```cpp
-// Full precompute: compute_hessian_only, then precompute_subset_fast from it.
-static void precompute_subset(SubsetData&, const Image& ref, int cx, int cy, int dim);
-
-// Stats + Hessian only — for the batch pipeline's Hessian pool.
-static CachedHessianData compute_hessian_only(const Image& ref, int cx, int cy, int dim);
-
-// Rebuilds per-pixel data but reuses pooled Hessian/stats (~65% cheaper).
-static void precompute_subset_fast(SubsetData&, const Image& ref,
-                                   int cx, int cy, int dim,
-                                   const CachedHessianData& cached);
-```
-
-Failure modes (→ `is_initialized = false` / `cached.valid = false`):
-`dim` not odd and ≥ 3; subset crosses the image boundary; > 50% masked pixels;
-ill-conditioned Hessian (`cond(H₂ₓ₂) > 1e12`, or the 6×6 rcond test
-`hessian::well_conditioned`). `precompute_subset_fast` with an invalid pool
-entry gives an uninitialized subset (no recomputation: it would fail again).
-
-Every solve in the pipeline goes through `solve_node` (pool entry → subset →
-`calculate_deformation` → Ghost-Wall rejection) on an engine from
-`make_engine` (LM damping `tuning::kLmAlpha`, the caller's interpolator):
-anchor lattice, Paths A, B and C, and incremental re-anchoring.
-
----
+A subset fails when `dim` is not odd and ≥ 3, it crosses the image edge,
+under 50% of it is unmasked, or its Hessian is ill-conditioned:
+`cond(H₂ₓ₂) > 1e12`, or `hessian::well_conditioned` fails (1-norm rcond,
+gradient rows scaled by the half-width, `kHessianMinRcond`). An invalid entry
+gives an uninitialized subset without recomputing. The pool is keyed by node,
+not `dim`, so `precompute_subset_fast` checks `dim` again.
 
 ## Module: `include/semper/solver.hpp`
 
-Per-thread solver object (owns scratch buffers — **do not share across OMP threads**).
-
-```cpp
-AnalysisResult calculate_deformation(const SubsetData& subset, const Image& def_img,
-                                     float guess_u, float guess_v,
-                                     float guess_ux, float guess_uy,
-                                     float guess_vx, float guess_vy,
-                                     InitializationMode init_mode);
-```
+`OptimizationEngine::calculate_deformation(subset, def_img, 6-DOF guess,
+InitializationMode)` solves one subset. It owns scratch buffers: never share
+one across threads.
 
 ### Initialization modes
 
-| Mode | Pipeline |
-|---|---|
-| `INIT_AUTO_SEARCH` | coarse ±15 px SSD grid search → translation-only Simplex → full ICGN |
-| `INIT_NO_SEARCH` | ICGN from the given 6-DOF guess; Simplex rescue if ICGN fails or score > 0.4 |
-| `INIT_NO_SIMPLEX` | pure ICGN from the given guess — no rescue (fastest, needs good seeds) |
+| Mode | What runs | Used by |
+|---|---|---|
+| `INIT_AUTO_SEARCH` | If the guess is `(0, 0)`, a ZNSSD scan of ±15 px in 2 px steps over every 9th pixel (valid samples only); then a translation-only Simplex and IC-GN. No rescue. | Path C; anchor lattice without a model |
+| `INIT_NO_SEARCH` | IC-GN; if it fails or scores above `kCorrSimplexTrigger` (0.4), a 6-DOF Simplex and IC-GN again, keeping the better run. | Path A in a triangle; Path B; `match_anchor` |
+| `INIT_NO_SIMPLEX` | IC-GN only. | Anchor lattice with a model; Path A outside triangles |
 
-### Warp convention (the sign contract everything depends on)
+### Warp convention
 
-The shape function maps reference offsets `(x, y)` from subset center `c` to
-deformed-image coordinates:
+The sign contract everything depends on. Offsets `(x, y)` from the subset
+centre `c` map to:
 
 ```
 X_def = cx + (1+ux)·x + uy·y + u
 Y_def = cy + vx·x + (1+vy)·y + v
 ```
 
-i.e. a material point at `c + p` displaces by `t + [[ux,uy],[vx,vy]]·p`.
-Synthetic test data must be generated with this exact convention
-(see `tests/framework/synthetic.h`).
+A material point at `c + p` moves by `t + [[ux,uy],[vx,vy]]·p`. Synthetic test
+data must use this convention (`tests/framework/synthetic.h`). Positions are
+summed in double and rounded to float once.
 
 ### Solver internals
 
-- **ICGN** (inverse-compositional Gauss-Newton): the Hessian is constant per
-  subset (precomputed); each iteration interpolates the deformed subset,
-  normalizes (ZNSSD → invariant to affine intensity changes `a·I + b`),
-  accumulates the gradient via `simd::znssd_error_and_gradient`, then updates
-  `W ← W · ΔW⁻¹`. Converges when `‖Δp‖ < 0.001`, max 50 iterations.
-- **Sampling:** `sample_warped_subset` is the one place the deformed image is
-  read through a warp, for IC-GN and the Simplex alike; it fills values and a
-  per-pixel validity mask (inside the 4 px guard and not in the Ghost Wall).
-- **Guards:** ≥ 90% of warped pixels must be valid; post-convergence
-  texture check (sum of squared gradients of surviving pixels) rejects
-  texture-less matches. An iteration that loses pixels steps with its own
-  masked Hessian, and only if that Hessian passes the same 6×6 conditioning
-  test as the reference one (`hessian::well_conditioned`: 1-norm rcond with the
-  gradient rows scaled by the half-width, `tuning::kHessianMinRcond`); the
-  next full iteration is back on the reference Hessian. A step with a
-  non-invertible `ΔW`, or one that would make `W` non-finite (checked on the
-  bits, since `-ffast-math` folds `isfinite`), ends the solve as a failure on
-  the last good warp.
-- **Levenberg-Marquardt option** (`lm_enabled`, `lm_alpha`): adds `α` to
-  `H(0,0)`/`H(1,1)` only (translation DOFs), DICe-compatible. Off in a bare
-  `OptimizationEngine`, but `make_engine` turns it on for every pipeline
-  solve (anchors, Paths A, B and C, incremental re-anchoring).
-- **Simplex** (Nelder-Mead on ZNSSD): derivative-free rescue for bad seeds;
-  2-DOF or 6-DOF.
-
----
+- IC-GN keeps the subset's Hessian fixed. Each iteration samples, normalizes
+  (ZNSSD, invariant to `a·I + b`), accumulates with
+  `simd::znssd_error_and_gradient` and updates `W ← W · ΔW⁻¹`, until
+  `‖Δp‖ < 0.001` or `kIcgnMaxIter` (50) iterations.
+- `sample_warped_subset` is the only reader of the deformed image through a
+  warp. Its validity mask means inside the 4 px guard and off the Ghost Wall.
+- Rejected: under `kMinValidPixelFraction` (90%) valid pixels; an iteration
+  that lost pixels and whose masked Hessian fails the 2×2 or 6×6 test; a singular
+  `ΔW` or non-finite `W` (keeps the last good warp); after convergence, a zero
+  gradient sum in either axis or a non-finite score. The next full iteration
+  after a masked one returns to the reference Hessian.
+- LM (`lm_enabled`, `lm_alpha`) adds `α` to `H(0,0)` and `H(1,1)` only, as in
+  DICe. Off in a bare engine, on via `make_engine`.
+- Simplex: Nelder-Mead on ZNSSD, 2- or 6-DOF, ≤ 100 iterations. A warp
+  sampling under 90% scores `2.0`; a final score above `kSimplexFailScore`
+  (0.1) fails.
 
 ## Module: `include/semper/simd.hpp`
 
-Portable SIMD hot loops via **OpenCV universal intrinsics** — one codepath
-compiled to NEON on ARM and SSE on x86, scalar fallback elsewhere. Header-only;
-no OpenCV linkage required.
+Header-only loops on OpenCV universal intrinsics (NEON, SSE or scalar).
 
-```cpp
-namespace Semper::simd {
-  // Σ (vals[i] − mean)²
-  float sum_sq_diff(const float* vals, size_t n, float mean);
+| Function | Computes |
+|---|---|
+| `sum_sq_diff(vals, n, mean)` | Σ (vals[i] − mean)² |
+| `znssd_sum(vals, ref, n, mean, inv_std)` | Σ (ref[i] − (vals[i] − mean)·inv_std)² |
+| `znssd_error_and_gradient(…, sdi_planes, …, dp_out)` | That error, plus `dp[k] = Σ sdi_plane_k[i]·diff` |
 
-  // Σ (ref[i] − (vals[i] − mean)·inv_std)²
-  float znssd_sum(const float* vals, const float* ref, size_t n,
-                  float mean, float inv_std);
-
-  // Fused: returns the ZNSSD error AND accumulates the 6 gradient
-  // projections dp[k] = Σ sdi_plane_k[i]·diff over SoA planes.
-  float znssd_error_and_gradient(const float* vals, const float* ref,
-                                 const float* sdi_planes, size_t n,
-                                 float mean, float inv_std, float dp_out[6]);
-}
-```
-
-Contracts (all test-guarded):
-- Exact for any `n` (full vector blocks + scalar tail).
-- `znssd_error_and_gradient`'s error term ≡ `znssd_sum` for identical input.
-- `sdi_planes` layout: plane `k` at `[k·n, (k+1)·n)` — produced by `SubsetPrecomputer`.
-
----
+Tested contracts: any `n` (vector blocks, then a scalar tail); the fused error
+equals `znssd_sum`. Multiply, then add, never `cv::v_fma`: NEON fuses it and
+SSE2 cannot, so arm64 and x86-64 would disagree.
 
 ## Module: `include/semper/strain.hpp`
 
-```cpp
-struct DisplacementField { int width, height, step;       // grid dims + px spacing
-                           std::vector<float> u, v;        // px displacements
-                           std::vector<bool> valid; };
+`StrainCalculator` works on a `DisplacementField` (`width`, `height`, `step`,
+`u`, `v`, `valid`). `pack_full_field_output` runs
+`reject_displacement_outliers`, then `compute_vsg_strain`. Before solving,
+`run_full_field` returns `kBadStrainWindow` (`-4`) if `vsg_window_node_count`
+is under 3.
 
-static StrainField compute_vsg_strain (const DisplacementField&, int window_pixels);
-static int reject_displacement_outliers(DisplacementField&);   // clears valid[], returns count
-```
-
-`pack_full_field_output` runs `reject_displacement_outliers` on the solved grid
-before `compute_vsg_strain`. It is a normalized median test (MATHEMATICS §9.4)
-on u and v over each point's 5x5 neighbours, repeated until nothing new fails.
-Rejected points feed no strain window and are not written to the output, so they
-count in metrics slot 2 (rejected = attempted − solved) like any other drop.
-
-Outputs **Green-Lagrange strain**:
-`exx = ∂u/∂x + ½((∂u/∂x)² + (∂v/∂x)²)`, etc.
-
-| | VSG |
+| | |
 |---|---|
-| Method | least-squares plane fit over a circular window |
-| Exact for | any linear displacement field |
-| Rejection | < 90% window fill or `rcond < 1e-12` → sentinel `−1000.0f` |
-| Displacement outliers | normalized median test, 5x5, ε 0.1 px, threshold 3, repeated (`tuning::kOutlier*`) → point dropped before the fit |
+| Outlier test | Normalized median test on u and v ([MATHEMATICS §9.4](MATHEMATICS.md)): 5×5, ε 0.1 px, threshold 3, ≥ 3 neighbours, until stable or 5 passes (`kOutlier*`) |
+| VSG fit | Least-squares plane over a circular window; exact for linear fields |
+| VSG rejection | < 90% window fill, < 3 points or `rcond < 1e-12` → `−1000.0f` |
+| Output | Green-Lagrange, e.g. `exx = ∂u/∂x + ½((∂u/∂x)² + (∂v/∂x)²)`; `exy` is the tensor component |
 
-**Consumer warning:** VSG failures are marked with `−1000.0f`. Check before
-rendering/statistics.
+Outliers feed no window, are not written, and count in metrics slots 2 and 23.
+A field the fit cannot read (zero step, short vectors) is all `−1000.0f`;
+consumers must check for it.
 
----
+## Module: `include/semper/io.hpp`
+
+The adapters decode; the engine accepts only 8-bit single-channel images and
+masks. Rules: [CONTRACT.md](CONTRACT.md) ("Image I/O"). The engine relies on:
+
+- A mask value below 128 excludes a pixel, in the grid scan, the Ghost Wall
+  and the AKAZE match filter alike.
+- `to_gray8` maps a non-8-bit image linearly from its 0.1th–99.9th percentile
+  onto 0..255; `to_mask8` makes a non-8-bit mask boolean. `decode_gray` and
+  `decode_mask` differ only in which they call.
+
+## Module: `include/semper/pipeline.hpp` — `run_full_field`
+
+`full_field_solver.cpp` sequences the phases.
+
+### Phases
+
+| Phase | Function (file) | Notes |
+|---|---|---|
+| Checks | `validate_params` (`full_field_solver.cpp`) | Clips the rect to the image without moving the lattice |
+| Grid scan | `run_full_field_impl` | Marks `solved` (skipped) nodes within `subset_size/2 + 19` px of the border (4 px guard + 15 px reserve) or with a masked subset pixel |
+| Hessian pre-pass | `compute_hessian_only` | OpenMP `static` |
+| Seeding | `solve_anchor_seeds`, then `publish_anchor_results` (`full_field_anchors.cpp`, `akaze_features.cpp`) | Publishing is a separate, serial step |
+| Mesh guess | `build_mesh_guess_field` (`full_field_mesh.cpp`) | |
+| Path C | `run_path_c` (`full_field_path_c.cpp`) | Only without a seed |
+| Path A | `run_path_a` (`full_field_path_a.cpp`) | OpenMP `dynamic, 32` |
+| Path B | `run_path_b` (`full_field_path_b.cpp`) | Own `std::thread` workers |
+| Pack | `pack_full_field_output`, `fill_engine_metrics` (`full_field_solver_stats.cpp`) | Layouts: CONTRACT §A.4 |
+| Debug export | `full_field_debug_export.cpp` | When `cache.debug_dir` is set (one solve) |
+
+Progress: a ticker thread reports 10–90%; the calling thread sends `100` after
+it joins.
+
+### Seeding: AKAZE model and anchor lattice
+
+The global model: AKAZE matches the two frames over the ROI padded by
+`kAkazePadPx / scale` (40 px at full scale), filtered by Lowe's ratio (0.75)
+and the mask, then a RANSAC homography (3 px at the detection scale). The
+coarsest of 0.25×, 0.5×, 1× with 25 inliers (`kAkazeGoodInliers`) wins, else
+the best with 10 (`kAkazeMinInliers`). The search starts where the last
+completed solve on this reference settled, trying coarser scales only if
+nothing from there fits.
+
+The lattice: about `kAnchorTarget` (256) nodes, per-axis stride, last row and
+column included (`plan_anchor_lattice`), solved by IC-GN on the pool (OpenMP
+`dynamic, 4`). An anchor starts from the homography at its position if the
+model moves an ROI corner over `kSimilarityMinCornerPx` (4 px) beyond its
+centre translation; otherwise from that translation.
+
+1. ZNSSD ≤ `kAnchorAcceptScore` (0.40) makes a vertex candidate; ≤
+   `kCorrAccept` (0.15) also makes it publishable.
+2. `mark_kept_anchors` keeps a vertex within `kAnchorMedianTol` (1 px) of the
+   median of its vertex 8-neighbours, on the residual from the model; with
+   fewer than three such neighbours it is not kept.
+3. `publish_anchor_results` marks kept, publishable anchors solved (Path A
+   skips them, Path B seeds from them). As this follows the median test, a
+   confident match on the wrong speckle never seeds the flood fill.
+
+A model whose lattice is not `FULL`, or keeps under `kSimilarityKeepFraction`
+(90%), is rejected and the lattice re-solved from the translation. With ≥ 8
+kept anchors (`kAnchorRefitMinPoints`) the homography is refitted to them
+(RANSAC 1 px); a rejected model without a refit seeds nothing outside the
+mesh. The mesh is `FULL` with ≥ 10 kept vertices, ≥ 60% of attempts kept and
+≥ 30% hull coverage; `SPARSE` with ≥ 3 vertices and ≥ 5%; else `NONE`.
+
+Seeding follows the pre-pass so anchors reuse the pool. Anchors, not
+keypoints, are the vertices: guess gradients err by vertex error over edge
+length, about 1 px for keypoints against 0.01 px for anchors
+([SEEDING_BENCHMARK.md](SEEDING_BENCHMARK.md)). `phase_correlate.cpp`, the
+front end replaced in 0.6.0, remains for `seeding.hpp` but is unused.
+
+### Mesh, Path A, Path B, Path C
+
+- Mesh guess: `cv::Subdiv2D` triangulates the kept anchors; a node in a
+  triangle takes its affine map (`kMeshInTriangle`). With a `FULL` mesh, nodes
+  within 3 steps take the nearest triangle's (`kMeshExtrapolated`). The rest
+  take the homography (`kMeshHomography`); the field is then smoothed over 5×5.
+- Path A solves every guessed, unsolved node and accepts converged ones with
+  ZNSSD ≤ `kCorrAccept`. Outside triangles it leaves failures to Path B.
+- Path B floods in rounds. A serial claim pops the `kPathBBatchNodes` (32)
+  lowest-ZNSSD nodes (ties by row, then column) and gives each unclaimed
+  4-neighbour to the first that touches it, guessed by first-order expansion.
+  Workers solve in parallel; a serial commit applies rounds in order, two in
+  flight, so the field does not depend on timing or thread count.
+- Path B seeds: solved nodes next to unsolved ones; else up to 5 kept anchors
+  (smallest whole-pixel displacement, then nearest the centre); else, or if
+  those fail, the Path C seed.
+- Path C runs when the mesh is `NONE`, no kept anchor is publishable and under
+  3 vertices were kept. It tries up to `kPathCMaxCandidates` (9) nodes nearest
+  the centre, starting from the global shift. If all fail, the solve returns
+  `kSeedFailed` without an AKAZE lock, or goes on to Path B with one.
+
+### Reference cache
+
+`ReferenceCache` holds the prepared `Image`, its gray `cv::Mat`, `debug_dir`,
+`precompute` and a `mutex`, which JNI holds around a solve; it does not make
+the methods thread-safe.
+
+- `set_from_gray` resets first, refuses non-8-bit input or over `INT_MAX`
+  pixels, and installs the image only once built: refusal or throw leaves the
+  cache empty.
+- `adopt` / `internal::adopt_reference` (incremental DIC) takes a prepared
+  image. All throwing steps run first, so a throw keeps the outgoing reference.
+  It carries over the AKAZE starting scale and features.
+- The Ghost Wall stamps `kGhostWallValue` (−10) into masked pixels after
+  `prepare_data`, so edge gradients use real intensities. Subset code skips
+  pixels below `kGhostWallThreshold` (−5); `reject_if_ghosted` fails a subset
+  over 5% of them.
+
+| `RefPrecompute` part | Keyed on | Notes |
+|---|---|---|
+| Grid scan + Hessian pool | Clipped rect, `step`, `subset_size`, mask (exact) | Valid only after a complete, uncancelled pre-pass |
+| AKAZE keypoints, per scale | ROI rect | Detected once per scale |
+| `akaze_first_level` | — | Moved only by a completed solve |
+
+The scan, pool and keypoints are bit-identical with or without the cache
+(`FullField.RefCache_*`). The starting scale is not: a solve may take its model
+from a finer scale than a cold one, the only way a solve depends on earlier
+ones (CONTRACT, "Reference cache"). Steepest-descent images are not cached:
+`dim² × 6` floats per node is too much for a phone.
+
+### Errors and threads
+
+- OpenMP regions and Path B use `std::thread::hardware_concurrency()` workers,
+  each with its own engine and `SubsetData`. Both overwrite all they read, so
+  the worker cannot change a result.
+- An exception must not leave an OpenMP region: each catches into a
+  `RegionErrors`, skips the remaining iterations and rethrows after the join.
+  A throwing Path B worker stops the flood; it rethrows once all join. The
+  adapters' `guarded_call` maps it to their error value.
+
+## Module: `include/semper/cancel.hpp` — cancellation
+
+API and token semantics are in CONTRACT. The mechanism:
+
+- Window: each solve entry calls `CancelToken::enter`, which clears an old
+  request unless an adapter opened a `CancelScope`. JNI and Python open it once
+  they hold their lock; the C ABI before decoding.
+- Latch: `run_full_field_impl` polls through `SolveCancel`; once a poll sees a
+  request, the solve keeps seeing it even if the token is cleared (JNI
+  `setCancelRequested(false)` is lock-free). Otherwise a pre-pass could mark a
+  holed pool complete, or Paths A and B return a partial field as success.
+- A poll is one relaxed load per point; a late one costs a point, not a result.
+
+| Poll site | Shape |
+|---|---|
+| Pre-pass, anchor lattice, Path A | `continue` (no `break` out of an OpenMP `for`) |
+| After pre-pass, seeding, Path A, Path B; Path C loop | `return kCancelled`: no strain or packing on a partial field |
+| Path B seeds and workers | `return`; the flag is in the CV predicate |
+| Path B's CV wait | `wait_for` `kCancelPollMs` (20 ms): nobody notifies a parked worker |
+
+A cancelled solve leaves the pool stale and the AKAZE scale unmoved.
+`kCancelled` (`-99`) equals Kotlin's `AnalysisRunCodes.ERROR_CANCELLED`, which
+the app discards silently, unlike the `-2` / `-3` dialogs. In the app,
+`AnalysisViewModel.cancelRequested` and `VsgStudyRunner.cancelRequested`
+forward to `setCancelRequested` and assign `false` at the top of a run.
 
 ## Module: `include/semper/incremental.hpp` — class `IncrementalSession`
 
-Multi-frame DIC that can move its reference forward. The maths is in
-[MATHEMATICS.md §9.5](MATHEMATICS.md#95-incremental-updated-reference-dic);
-the surface is in [CONTRACT.md](CONTRACT.md).
+Maths: [MATHEMATICS.md §9.5](MATHEMATICS.md#95-incremental-updated-reference-dic).
 
 ```
-init(frame 0)        -> validate params, ReferenceCache::set_from_gray (the
-                        frame-0 grid scan runs with the first solve)
+init(frame 0)      -> validate_params, material mask, set_from_gray
 process_frame(t):
-  k == 0             -> run_full_field_impl into the caller's buffer (bit-identical)
-  k  > 0             -> run_full_field_impl on reference k's grid into scratch
-                        -> node_field_from_capture (solved, ZNSSD >= 0, median test)
-                        -> sample_increment at X0 + U(X0,k) for every tracked node
-                           - nothing in reach: fit_increment (coast, unreported)
-                           - coasted far: match_anchor before it is reported again
-                        -> frame-0 ResultGrid -> pack_full_field_output (VSG, packing)
-  every N frames,    -> make_anchor for clean nodes near a gap (from this frame)
-  or on a 5% drop       warp_material_mask, ReferenceCache::adopt(prepared image)
+  reference 0      -> run_full_field_impl into the caller's buffer (bit-identical)
+  reference k > 0  -> run_full_field_impl on reference k's grid into scratch
+                      -> node_field_from_capture (solved, ZNSSD >= 0, median test)
+                      -> sample_increment at X0 + U(X0,k) per tracked node
+                         (no sample: fit_increment, coast; coasted far: match_anchor)
+                      -> frame-0 ResultGrid -> pack_full_field_output
+  update due       -> make_anchor near gaps; prepare_reference (warp_material_mask,
+                      new grid rect); adopt_reference; commit
 ```
 
-- **Hand-off without rework.** `run_full_field_impl` takes an optional
-  `FieldCapture`. It returns the solved grid and, on a frame that will become
-  the next reference, the prepared deformed `Image` and its gray `cv::Mat`.
-  `ReferenceCache::adopt` takes them over and stamps the mask, so the new
-  reference is never decoded or prepared twice, and at most two `Image`s are
-  alive at once.
-- **State.** Per frame-0 node: the base displacement `U(X0, k)`, an `alive`
-  flag and the distance it has coasted. Anchors (a ~1.5 KB grey patch each)
-  only for nodes near a gap or coasting. Also the reference index, the frames
-  since the last update, the points reported on the first frame against the
-  reference, and the reference's mask and ROI.
-- **Errors and cancel.** Every state change happens after a successful solve,
-  so a negative return leaves the session as it was.
-- **Between updates (N > 1)** every frame after the first one on a reference
-  reuses that reference's cached grid scan, Hessian pool and AKAZE keypoints.
-- **On an update** the keypoints AKAZE found on the deformed frame become the
-  new reference's (those inside its padded ROI), and the AKAZE scale carries
-  over, so a reference is never detected twice.
-- **Metrics** are the increment solve's; frame-0 counts are in
-  `IncrementalFrameInfo`.
+- Updates: every `N` frames, or early (N > 1) when a frame reports
+  `kIncEarlyUpdateDrop` (5%) fewer points than the reference's first frame.
+  Never onto a frame under `kIncUpdateMinReported` (50%) of that count (else
+  of the reference's own count, else of the frame-0 nodes); the update waits.
+- Hand-off: `FieldCapture` (filled after Path B, before packing) also keeps,
+  for N > 0, the deformed `Image`, its gray and AKAZE features, as any frame
+  may become the reference. Nothing is prepared twice; at most two full-frame
+  `Image`s exist.
+- State per frame-0 node: `U(X0, k)`, `alive`, coasted distance. Anchors exist
+  only near gaps or while coasting: a gray patch of side
+  `subset_size + 2·kIncAnchorMarginPx` (3.7 KB at subset 41).
+- Coasting: a node with no solved node within `kIncTaylorMaxCells` moves,
+  unreported, on a weighted plane through solved increments within
+  `kIncCoastRadiusCells`. It is dropped past `kIncCoastMaxTravelSubsets`; past
+  `kIncCoastTrustedTravelSubsets` it is reported only once `match_anchor`
+  confirms it.
+- Errors: an update builds its state on copies; `adopt_reference` is the last
+  throwing step; the commit only moves and swaps. A negative return or
+  exception leaves the session unchanged. Failed frames, `kSeedFailed`
+  included, are not counted, so indices then lag the caller's by one.
+- A moved reference with no solvable node (`-2`) drops the nodes; the frame
+  returns 0 points and zeroed metrics.
+- Frames between updates reuse the reference's scan, pool and keypoints. At an
+  update the deformed frame's AKAZE features replace a fresh detection at their
+  scale if they cover ≥ `kAkazeReuseCover` (90%) of the new padded ROI.
 
-Tunables: `tuning::kIncTaylorMaxCells`, `kIncMaskMaxSamplesPerPx`,
-`kIncMaskExtrapCells`, `kIncCoastRadiusCells`, `kIncCoastMinNodes`,
-`kIncCoastMaxTravelSubsets`, `kIncCoastTrustedTravelSubsets`,
-`kIncReanchorMaxShiftFraction`, `kIncReanchorMinShiftPx`, `kIncAnchorMarginPx`,
-`kIncEarlyUpdateDrop`, `kIncUpdateMinReported`.
-
----
+Other tunables: `kIncMaskMaxSamplesPerPx`, `kIncMaskExtrapCells`,
+`kIncCoastMinNodes`, `kIncReanchorMaxShiftFraction`, `kIncReanchorMinShiftPx`.
 
 ## Module: `adapters/android/jni/SemperJNI.cpp`
 
-JNI surface (see `SemperNativeLib.kt` for the Kotlin declarations).
-Key behaviors:
+Exports and behaviour: CONTRACT §A.3. Internals:
 
-- `initializeReference(...)` caches the decoded reference image in
-  `g_cache` (guarded by `g_cache.mutex`) so batch runs decode once. A mask
-  that does not decode clears the cache rather than being ignored.
-- `computeFullFieldDirect(...)` runs the full pipeline (OpenMP for the
-  pre-pass, `static`; the anchor lattice, `dynamic, 4`; Path A,
-  `dynamic, 32`; Path B on its own `std::thread` workers), reliability-guided seed propagation, and
-  progress callbacks marshalled through a `NewGlobalRef` + `AttachCurrentThread`.
-- Results are written into a direct `ByteBuffer` (no copy back through JNI).
-- `initializeIncremental(...)` / `computeIncrementalFrame(...)` /
-  `releaseIncremental()` (v0.4.0) drive one `IncrementalSession` under the same
-  mutex. `initializeIncremental` drops the fixed-reference cache, since only one
-  of the two paths runs at a time. `computeIncrementalFrame` fills an optional
-  `int[6]` with the frame info.
-- `setCancelRequested(...)` sets the cooperative cancel flag. It takes **no
-  lock** on purpose: `computeFullFieldDirect` holds the reference-cache mutex
-  for the whole solve, so a cancel that waited for it could never arrive while
-  the solve it means to stop is still running.
-
-Threading contract: **one `OptimizationEngine` + one `SubsetData` per OMP
-thread**; `SubsetData` buffers are reused across grid points via the
-`precompute_subset_fast` pool.
-
-### Cancellation — `include/semper/cancel.hpp`
-
-A `CancelToken` per solve, passed down to every phase (`SolveContext::cancel`,
-and to `solve_anchor_seeds`) and polled inside the point loops, so a cancel
-lands within a point or two instead of at the end of the frame. One relaxed
-atomic load per point is nothing against an ICGN solve. The process-wide
-functions (`request_cancel` / `clear_cancel` / `cancel_requested`) act on the
-token that the overloads without one pass down; nothing is shared between
-solves that bring their own.
-
-Where it is polled, and why there:
-
-| Site | Shape |
-|---|---|
-| Hessian pre-pass, anchor lattice, Path A mesh execution | `if (cancel.requested()) continue;` — OpenMP forbids breaking out of a parallel `for`, so a cancel skips the remaining iterations |
-| Path B workers | the flag in the condition-variable predicate, then `return` |
-| Path B's CV wait | bounded (`wait_for`, 20 ms) — a worker waiting for the next round has no one to notify it of a cancel, so it re-checks on a timer |
-| After Path A, after Path B | `return kCancelled` — a cancelled field is partial, so strain and packing are never run on it |
-
-`run_full_field` returns `kCancelled` (**-99**), which is deliberately the same
-value as `AnalysisRunCodes.ERROR_CANCELLED` on the Kotlin side: the app already
-treats that code as "cancelled, discard", distinct from the `-2` / `-3` engine
-failures that raise a dialog.
-
-The flag is **sticky** — it survives the solve it stopped — so every run clears
-it before starting. Both `AnalysisViewModel.cancelRequested` and
-`VsgStudyRunner.cancelRequested` forward to it from their setters, and both
-assign `false` at the top of a run.
+- `g_cache` and at most one `g_session` share `g_cache.mutex`, held for a
+  whole solve; `setCancelRequested` takes no lock, so it can stop that solve.
+- `decode_optional`: an array that does not decode is `-3`, never "no mask";
+  masks use `decode_mask`.
+- Results go into the direct `ByteBuffer`, bounded by its capacity.
+- `ProgressBridge` holds a `NewGlobalRef` and attaches the progress thread
+  (`AttachCurrentThread`). A thread-local flag makes a locking export called
+  from the callback fail instead of deadlocking.
+- Every export runs through `guarded_call`; no JNI call runs with a Java
+  exception pending.
 
 ### Parameters from the app
 
-`StaticAnalysisActivity` ("Advanced parameters" in the setup wizard) is the
-only producer of the three solve parameters. Each has a slider plus an
-editable numeric field; both write the same slider value, which is what
-`currentSubsetSize()` / `currentStepSize()` / `currentStrainWindow()` read.
+`StaticAnalysisActivity` ("Advanced parameters" in the setup wizard) alone
+sets the solve parameters. A slider and a field write one value, read by
+`currentSubsetSize()` / `currentStepSize()` / `currentStrainWindow()`.
 
 | Parameter | JNI argument | Default | Range | Step |
 |---|---|---|---|---|
-| Subset size | `subsetSize` → `dim` | 41 | 15–101 | 2 (**odd only**) |
+| Subset size | `subsetSize` → `dim` | 41 | 15–101 | 2 (odd only) |
 | Step size | `stepSize` → grid spacing | 5 | 1–30 | 1 |
-| Strain window | `strainWindow` → `window_pixels` | 15 | 5–51 | 2 (**odd only**) |
+| Strain window | `strainWindow` → `window_pixels` | 15 | 5–51 | 2 (odd only) |
 
-Typed input is clamped to the range and snapped onto the slider's step grid
-by `snapToSlider`, so the odd-`dim` invariant above holds for hand-entered
-values too. Fields commit on IME "Done", on focus loss, and before the solve
-starts — a pending edit can never reach the engine uncommitted.
+`snapToSlider` clamps and snaps typed input, so `dim` stays odd. Fields commit
+on IME "Done", on focus loss and before the solve starts.
 
----
+## Module: `adapters/c/` and `bindings/python/`
+
+Behaviour is in CONTRACT. Each C ABI handle owns a cache or session and a
+`CancelToken`; a `busy` flag (`HandleCall`) admits one call per handle, cancel
+excepted. Python's `run_interruptible` solves on a worker thread while the
+caller waits without the GIL and checks signals every 50 ms, so Ctrl-C
+cancels. An exception from `progress` cancels the solve and is raised after.
 
 ## Package map
 
-| Path | Role |
-|---|---|
-| `include/semper/` | Public headers (`types`, `image`, `subset`, `solver`, `strain`, `simd`, `pipeline`, `incremental`, `io`, `seeding`, `cancel`, `metrics`, `version`, `tuning`, `assert`, `guarded_call`, `semper_c.h`; tiers in CONTRACT.md) |
-| `src/math/` | Image / SubsetPrecomputer / OptimizationEngine |
-| `src/strain/` | StrainCalculator |
-| `src/io/` | Platform-agnostic OpenCV decode |
-| `src/pipeline/` | Anchor seeding (AKAZE homography + lattice) + full-field Path A/B/C + OpenMP; incremental session (composition, mask warp) |
-| `adapters/android/` | JNI only → `libsemper_core.so` |
-| `adapters/c/` | Stable C ABI → `libsemper_c` |
-| `bindings/python/` | pybind11 module |
-| `tests/` | Host unit / integration / DICe / perf + C smoke |
+Layout: README. In `src/`: `math/` (`Image`, `SubsetPrecomputer`,
+`OptimizationEngine`, `hessian.hpp`), `strain/`, `io/` (`image_codec.cpp`),
+`pipeline/` (the phases plus `reference_cache.cpp`, `cancel.cpp`,
+`incremental_*.cpp`, `phase_correlate.cpp`) and `util/` (`finite.hpp`,
+`omp.hpp`, `log.hpp`, `median.hpp`).
 
-CMake targets: `semper_math`, `semper_pipeline`, `semper` (interface), `semper_android` (`OUTPUT_NAME semper_core`), `semper_c`, `_semper` (Python).
+`src/` never includes `jni.h`; `android/log.h` appears only in
+`src/util/log.hpp`, behind `SEMPER_ANDROID_LOG`. The JNI adapter includes only
+`include/`, so it can move to the app repository.
 
----
+## Dependencies
 
-## Dependencies (git submodules, built from source)
-
-Both libraries are **git submodules**, not vendored binaries. Run
-`git submodule update --init --recursive` after cloning.
-
-`.gitmodules` records only `path` and `url` — there is no `branch` or tag entry.
-What pins the build is the **commit SHA the superproject records**, which is
-what `git submodule update` checks out. Those SHAs currently sit exactly on the
-upstream release tags below, so `git submodule status` prints the tag name, but
-that is a property of the commits chosen, not a constraint the repo enforces:
-bumping a submodule to an arbitrary commit would be accepted silently. Verify
-with `git submodule status` rather than trusting this table.
-
-| Dependency | Path | Recorded commit | Tag at that commit | How it's used |
+| Dependency | Path | Commit | Release | Use |
 |---|---|---|---|---|
-| **Eigen** | `third_party/eigen` | `bc3b3987` | 5.0.1 | header-only; added via `include_directories` |
-| **OpenCV** | `third_party/opencv` | `0654a42e` | 4.14.0 | **compiled from source** in the engine build |
+| Eigen | `third_party/eigen` | `bc3b3987` | 5.0.1 | Header-only, `SYSTEM` include |
+| OpenCV | `third_party/opencv` | `0654a42e` | 4.14.0 | Built from source, static |
 
-**OpenCV modules compiled:** `core,imgproc,imgcodecs,features2d,calib3d,flann`
-(`SEMPER_OPENCV_REQUIRED_MODULES` in `cmake/SemperOpenCV.cmake`, the modules
-`semper_pipeline` links). OpenCV's `BUILD_LIST` is always that set plus
-`SEMPER_OPENCV_BUILD_LIST`, a comma-separated cache option (empty by default)
-for extra modules; it cannot remove a required one. Through v0.5.x
-`SEMPER_OPENCV_BUILD_LIST` was the whole list, so build trees configured then
-cache `core,imgproc,imgcodecs`; the merge keeps such a cache from dropping the
-AKAZE modules. Configure also fails if a required module ends up without a
-target (e.g. a cached `BUILD_opencv_calib3d=OFF`), instead of failing at link
-time. `features2d`, `flann` and `calib3d` were dropped in v0.2.2 along with the
-descriptor seeding front-end that used them (~29% of the aarch64
-`libsemper_c.so`), and came back in v0.6.0 for the AKAZE global model: the
-stripped x86-64 Python extension grows from 12.30 MB to 14.32 MB (+16%). Only
-`src/pipeline/akaze_features.cpp` and `full_field_anchors.cpp` include their
-headers; nothing under `include/semper/` does.
+- Pinning: the recorded SHA pins the build. `.gitmodules` has `path`, `url`
+  and (OpenCV) `ignore = untracked`, no branch or tag, so any bump goes in
+  silently. `git submodule status` shows a tag only if the clone has tags.
+- Modules: `core imgproc imgcodecs features2d calib3d flann`
+  (`SEMPER_OPENCV_REQUIRED_MODULES`; keep `cmake/SemperOpenCV.cmake` and
+  `CMakeLists.txt` in sync). `SEMPER_OPENCV_BUILD_LIST` only adds; a missing
+  required target fails configure. `features2d`, `calib3d` and `flann` serve
+  only AKAZE (`akaze_features.cpp`, `full_field_anchors.cpp`), never
+  `include/semper/`. Rationale and size: CHANGELOG 0.6.0, 0.6.1.
+- Build: `add_subdirectory(… EXCLUDE_FROM_ALL)`, `BUILD_SHARED_LIBS OFF`,
+  bundled codecs. In-tree targets export no headers, so their `include/` dirs
+  and `CMAKE_BINARY_DIR` (`opencv_modules.hpp`, `cvconfig.h`) are added
+  explicitly. Engine flags are per target.
+- Sparse checkout: `scripts/sparse-opencv.sh` (`.ps1` on Windows) keeps
+  `modules include 3rdparty cmake platforms hal`; it and
+  `cmake/SemperOpenCV.cmake` plant the stub `doc/` and `data/` CMake files
+  OpenCV always adds.
 
-**OpenCV threads.** AKAZE, the matcher and RANSAC run inside a one-stripe
-`cv::parallel_for_`, so OpenCV runs their own parallel loops inline and never
-wakes its thread pool for them. On a few hundred pixels the pool saves under
-1 ms, and its workers would still be spinning when the engine's OpenMP region
-starts (2–3× the wall time of a small-ROI frame on a 20-thread host). The
-Android adapter pins OpenCV to one thread in `JNI_OnLoad`.
+### OpenCV threads
 
-**Sparse OpenCV checkout:** the full OpenCV repo includes `doc/`, `samples/`,
-`data/`, and `apps/` that this project never builds. After submodule init, run
-`scripts/sparse-opencv.sh` (or `scripts/sparse-opencv.ps1` on Windows) to drop
-those trees from the worktree (~100+ MB). CMake only needs `modules/`,
-`include/`, `3rdparty/`, `cmake/`, and the top-level `CMakeLists.txt`.
-
-**OpenCV from-source integration** (`CMakeLists.txt`):
-
-- `add_subdirectory(third_party/opencv …)` builds OpenCV as part of this
-  CMake project. A curated `BUILD_LIST` (see above) compiles only the modules
-  the engine uses — `core, imgproc, imgcodecs, features2d, calib3d, flann` — which keeps the
-  build to a few minutes per ABI instead of tens.
-- `BUILD_SHARED_LIBS OFF` → OpenCV is **statically linked** into
-  `libsemper_core.so` / `libsemper_c` (which is why the Android `.so` is
-  ~10–22 MB per ABI). We link the in-tree targets directly:
-  `opencv_core opencv_imgproc opencv_imgcodecs opencv_features2d
-  opencv_calib3d opencv_flann`.
-- OpenCV's bundled 3rd-party image codecs (`zlib/png/jpeg/tiff/webp`) are built
-  in-tree, so `cv::imdecode` / `cv::imwrite` work with **no system libraries**.
-- OpenCV's in-tree targets don't export their header dirs, so the module
-  `include/` paths and the generated-header dir (`opencv_modules.hpp`,
-  `cvconfig.h` in `CMAKE_BINARY_DIR`) are added explicitly.
-- `OPENCV_PYTHON_SKIP_DETECTION ON` disables OpenCV's host-Python detection for
-  the C++/JNI build (the optional `bindings/python` path uses pybind11
-  separately).
-- OpenCV compiles with its **own** default flags: `add_subdirectory` runs before
-  the engine's aggressive `-O3 -ffast-math` flags are set, so those apply
-  to the DIC code only, not to OpenCV.
-
-The host test build ([TESTING.md](TESTING.md)) consumes OpenCV's universal-intrinsics
-header from the submodule source; the two generated headers it needs are
-committed under `tests/shim/opencv2/` so host builds need no OpenCV
-configure.
+AKAZE detection, matching and RANSAC run inside a one-stripe
+`cv::parallel_for_` (`without_opencv_pool`), so OpenCV runs their loops inline
+and never wakes its pool. The pool saves under 1 ms on a small ROI, but its
+spinning workers slowed the next OpenMP region, up to 2–3× a small-ROI frame's
+wall time on a host. The Android adapter pins OpenCV to one thread in
+`JNI_OnLoad`.
 
 ## Build & ABI strategy
 
-- Downstream Android apps configure with `-DSEMPER_ANDROID=ON` (typical ABI
-  **arm64-v8a**; debug often adds **x86_64** for emulators).
-- OpenCV is compiled once per ABI into the shared lib; NDK `.cxx/` caches the
-  from-source build across incremental compiles.
-- SIMD portability comes from `include/semper/simd.hpp`; there is **no**
-  architecture-conditional code left in the engine (`#if __aarch64__` was
-  removed — do not reintroduce it; extend the kernels instead).
-- Production flags: `-O3 -ffast-math`, plus OpenMP on host when CMake finds
-  it. Without it (MSVC, Apple Clang without libomp) the `#pragma omp` regions
-  run on the calling thread: thread indices go through `util::omp_thread()`
-  (`src/util/omp.hpp`), never `omp.h` directly. CI's `serial-build` job
-  builds the suite that way (`DIC_OPENMP=OFF`, warnings fatal) and runs it.
-  Android also uses
-  `-flto` on the pipeline/JNI targets. Note `-ffast-math` disables NaN
-  semantics: Inf/NaN checks read the bits (`util::finite_bits`,
-  `src/util/finite.hpp`), never `std::isfinite` or `!(x > eps)`, and the
-  code uses explicit sentinels (`-1.0f`, `-1000.0f`) instead of
-  `std::isnan`. Preserve this convention. Host shared-lib builds intentionally
-  omit `-flto` (MinGW LTO + DLL is unstable).
-- 16 KB page alignment: `-Wl,-z,max-page-size=16384` on the Android shared lib for
-  Android 15+ devices.
+- Android: `-DSEMPER_ANDROID=ON`, typically `arm64-v8a` (debug adds
+  `x86_64`). `SEMPER_FORCE_RELEASE` keeps OpenCV off `-O0` under AGP Debug.
+  OpenCV compiles once per ABI, cached in the NDK's `.cxx/`. The library links
+  with `-Wl,-z,max-page-size=16384` for Android 15+ 16 KB pages.
+- SIMD goes only through `simd.hpp`; never reintroduce `#if __aarch64__`.
 
-### Platform support, and what CI actually gates
+### Compiler flags
 
-| platform | status | gated by |
-|---|---|---|
-| Linux x86_64 (GCC, Clang) | supported | every CI job |
-| Android arm64-v8a | shipping target | `android-ndk` compiles the JNI adapter (no device run); the app builds the APK |
-| Windows x86_64 (MinGW-w64) | **works, but ungated** | nothing |
-| aarch64 Linux cross | measurement only | nothing (see the toolchain header) |
-| MSVC | headers declare `dllexport`/`dllimport`, never built | nothing |
+Non-MSVC; MSVC keeps its defaults.
 
-Windows is a first-class *development* platform here — the engine, the C SDK
-and the full test suite all build and pass under MinGW-w64 — but no workflow
-builds it, so nothing stops a Windows break from landing. That is not
-hypothetical: `tests/integration/test_seeding_bench.cpp` shipped with an
-unguarded `<sys/resource.h>`, which broke not the benchmark but the whole
-`dic_tests` binary, and it survived review and a green CI run because CI is
-Linux.
+| Target | Flags |
+|---|---|
+| `semper_math` | `-O3 -ffast-math -fno-finite-math-only -ffp-contract=off -fPIC -fvisibility=hidden` |
+| `semper_pipeline` | Same plus `-fexceptions`; Android adds `-flto -fopenmp`, host links OpenMP when found |
+| `semper_android` | As the Android pipeline; links `-s -flto -Wl,-z,max-page-size=16384 -fopenmp -static-openmp -static-libstdc++` |
+| `semper_c` | `-O3 -fPIC -fvisibility=hidden`; `semper_c.map` limits ELF exports |
 
-A Windows job is the real fix and is not currently justified: it would have to
-build the vendored OpenCV submodule on a Windows runner, which is the slowest
-part of the build and would dominate CI time for a platform nothing ships on.
-Until that changes, the rule is procedural: **a change that touches system
-headers, process/OS APIs or paths must be compiled on both hosts before
-merge**, and cross-host numeric results are covered separately by the
-tolerances documented in [TESTING.md](TESTING.md).
+- `-ffp-contract=off`: a multiply-add rounds alike on aarch64, where compilers
+  fuse it, and on baseline x86-64.
+- `-fno-finite-math-only`: NaN and Inf checks survive `-ffast-math`. The code
+  still checks finiteness on the bits (`util::finite_bits`) and uses sentinels
+  (`-1.0f` no correlation, `-1000.0f` failed strain), never NaN. Keep it so.
+- Host shared libraries omit `-flto` (a MinGW DLL from an LTO archive fails to
+  load). `SEMPER_SANITIZER` drops LTO and adds `float-cast-overflow` to
+  `undefined`.
+
+### OpenMP
+
+Host builds link OpenMP when found; `SEMPER_REQUIRE_OPENMP=ON` (macOS wheels)
+fails configure otherwise. Without it (MSVC, Apple Clang without libomp) every
+`#pragma omp` region runs on the calling thread, so thread indices come from
+`util::omp_thread()`, never `omp.h`. CI's `serial-build` job tests that build.
+
+### Platform support and CI gates
+
+What each CI job gates: [TESTING.md](TESTING.md) ("CI jobs").
+
+| Platform | Status |
+|---|---|
+| Linux x86-64 (GCC; Clang 18 for TSan) | Supported, CI-gated |
+| Android arm64-v8a | Shipping; CI compiles it (no device run), the app builds the APK |
+| macOS; Windows with MSVC | Python wheels from the manual `wheels` workflow; not gated |
+| Windows, MinGW-w64 | Engine, C SDK and tests build and pass; not gated |
+| aarch64 Linux cross | Size measurement only (`cmake/toolchains/aarch64-linux-gnu.cmake`) |
+
+No Windows job exists: it would build OpenCV on a Windows runner, the slowest
+step, for a platform nothing ships on. An unguarded `<sys/resource.h>` in
+`tests/integration/test_seeding_bench.cpp` once broke the Windows build past
+review and green CI. So compile changes to system headers, OS APIs or paths on
+both hosts before merge.

@@ -12,9 +12,10 @@ signature, slot or packing changed.
 
 ### Fixed — cancellation
 - A cancel issued while an adapter was still decoding the frame (or, in
-  Python and JNI, waiting for its lock or allocating) was cleared by the
-  solve's entry and the solve ran to completion. The adapters open the cancel
-  window at their own entry (`CancelScope`).
+  Python and JNI, allocating its output) was cleared by the solve's entry and
+  the solve ran to completion. The adapters open the cancel window at their
+  own entry (`CancelScope`); Python and JNI open it once they hold their lock,
+  so a cancel made while a call waits for the lock stops the solve in flight.
 - A cancel requested and then cleared mid-solve (JNI `setCancelRequested`
   is lock-free) let the Hessian pre-pass mark a pool with holes complete: the
   solve returned the holes as a success and every later solve against the
@@ -103,8 +104,20 @@ signature, slot or packing changed.
   cancelled by the next push; pip installs pinned; fail-closed tool checks;
   wheels fail on a missing sparse checkout or an empty wheelhouse, and the
   macOS wheels find (and require) OpenMP.
+- Wheels: the macOS wheels bundle a libomp built from LLVM 21.1.8 source for
+  macOS 11.0 (`scripts/build-libomp-macos.sh`); Homebrew's targets the
+  runner's macOS 26 and delocate rejected it. The wheel tests pin pytest
+  8.4.2 (9.x needs Python 3.10, so cp39 could not install it) and run
+  `{package}/tests`, the Python tests, instead of the repository's C++
+  `tests/`.
 
 ### Docs
+- Rewritten for readability: README (quick start from a fresh clone, entry
+  points, all CMake options), CONTRACT (metrics-slot and return-code tables),
+  ARCHITECTURE, TESTING (one-row-per-suite catalog, CI job table), the
+  examples and benchmark docs (summary first). Statements were checked
+  against the code and corrected where stale; MATHEMATICS regains about 28
+  equations that were blank in the file, and describes the coarse search.
 - MATHEMATICS: the reported score is the per-pixel mean ZNSSD (so
   `2(1 - ZNCC)` and the 0.15 gate hold for it); IC-GN and Simplex iteration
   limits (50, 100); the VSG fit is a plane with an explicit inverse and an

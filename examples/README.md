@@ -1,62 +1,43 @@
 # Examples
 
-Beginner demos using **published DICe sample images** that this engine’s host
-suite already verifies.
+Three small programs that run the engine on sample images and check the
+result. Run them from the repository root after the setup in the
+[README](../README.md#quick-start). What each sample verifies:
+[docs/EXAMPLES.md](../docs/EXAMPLES.md).
 
-| Sample | Images | Verified result |
+| Program | What it shows | Pass line |
 |---|---|---|
-| [samples/translation](samples/translation/) | `ref.tif` / `def.tif` (512²) | DICe custom_app: \|u − 0.4\| ≤ 0.1 px at four subsets |
-| [samples/oht_cfrp](samples/oht_cfrp/) | `ref.tiff` / `def.tiff` (400×1040) | Field agreement vs `DICe_solution_01.txt` (host test) |
+| `cpp/run_translation` | Subset solver on the DICe 0.4 px pair: \|u − 0.4\| ≤ 0.1 px at four subsets | `OK — DICe custom_app contract: 4/4 subsets ...` |
+| `python/run_synthetic.py` | Full-field solve of a synthetic +3 px shift; confirms the Python install | `OK — synthetic translation recovered` |
+| `python/run_translation.py` | Full-field solve of the DICe pair from Python; prints the metrics | see below |
 
-Redistributed under [samples/LICENSE.DICe](samples/LICENSE.DICe) (Sandia / NTESS).
-
-## 1. C++ — verified DICe contract (recommended first)
-
-Uses the same **subset solver** path as
-`tests/dice/test_translation_real_image.cpp`:
+## C++
 
 ```bash
-# from engine repo root
-git submodule update --init --recursive
-./scripts/sparse-opencv.sh          # Windows: scripts/sparse-opencv.ps1
-
-cmake -S . -B build/sdk \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DSEMPER_BUILD_EXAMPLES=ON
+cmake -S . -B build/sdk -DCMAKE_BUILD_TYPE=Release -DSEMPER_BUILD_EXAMPLES=ON
 cmake --build build/sdk --target run_translation
-
 ./build/sdk/examples/cpp/run_translation \
-  examples/samples/translation/ref.tif \
-  examples/samples/translation/def.tif
+    examples/samples/translation/ref.tif examples/samples/translation/def.tif
 ```
 
-Expected output ends with:
-
-```text
-OK — DICe custom_app contract: 4/4 subsets |u-0.4| <= 0.1 px
-```
-
-## 2. Python
+## Python
 
 ```bash
 pip install ./bindings/python
-
-# A) Synthetic rigid shift — confirms the install (full-field API)
 python examples/python/run_synthetic.py
-
-# B) Same DICe TIFF pair via full-field Engine (reports metrics;
-#    subset-level golden is the C++ demo / dic_tests)
 python examples/python/run_translation.py
 ```
 
-## Output layout (Frozen)
+`run_translation.py` can report 0 points: on this sub-pixel pair the
+full-field quality filter may keep none. The strict check for this pair is the
+C++ program (or `dic_tests DiceTranslationReal`).
 
-Full-field points are 8 floats: `x, y, u, v, exx, eyy, exy, corr`.
-See [docs/CONTRACT.md](../docs/CONTRACT.md) and
-[samples/translation/expected.json](samples/translation/expected.json).
+## Samples
 
-## Going further
+| Directory | Images | Reference result |
+|---|---|---|
+| [samples/translation](samples/translation/) | `ref.tif`, `def.tif` (512 × 512) | 0.4 px diagonal shift; parameters in `expected.json` |
+| [samples/oht_cfrp](samples/oht_cfrp/) | `ref.tiff`, `def.tiff` (400 × 1040) | DICe's solution `DICe_solution_01.txt`; parameters in `expected.json` |
 
-- Inspect `samples/oht_cfrp/` for a real experiment + DICe solution file.
-- Host suite: `dic_tests DiceTranslationReal` / `DiceFieldAgreement`.
-- Catalog: [docs/TESTING.md](../docs/TESTING.md) · [docs/EXAMPLES.md](../docs/EXAMPLES.md).
+The images are redistributed from DICe under
+[samples/LICENSE.DICe](samples/LICENSE.DICe) (Sandia / NTESS).
