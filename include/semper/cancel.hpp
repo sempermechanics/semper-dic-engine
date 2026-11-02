@@ -42,9 +42,11 @@ constexpr int kSeedFailed = -5;
  *
  * A solve clears its token on entry, so a stale cancel from a previous solve
  * never aborts the next one. A caller that does work of its own before the
- * solve starts (decoding the frame, waiting for a lock, allocating the output)
- * opens the window at its own entry instead, with [CancelScope]: a request
- * made during that work then stops the solve rather than being cleared by it.
+ * solve starts (decoding the frame, allocating the output) opens the window at
+ * its own entry instead, with [CancelScope]: a request made during that work
+ * then stops the solve rather than being cleared by it. Adapters that
+ * serialise calls open it after taking their lock, so a request made while a
+ * call waits for the lock stops the solve in flight, not the waiting one.
  *
  * Non-copyable / non-movable (holds a std::atomic); pass by reference.
  */
